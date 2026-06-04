@@ -107,11 +107,17 @@ def parse_crypto_market(
         or market.get("expected_expiration_ts")
         or market.get("expiration_time")
     )
+    requested_frequency = normalize_frequency(frequency)
+    series_frequency = normalize_frequency(series.frequency if series is not None else market.get("frequency"))
+    duration_frequency = _frequency_from_duration(open_time, close_time)
+    if series is not None and requested_frequency in {"15m", "1h"} and open_time is not None and close_time is not None:
+        if duration_frequency != requested_frequency:
+            return None
     normalized = (
-        normalize_frequency(series.frequency if series is not None else market.get("frequency"))
+        duration_frequency
+        or series_frequency
         or _frequency_from_ticker(series_ticker)
-        or _frequency_from_duration(open_time, close_time)
-        or normalize_frequency(frequency)
+        or requested_frequency
         or "15m"
     )
     return CryptoMarket(

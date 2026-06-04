@@ -49,12 +49,18 @@ def test_runtime_scripts_align_btc_touch_singleton_to_active_color() -> None:
 
     assert "active_color_for_env()" in start_stack
     assert 'export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"' in start_stack
+    assert 'export CRYPTO_1H_TOUCH20_APP_COLOR="${production_active_color}"' in start_stack
     assert 'export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"' in start_stack
+    assert 'export CRYPTO_1H_CURRENT_APP_COLOR="${production_active_color}"' in start_stack
     assert "active_color_for_env()" in restart_color
     assert 'export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"' in restart_color
+    assert 'export CRYPTO_1H_TOUCH20_APP_COLOR="${production_active_color}"' in restart_color
     assert 'export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"' in restart_color
+    assert 'export CRYPTO_1H_CURRENT_APP_COLOR="${production_active_color}"' in restart_color
     assert 'export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${TARGET}"' in blue_green
+    assert 'export CRYPTO_1H_TOUCH20_APP_COLOR="${TARGET}"' in blue_green
     assert 'export CRYPTO_CURRENT_APP_COLOR="${TARGET}"' in blue_green
+    assert 'export CRYPTO_1H_CURRENT_APP_COLOR="${TARGET}"' in blue_green
 
 
 def test_btc_current_collector_refreshes_settled_labels() -> None:
@@ -71,11 +77,18 @@ def test_btc_current_collector_refreshes_settled_labels() -> None:
     assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=600" in env_lines
     assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.20" in env_lines
     assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0005" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_BUCKET_PRICE_BAND_CENTS=10" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_STOP_LOSS_PCT=0.30" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_MIN_SECONDS_TO_CLOSE=600" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS=0.20" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM=0.0005" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_BUCKET_PRICE_BAND_CENTS=10" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES" in compose_text
+    assert "CRYPTO_BTC15M_TOUCH20_BUCKET_PRICE_BAND_CENTS" in compose_text
+    assert 'assets="$${CRYPTO_15M_TOUCH20_RULES_ASSETS:-BTC}"' in compose_text
+    assert 'replay_gate_every="$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES:-80}"' in compose_text
+    assert '--days "$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS:-30}"' in compose_text
+    assert 'sleep "$${CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS:-15}"' in compose_text
     assert "crypto-non-model-touch20 replay" in compose_text
     assert "crypto-non-model-touch20 gate" in compose_text
     assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
@@ -89,6 +102,46 @@ def test_btc_current_collector_refreshes_settled_labels() -> None:
     assert "--skip-quality" in compose_text
     assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES=20" in env_lines
     assert "CRYPTO_CURRENT_15M_SETTLED_DAYS=3" in env_lines
+
+
+def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
+    compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
+    env_lines = set(env_example.splitlines())
+    start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    restart_color = Path("infra/scripts/restart-color.sh").read_text(encoding="utf-8")
+    blue_green = Path("scripts/blue_green_redeploy.sh").read_text(encoding="utf-8")
+
+    assert "crypto_current_1h_production:" in compose_text
+    assert "CRYPTO_CURRENT_1H_ASSETS" in compose_text
+    assert 'assets="$${CRYPTO_CURRENT_1H_ASSETS:-$${PRODUCTION_CRYPTO_CURRENT_1H_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}}"' in compose_text
+    assert 'CRYPTO_1H_TOUCH20_ASSET_SETTINGS: "${PRODUCTION_CRYPTO_1H_TOUCH20_ASSET_SETTINGS:-{}}"' in compose_text
+    assert "CRYPTO_1H_TOUCH20_RULES_ASSETS: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC}" in compose_text
+    assert 'settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-20}"' in compose_text
+    assert '--days "$${CRYPTO_1H_CURRENT_SETTLED_DAYS:-7}"' in compose_text
+    assert 'sleep "$${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-15}"' in compose_text
+    assert "PRODUCTION_CRYPTO_CURRENT_1H_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP" in env_lines
+    assert "crypto_non_model_1h_touch20_production:" in compose_text
+    assert "--frequency 1h" in compose_text
+    assert 'assets="$${CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC}"' in compose_text
+    assert "CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES" in compose_text
+    assert "crypto-non-model-touch20 replay" in compose_text
+    assert "crypto-non-model-touch20 gate" in compose_text
+    assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
+    assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false" in env_lines
+    assert "PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
+    assert "CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
+    assert "CRYPTO_1H_TOUCH20_BUCKET_TIME_BAND_MINUTES=15" in env_lines
+    assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER=false" in env_lines
+    assert "ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false" in env_lines
+    assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS=15" in env_lines
+    assert "CRYPTO_1H_CURRENT_SETTLED_DAYS=2" in env_lines
+    assert "runtime_services+=(crypto_current_1h_production)" in start_stack
+    assert "runtime_services+=(crypto_non_model_1h_touch20_production)" in start_stack
+    assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER" in restart_color
+    assert "crypto_non_model_1h_touch20_production" in restart_color
+    assert "crypto_current_1h_production" in blue_green
+    assert "crypto_non_model_1h_touch20_production" in blue_green
 
 
 def test_sync_web_color_can_disable_strategies_site_container() -> None:

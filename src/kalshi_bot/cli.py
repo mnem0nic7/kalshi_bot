@@ -688,6 +688,7 @@ async def _run_crypto_history_command(args: argparse.Namespace, container: AppCo
             asset_symbols=getattr(args, "assets", None),
             capture_candles=False if getattr(args, "skip_candles", False) else None,
             summarize_quality=not getattr(args, "skip_quality", False),
+            propagate_settlement_labels=not getattr(args, "skip_label_propagation", False),
         )
     elif args.crypto_history_command == "status":
         result = await container.crypto_history_service.status(
@@ -872,6 +873,7 @@ async def _run_crypto_non_model_touch20_command(args: argparse.Namespace, contai
             days=args.days,
             limit=args.limit,
             persist=True,
+            include_joined_fallback=not getattr(args, "skip_joined_fallback", False),
         )
     elif args.crypto_non_model_touch20_command == "optimize":
         result = await container.crypto_non_model_touch20_service.optimize(
@@ -880,6 +882,7 @@ async def _run_crypto_non_model_touch20_command(args: argparse.Namespace, contai
             days=args.days,
             limit=args.limit,
             top_n=args.top,
+            include_joined_fallback=not getattr(args, "skip_joined_fallback", False),
         )
     elif args.crypto_non_model_touch20_command == "gate":
         result = await container.crypto_non_model_touch20_service.gate(
@@ -4498,6 +4501,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_history_collect_settled.add_argument("--assets", nargs="*", default=None)
     crypto_history_collect_settled.add_argument("--skip-candles", action="store_true")
     crypto_history_collect_settled.add_argument("--skip-quality", action="store_true")
+    crypto_history_collect_settled.add_argument("--skip-label-propagation", action="store_true")
     crypto_history_collect_settled.add_argument("--json", action="store_true")
     crypto_history_status = crypto_history_subparsers.add_parser("status")
     add_kalshi_env_argument(crypto_history_status)
@@ -4601,6 +4605,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_non_model_touch20_replay.add_argument("--asset", default="BTC")
     crypto_non_model_touch20_replay.add_argument("--days", type=int, default=30)
     crypto_non_model_touch20_replay.add_argument("--limit", type=int, default=0)
+    crypto_non_model_touch20_replay.add_argument("--skip-joined-fallback", action="store_true")
     crypto_non_model_touch20_replay.add_argument("--json", action="store_true")
     crypto_non_model_touch20_optimize = crypto_non_model_touch20_subparsers.add_parser("optimize")
     add_kalshi_env_argument(crypto_non_model_touch20_optimize)
@@ -4609,6 +4614,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_non_model_touch20_optimize.add_argument("--days", type=int, default=30)
     crypto_non_model_touch20_optimize.add_argument("--limit", type=int, default=0)
     crypto_non_model_touch20_optimize.add_argument("--top", type=int, default=10)
+    crypto_non_model_touch20_optimize.add_argument("--skip-joined-fallback", action="store_true")
     crypto_non_model_touch20_optimize.add_argument("--json", action="store_true")
     crypto_non_model_touch20_approve = crypto_non_model_touch20_subparsers.add_parser("approve")
     add_kalshi_env_argument(crypto_non_model_touch20_approve)

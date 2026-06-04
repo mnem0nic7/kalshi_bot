@@ -1,6 +1,6 @@
 # Crypto Trading Strategy
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
 
 This document is the operator-facing summary of the crypto trading system: what
 we trade, which strategy is active, which gates must pass before an order can go
@@ -21,13 +21,18 @@ trained predictive model artifacts and do not call the crypto probability model.
 Each lane can trade only after its own quote-path replay gate and matching
 operator approval pass.
 
+The non-model Touch20 rules module also has 1-hour support wired behind separate
+1h settings, artifacts, approvals, ledgers, and Docker opt-in flags. The 1h
+lanes are not live-approved; keep 1h order submission disabled until each asset
+has a passed 1h replay gate and explicit operator approval for that exact gate.
+
 Crypto is not a single global live switch. It is promoted per asset. BTC can be
 approved without approving ETH, and deployment-note asset mode `off` wins over
 any agent-pack live mode.
 
-The current production posture is BTC-only live eligibility with conservative
-entry gates. Other crypto assets remain shadow evidence collection until their
-own replay, P/L, and asset-mode gates pass.
+The current production posture is per-asset. BTC, HYPE, ETH, BNB, SOL, DOGE,
+and XRP are live-approved for the non-model 15m Touch20 rules path with max
+notional 10 per lane.
 
 ## Strategy Inventory
 
@@ -35,7 +40,8 @@ own replay, P/L, and asset-mode gates pass.
 |---|---:|---|---|
 | `CRYPTO_15M` live-quality | Active shadow | Predict fair YES for 15-minute crypto markets and select the best fee-adjusted YES/NO buy candidate. | Per-asset live only after replay, asset-mode, risk, and execution gates pass. |
 | `CRYPTO_1H` live-quality | Active shadow | Predict fair YES for 1-hour crypto markets and select the best fee-adjusted YES/NO buy candidate. | Same per-asset live gates as `CRYPTO_15M`; ongoing collection runs in the crypto-only 1h daemon with `CRYPTO_AUTO_FREQUENCIES=1h`. |
-| `*_15m_touch20_rules` | Disabled by default except explicitly enabled lanes | Independent 15-minute, non-model Touch20 path for BTC, ETH, SOL, XRP, BNB, DOGE, and HYPE. It enters on a standalone rules score plus replay bucket evidence, exits at +20% net executable profit, and cuts at -20% net executable loss. | Requires the asset lane enabled, a passed asset-owned live-faithful gate such as `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`, gate/simulator-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, live bucket controls, strategy cap room, min order notional, and asset-lane `trading_enabled=true` before live order submission. |
+| `*_15m_touch20_rules` | Disabled by default except explicitly enabled lanes | Independent 15-minute, non-model Touch20 path for BTC, ETH, SOL, XRP, BNB, DOGE, and HYPE. It enters on a standalone rules score plus replay bucket evidence, exits at the configured net executable take-profit target, and cuts at the configured stop loss. | Requires the asset lane enabled, a passed asset-owned live-faithful gate such as `btc15m_touch20_rules_gate:15m:BTC` or `eth15m_touch20_rules_gate:15m:ETH`, gate/simulator-version-matched operator approval, active color, kill switch off, fresh real quotes and spot, live bucket controls, strategy cap room, min order notional, and asset-lane `trading_enabled=true` before live order submission. |
+| `*_1h_touch20_rules` | Evidence collection active, trading disabled | Frequency-scoped 1-hour version of the non-model Touch20 rules path for BTC, HYPE, ETH, BNB, SOL, DOGE, and XRP. Production now collects all-seven 1h quote/spot evidence and stores recent settled labels; rule evaluation can be enabled per asset while `trading_enabled=false`. | Not live eligible until direct settled quote-path labels produce replay rows, the 1h replay gate passes for that asset, and the operator explicitly approves that asset/frequency with max notional. |
 | Crypto exploratory shadow | Active shadow | Collect candidate and quote evidence even when live edge is not present. | Never live eligible; evidence only. |
 | Per-asset policy promotion | Active control path | Stage asset-specific crypto policy in the active agent pack. | One asset at a time after live-path readiness passes. |
 | Crypto market making | Out of scope | Posting two-sided liquidity. | Not supported. |
@@ -60,13 +66,13 @@ Current tracked assets:
 
 | Asset | Primary treatment |
 |---|---|
-| BTC | Standard tracked asset. |
-| ETH | Standard tracked asset. |
-| SOL | Standard tracked asset. |
-| XRP | Standard tracked asset. |
-| DOGE | Tracked, but requires enough labeled real-quote evidence. |
-| BNB | Coinbase-supported tracked asset; keep shadow until its own data/replay gates pass. |
-| HYPE | Coinbase-supported tracked asset; keep shadow until its own data/replay gates pass. |
+| BTC | Non-model 15m Touch20 live-approved with max notional 10. |
+| ETH | Non-model 15m Touch20 live-approved with max notional 10. |
+| SOL | Non-model 15m Touch20 live-approved with max notional 10. |
+| XRP | Non-model 15m Touch20 live-approved with max notional 10. |
+| DOGE | Non-model 15m Touch20 live-approved with max notional 10. |
+| BNB | Non-model 15m Touch20 live-approved with max notional 10. |
+| HYPE | Non-model 15m Touch20 live-approved with max notional 10. |
 
 In scope:
 
@@ -125,9 +131,10 @@ their own strategy codes, such as `eth15m_touch20_rules`.
 
 The objective is `touch_20pct_before_close`: buy a configured YES/NO contract
 early enough in the 15-minute market that the contract price can fluctuate
-upward, then sell when the executable exit price clears +20% net profit after
-estimated entry and exit taker fees. BTC currently defaults to a YES-only,
-30-50c entry-cost setup with nonnegative side-aligned spot momentum.
+upward, then sell when the executable exit price clears the configured net
+take-profit target after estimated entry and exit taker fees. BTC currently
+defaults to a YES-only, 30-50c entry-cost setup with nonnegative side-aligned
+spot momentum.
 
 This is not a settlement-edge strategy. A position can be profitable even if the
 contract later settles out of the money, provided the contract touches the exit
@@ -381,7 +388,7 @@ generic `crypto-replay` command.
 
 Replay uses settled real quote-path rows only. It does not use proxy rows,
 trained model features, or trained model predictions. The current replay
-simulator version is `live_exit_v2`, and the entry replay mode is
+simulator version is `live_exit_v3`, and the entry replay mode is
 `first_eligible_per_market`. For each market, replay enters only the first row
 that satisfies the strategy rules, then scans future same-market quote snapshots
 before close:

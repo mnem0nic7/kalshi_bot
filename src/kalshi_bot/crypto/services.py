@@ -57,7 +57,7 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
-from kalshi_bot.db.repositories import PlatformRepository
+from kalshi_bot.db.repositories import PlatformRepository, _crypto_snapshot_matches_frequency_duration
 from kalshi_bot.integrations.crypto_spot import (
     COINGECKO_IDS,
     COINBASE_PRODUCT_IDS,
@@ -113,6 +113,15 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "xgboost_classifier",
     "lightgbm_classifier",
 )
+
+
+def _settled_label_matches_requested_duration(market: CryptoMarket, frequency: str) -> bool:
+    freq = normalize_frequency(frequency)
+    if freq == "1h" and (market.open_time is None or market.close_time is None):
+        return False
+    return _crypto_snapshot_matches_frequency_duration(market, freq)
+
+
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 CRYPTO_CROSS_ASSET_FEATURE_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE")
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
@@ -914,6 +923,8 @@ class CryptoMarketService:
         status: str | None = "open",
         persist: bool = True,
         asset_symbols: list[str] | None = None,
+        min_close_time: datetime | None = None,
+        max_close_time: datetime | None = None,
     ) -> list[CryptoMarket]:
         requested_assets = set(normalize_asset_symbols(asset_symbols))
         series_rows = await self.discover_series(frequency=frequency)
@@ -923,15 +934,30 @@ class CryptoMarketService:
             ]
         markets: list[CryptoMarket] = []
         for series in series_rows:
-            response = await self.kalshi.list_markets(
-                series_ticker=series.series_ticker,
-                limit=1000,
-                **({"status": status} if status else {}),
-            )
-            for row in _rows_from_response(response, "markets"):
-                parsed = parse_crypto_market(row, series=series, frequency=frequency)
-                if parsed is not None:
-                    markets.append(parsed)
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            for _ in range(20):
+                params: dict[str, Any] = {
+                    "series_ticker": series.series_ticker,
+                    "limit": 1000,
+                }
+                if status:
+                    params["status"] = status
+                if min_close_time is not None:
+                    params["min_close_ts"] = int(min_close_time.timestamp())
+                if max_close_time is not None:
+                    params["max_close_ts"] = int(max_close_time.timestamp())
+                if cursor:
+                    params["cursor"] = cursor
+                response = await self.kalshi.list_markets(**params)
+                for row in _rows_from_response(response, "markets"):
+                    parsed = parse_crypto_market(row, series=series, frequency=frequency)
+                    if parsed is not None:
+                        markets.append(parsed)
+                cursor = response.get("cursor") or response.get("next_cursor")
+                if not cursor or cursor in seen_cursors:
+                    break
+                seen_cursors.add(cursor)
         markets.sort(key=lambda market: (market.close_time or datetime.max.replace(tzinfo=UTC), market.asset_symbol))
         if persist and markets:
             async with self.session_factory() as session:
@@ -1554,6 +1580,7 @@ class CryptoHistoryService:
         asset_symbols: list[str] | None = None,
         capture_candles: bool | None = None,
         summarize_quality: bool = True,
+        propagate_settlement_labels: bool = True,
     ) -> dict[str, Any]:
         """Collect recently settled crypto markets as immutable label snapshots."""
         freq = normalize_frequency(frequency) or "15m"
@@ -1600,20 +1627,90 @@ class CryptoHistoryService:
             "concurrency": max(1, int(self.settings.crypto_history_candle_concurrency)),
         }
         asset_counts: Counter[str] = Counter({asset: 0 for asset in expected_assets})
+        settlement_labels_propagated = 0
+        settlement_label_candidates = 0
+        settlement_label_live_ticker_count = 0
         commit_batch_size = 250
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-            for index, market in enumerate(settled_markets, start=1):
-                await self.market_service.record_market_snapshot(
-                    repo,
-                    market,
-                    source_kind="settled_backfill",
-                    observed_at=_crypto_settlement_observed_at(market),
+            settled_snapshot_batch: list[dict[str, Any]] = []
+            for market in settled_markets:
+                settled_snapshot_batch.append(
+                    {
+                        "kalshi_env": self.settings.kalshi_env,
+                        "series_ticker": market.series_ticker,
+                        "market_ticker": market.market_ticker,
+                        "event_ticker": market.event_ticker,
+                        "asset_symbol": market.asset_symbol,
+                        "frequency": market.frequency,
+                        "title": market.title,
+                        "status": market.status,
+                        "open_time": market.open_time,
+                        "close_time": market.close_time,
+                        "expected_expiration_time": market.expected_expiration_time,
+                        "target_price_dollars": market.target_price_dollars,
+                        "yes_bid_dollars": market.yes_bid_dollars,
+                        "yes_ask_dollars": market.yes_ask_dollars,
+                        "no_bid_dollars": market.no_bid_dollars,
+                        "no_ask_dollars": market.no_ask_dollars,
+                        "last_price_dollars": market.last_price_dollars,
+                        "volume": market.volume,
+                        "open_interest": market.open_interest,
+                        "settlement_result": market.settlement_result,
+                        "observed_at": _crypto_settlement_observed_at(market),
+                        "source_kind": "settled_backfill",
+                        "payload": market.to_payload(),
+                    }
                 )
                 asset_counts[market.asset_symbol] += 1
-                if index % commit_batch_size == 0:
+                if len(settled_snapshot_batch) >= commit_batch_size:
+                    await repo.bulk_record_crypto_market_snapshots(
+                        settled_snapshot_batch,
+                        kalshi_env=self.settings.kalshi_env,
+                    )
                     await session.commit()
+                    settled_snapshot_batch.clear()
+            if settled_snapshot_batch:
+                await repo.bulk_record_crypto_market_snapshots(
+                    settled_snapshot_batch,
+                    kalshi_env=self.settings.kalshi_env,
+                )
             await session.commit()
+            if propagate_settlement_labels:
+                recent_live_snapshots = await repo.list_crypto_market_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=expected_assets,
+                    since=cutoff,
+                    limit=200_000,
+                    match_frequency_duration=True,
+                )
+                live_tickers_needing_labels = {
+                    row.market_ticker
+                    for row in recent_live_snapshots
+                    if row.source_kind != "settled_backfill" and row.settlement_result is None
+                }
+                settlement_label_live_ticker_count = len(live_tickers_needing_labels)
+                settlement_labels = {
+                    market.market_ticker: str(market.settlement_result or "").lower()
+                    for market in settled_markets
+                    if str(market.settlement_result or "").lower() in {"yes", "no"}
+                    and _settled_label_matches_requested_duration(market, freq)
+                    and market.market_ticker in live_tickers_needing_labels
+                }
+                settlement_label_items = list(settlement_labels.items())
+                settlement_label_candidates = len(settlement_label_items)
+                label_propagation_batch_size = 250
+                for offset in range(0, len(settlement_label_items), label_propagation_batch_size):
+                    batch = dict(settlement_label_items[offset : offset + label_propagation_batch_size])
+                    settlement_labels_propagated += await repo.update_crypto_snapshot_settlement_results(
+                        batch,
+                        kalshi_env=self.settings.kalshi_env,
+                        frequency=freq,
+                        observed_since=cutoff,
+                    )
+                    await session.commit()
+                await session.commit()
             captures = []
             if capture_settled_candles:
                 captures = await self._capture_candles_for_markets(
@@ -1688,6 +1785,10 @@ class CryptoHistoryService:
             "asset_symbols": expected_assets,
             "lookback_days": lookback_days,
             "settled_markets_stored": len(settled_markets),
+            "settlement_labels_propagated": settlement_labels_propagated,
+            "settlement_label_candidates": settlement_label_candidates,
+            "settlement_label_live_ticker_count": settlement_label_live_ticker_count,
+            "settlement_label_propagation_skipped": not propagate_settlement_labels,
             "asset_counts": dict(sorted(asset_counts.items())),
             "assets_missing_settled_markets": assets_missing_settled,
             "candles_stored": candle_stats["stored"],
@@ -1712,11 +1813,20 @@ class CryptoHistoryService:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = set(normalize_asset_symbols(asset_symbols))
         observed_at = datetime.now(UTC)
+        market_status = "open"
+        min_close_time: datetime | None = None
+        max_close_time: datetime | None = None
+        if freq == "1h":
+            market_status = None
+            min_close_time = observed_at - timedelta(minutes=1)
+            max_close_time = observed_at + timedelta(hours=1, minutes=5)
         markets = await self.market_service.discover_markets(
             frequency=freq,
-            status="open",
+            status=market_status,
             persist=False,
             asset_symbols=sorted(requested_assets) or None,
+            min_close_time=min_close_time,
+            max_close_time=max_close_time,
         )
         if requested_assets:
             markets = [market for market in markets if normalize_asset_symbol(market.asset_symbol) in requested_assets]
@@ -1726,6 +1836,24 @@ class CryptoHistoryService:
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
             for market in markets:
+                if market.open_time is not None and observed_at < market.open_time:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "market_not_open",
+                        }
+                    )
+                    continue
+                if market.close_time is not None and observed_at >= market.close_time:
+                    skipped.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "reason": "market_closed",
+                        }
+                    )
+                    continue
                 if market.yes_bid_dollars is None or market.yes_ask_dollars is None:
                     skipped.append(
                         {
@@ -1749,6 +1877,7 @@ class CryptoHistoryService:
                 kalshi_env=self.settings.kalshi_env,
                 since=observed_at - timedelta(minutes=30),
                 limit=5000,
+                match_frequency_duration=True,
             )
             await session.commit()
         return {
@@ -1889,6 +2018,7 @@ class CryptoHistoryService:
                 "series_ticker": series.series_ticker,
                 "status": "settled",
                 "limit": 1000,
+                "min_close_ts": int(cutoff.timestamp()),
             }
             if cursor:
                 params["cursor"] = cursor

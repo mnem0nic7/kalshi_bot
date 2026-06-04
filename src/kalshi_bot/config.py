@@ -370,10 +370,46 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_max_contract_price_dollars: float = 0.50
     crypto_btc15m_touch20_min_aligned_momentum: float = 0.0005
     crypto_btc15m_touch20_min_rule_score: float = 0.458
+    crypto_btc15m_touch20_bucket_price_band_cents: int = 10
+    crypto_btc15m_touch20_bucket_spread_band_cents: int = 1
+    crypto_btc15m_touch20_bucket_time_band_minutes: int = 5
     crypto_btc15m_touch20_quote_fresh_seconds: int = 30
     crypto_btc15m_touch20_spot_fresh_seconds: int = 180
     crypto_15m_touch20_rules_assets: str = "BTC"
     crypto_15m_touch20_asset_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    crypto_1h_touch20_rules_enabled: bool = False
+    crypto_1h_touch20_rules_trading_enabled: bool = False
+    crypto_1h_touch20_allowed_sides: str = "yes"
+    crypto_1h_touch20_take_profit_pct: float = 0.20
+    crypto_1h_touch20_stop_loss_pct: float = 0.30
+    crypto_1h_touch20_min_market_age_seconds: int = 60
+    crypto_1h_touch20_min_seconds_to_close: int = 1200
+    crypto_1h_touch20_replay_min_candidates: int = 50
+    crypto_1h_touch20_replay_min_touch_rate: float = 0.25
+    crypto_1h_touch20_replay_min_net_pnl_dollars: float = 0.0
+    crypto_1h_touch20_replay_min_pnl_per_candidate_dollars: float = 0.01
+    crypto_1h_touch20_replay_max_hard_cap_breaches: int = 0
+    crypto_1h_touch20_max_open_notional_dollars: float = 10.0
+    crypto_1h_touch20_daily_loss_limit_dollars: float = 10.0
+    crypto_1h_touch20_min_order_notional_dollars: float = 5.0
+    crypto_1h_touch20_max_bucket_live_loss_dollars: float = 1.0
+    crypto_1h_touch20_max_bucket_consecutive_losses: int = 2
+    crypto_1h_touch20_max_replay_stop_loss_rate: float = 0.35
+    crypto_1h_touch20_max_replay_terminal_loss_rate: float = 0.15
+    crypto_1h_touch20_profit_protection_threshold_pct: float = 0.10
+    crypto_1h_touch20_profit_protection_floor_pct: float = 0.05
+    crypto_1h_touch20_loop_interval_seconds: int = 15
+    crypto_1h_touch20_min_contract_price_dollars: float = 0.20
+    crypto_1h_touch20_max_contract_price_dollars: float = 0.50
+    crypto_1h_touch20_min_aligned_momentum: float = 0.0005
+    crypto_1h_touch20_min_rule_score: float = 0.458
+    crypto_1h_touch20_bucket_price_band_cents: int = 10
+    crypto_1h_touch20_bucket_spread_band_cents: int = 1
+    crypto_1h_touch20_bucket_time_band_minutes: int = 15
+    crypto_1h_touch20_quote_fresh_seconds: int = 30
+    crypto_1h_touch20_spot_fresh_seconds: int = 3600
+    crypto_1h_touch20_rules_assets: str = "BTC"
+    crypto_1h_touch20_asset_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     crypto_take_profit_enabled: bool = True
     crypto_take_profit_frequencies: str = "15m,1h"

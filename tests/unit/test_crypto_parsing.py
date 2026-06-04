@@ -101,6 +101,28 @@ def test_crypto_market_parser_infers_hourly_duration_and_ignores_title_dates() -
     assert market.target_price_dollars == Decimal("105000.00000000")
 
 
+def test_crypto_market_parser_rejects_weekly_range_for_requested_hourly_series() -> None:
+    series = parse_crypto_series(
+        {"ticker": "KXBTC", "title": "Bitcoin range", "category": "Crypto", "frequency": "hourly"},
+        frequency="1h",
+    )
+    market = parse_crypto_market(
+        {
+            "ticker": "KXBTC-26JUN0517-B73050",
+            "series_ticker": "KXBTC",
+            "open_time": "2026-05-29T20:00:00Z",
+            "close_time": "2026-06-05T21:00:00Z",
+            "yes_bid": 48,
+            "yes_ask": 52,
+            "status": "open",
+        },
+        series=series,
+        frequency="1h",
+    )
+
+    assert market is None
+
+
 def test_candlestick_normalization_accepts_official_nested_shape() -> None:
     candle = normalize_candlestick(
         {

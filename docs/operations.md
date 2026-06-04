@@ -67,11 +67,15 @@ Crypto policy is separate from weather thresholds and promotes per asset. A BTC 
 
 Use `crypto-live-path` to collect production evidence and show the exact blockers before any crypto asset is promoted out of shadow mode. The command does not relax replay gates, promote assets, or enable production crypto switches.
 
-The independent BTC 15-minute non-model Touch20 path has its own runbook:
-[BTC 15m Touch20 Rules](operations/btc15m-touch20-rules.md). It is additive to
-the model-trained crypto path and uses a separate replay gate,
-`btc15m_touch20_rules_gate:15m:BTC`, plus a gate-version-matched operator
-approval checkpoint.
+The independent 15-minute non-model Touch20 path has its own runbook:
+[Crypto 15m Touch20 Rules](operations/btc15m-touch20-rules.md). It is additive
+to the model-trained crypto path and uses asset-owned replay gates, such as
+`btc15m_touch20_rules_gate:15m:BTC`, `hype15m_touch20_rules_gate:15m:HYPE`,
+`eth15m_touch20_rules_gate:15m:ETH`, `bnb15m_touch20_rules_gate:15m:BNB`,
+`sol15m_touch20_rules_gate:15m:SOL`, `doge15m_touch20_rules_gate:15m:DOGE`,
+and `xrp15m_touch20_rules_gate:15m:XRP`, plus gate-version-matched operator
+approval checkpoints. The runbook includes the 2026-06-03 BTC and HYPE live
+activation records and the ETH/BNB/SOL/DOGE/XRP live activation records.
 
 Read-only status:
 

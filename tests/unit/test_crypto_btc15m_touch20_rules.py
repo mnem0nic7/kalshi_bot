@@ -175,6 +175,73 @@ def test_rules_candidate_uses_explicit_score_and_20pct_objective():
     assert no_candidate["reason"] == "side_not_allowed"
 
 
+def test_rules_candidate_distinguishes_non_executable_terminal_quotes():
+    terminal_candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            yes_bid_dollars=Decimal("0.0000"),
+            yes_ask_dollars=Decimal("0.0100"),
+            no_bid_dollars=Decimal("0.9900"),
+            no_ask_dollars=Decimal("1.0000"),
+        ),
+        settings=_settings(),
+        spot=_spot(),
+        gate_metrics=_gate(),
+    )
+    missing_candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(yes_bid_dollars=None, no_ask_dollars=None),
+        settings=_settings(),
+        spot=_spot(),
+        gate_metrics=_gate(),
+    )
+
+    terminal_yes = next(candidate for candidate in terminal_candidates if candidate["side"] == "yes")
+    missing_yes = next(candidate for candidate in missing_candidates if candidate["side"] == "yes")
+
+    assert terminal_yes["reason"] == "non_executable_bid_ask"
+    assert missing_yes["reason"] == "missing_real_bid_ask"
+
+
+def test_rules_candidate_infers_entry_from_opposite_side_quote_pair():
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            yes_bid_dollars=None,
+            yes_ask_dollars=None,
+            no_bid_dollars=Decimal("0.7000"),
+            no_ask_dollars=Decimal("0.7100"),
+        ),
+        settings=_settings(),
+        spot=_spot(),
+        gate_metrics=_gate(),
+    )
+
+    selected = candidates[0]
+
+    assert selected["side"] == "yes"
+    assert selected["candidate_status"] == "live_quality"
+    assert selected["execution_price_dollars"] == "0.3000"
+    assert selected["bid_price_dollars"] == "0.2900"
+    assert selected["spread_dollars"] == "0.0100"
+    assert selected["target_yes_price_dollars"] == "0.3000"
+
+
+def test_rules_candidate_rejects_terminal_opposite_side_complement():
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            yes_bid_dollars=None,
+            yes_ask_dollars=None,
+            no_bid_dollars=Decimal("0.9900"),
+            no_ask_dollars=Decimal("1.0000"),
+        ),
+        settings=_settings(),
+        spot=_spot(),
+        gate_metrics=_gate(),
+    )
+
+    selected = next(candidate for candidate in candidates if candidate["side"] == "yes")
+
+    assert selected["reason"] == "non_executable_bid_ask"
+
+
 def test_non_btc_assets_have_independent_identity_and_disabled_defaults():
     settings = _settings(
         crypto_btc15m_touch20_rules_enabled=True,
@@ -189,6 +256,77 @@ def test_non_btc_assets_have_independent_identity_and_disabled_defaults():
     assert rules._asset_settings(settings, "BTC").trading_enabled is True
     assert rules._asset_settings(settings, "ETH").rules_enabled is False
     assert rules._asset_settings(settings, "ETH").trading_enabled is False
+
+
+def test_one_hour_assets_have_frequency_scoped_identity_and_settings():
+    settings = _settings(
+        crypto_btc15m_touch20_rules_enabled=True,
+        crypto_btc15m_touch20_rules_trading_enabled=True,
+        crypto_1h_touch20_rules_enabled=True,
+        crypto_1h_touch20_rules_trading_enabled=False,
+        crypto_1h_touch20_min_seconds_to_close=1200,
+        crypto_1h_touch20_asset_settings={
+            "ETH": {
+                "rules_enabled": True,
+                "trading_enabled": True,
+                "bucket_time_band_minutes": 15,
+            }
+        },
+    )
+
+    assert rules._scope_supported("1h", "ETH") is True
+    assert rules._strategy_code("BTC", frequency="1h") == "btc1h_touch20_rules"
+    assert rules._strategy_code("ETH", frequency="1h") == "eth1h_touch20_rules"
+    assert rules._order_prefix("BTC", frequency="1h") == "btc1ht20r"
+    assert rules._artifact_type(rules._artifact_base("gate", "ETH", frequency="1h"), frequency="1h", asset_symbol="ETH") == "eth1h_touch20_rules_gate:1h:ETH"
+    assert rules._asset_settings(settings, "BTC", frequency="15m").trading_enabled is True
+    assert rules._asset_settings(settings, "BTC", frequency="1h").rules_enabled is True
+    assert rules._asset_settings(settings, "BTC", frequency="1h").trading_enabled is False
+    assert rules._asset_settings(settings, "BTC", frequency="1h").min_seconds_to_close == 1200
+    assert rules._asset_settings(settings, "ETH", frequency="1h").rules_enabled is True
+    assert rules._asset_settings(settings, "ETH", frequency="1h").trading_enabled is True
+    assert rules._time_bucket(3600, width_minutes=15, interval_seconds=3600) == "45_60m"
+    assert rules._time_bucket(1200, width_minutes=15, interval_seconds=3600) == "15_30m"
+    assert rules._bucket_time_band_minutes(60) == 60
+    assert rules._time_bucket(3600, width_minutes=60, interval_seconds=3600) == "0_60m"
+
+
+def test_one_hour_asset_can_use_full_interval_bucket_for_sparse_replay():
+    now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    settings = _settings(
+        crypto_1h_touch20_asset_settings={
+            "BTC": {
+                "allowed_sides": "yes",
+                "bucket_time_band_minutes": 60,
+                "min_aligned_momentum": 0.0,
+                "min_rule_score": 0.0,
+            }
+        }
+    )
+    gate = _gate("BTC|yes|40_50c|le_1c|0_60m")
+
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            frequency="1h",
+            series_ticker="KXBTC",
+            market_ticker="KXBTC-26JUN011200-B100000-T100500",
+            event_ticker="KXBTC-26JUN011200",
+            open_time=now - timedelta(seconds=60),
+            close_time=now + timedelta(seconds=3600),
+            expected_expiration_time=now + timedelta(seconds=3600),
+            yes_bid_dollars=Decimal("0.4400"),
+            yes_ask_dollars=Decimal("0.4500"),
+            no_bid_dollars=Decimal("0.5400"),
+            no_ask_dollars=Decimal("0.5600"),
+        ),
+        settings=settings,
+        spot=_spot(),
+        gate_metrics=gate,
+    )
+
+    assert rules._asset_settings(settings, "BTC", frequency="1h").bucket_time_band_minutes == 60
+    assert candidates[0]["candidate_status"] == "live_quality"
+    assert candidates[0]["bucket_key"] == "BTC|yes|40_50c|le_1c|0_60m"
 
 
 def test_non_btc_asset_settings_override_candidate_rules():
@@ -218,6 +356,142 @@ def test_non_btc_asset_settings_override_candidate_rules():
     assert cfg.daily_loss_limit_dollars == Decimal("3")
     assert candidates[0]["candidate_status"] == "live_quality"
     assert candidates[0]["bucket_key"] == "ETH|yes|30_40c|le_1c|10_15m"
+
+
+def test_non_btc_asset_can_use_20c_bucket_price_bands():
+    settings = _settings(
+        crypto_15m_touch20_asset_settings={
+            "BNB": {
+                "rules_enabled": True,
+                "allowed_sides": "yes",
+                "max_contract_price_dollars": 0.85,
+                "min_aligned_momentum": 0.0,
+                "min_rule_score": 0.30,
+                "bucket_price_band_cents": 20,
+            }
+        }
+    )
+    gate = _gate("BNB|yes|60_80c|le_1c|10_15m")
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            asset_symbol="BNB",
+            series_ticker="KXBNB15M",
+            market_ticker="KXBNB15M-26JUN011200-B600-T700",
+            yes_bid_dollars=Decimal("0.6800"),
+            yes_ask_dollars=Decimal("0.6900"),
+            no_bid_dollars=Decimal("0.3000"),
+            no_ask_dollars=Decimal("0.3100"),
+        ),
+        settings=settings,
+        spot=_spot(),
+        gate_metrics=gate,
+    )
+
+    assert rules._asset_settings(settings, "BNB").bucket_price_band_cents == 20
+    assert candidates[0]["candidate_status"] == "live_quality"
+    assert candidates[0]["bucket_key"] == "BNB|yes|60_80c|le_1c|10_15m"
+
+
+def test_non_btc_asset_can_use_40c_bucket_price_bands():
+    settings = _settings(
+        crypto_15m_touch20_asset_settings={
+            "DOGE": {
+                "rules_enabled": True,
+                "allowed_sides": "yes",
+                "max_contract_price_dollars": 0.85,
+                "min_aligned_momentum": 0.0,
+                "min_rule_score": 0.30,
+                "bucket_price_band_cents": 40,
+            }
+        }
+    )
+    gate = _gate("DOGE|yes|40_80c|le_1c|10_15m")
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            asset_symbol="DOGE",
+            series_ticker="KXDOGE15M",
+            market_ticker="KXDOGE15M-26JUN011200-B1000-T1005",
+            yes_bid_dollars=Decimal("0.6700"),
+            yes_ask_dollars=Decimal("0.6800"),
+            no_bid_dollars=Decimal("0.3100"),
+            no_ask_dollars=Decimal("0.3200"),
+        ),
+        settings=settings,
+        spot=_spot(),
+        gate_metrics=gate,
+    )
+
+    assert rules._asset_settings(settings, "DOGE").bucket_price_band_cents == 40
+    assert candidates[0]["candidate_status"] == "live_quality"
+    assert candidates[0]["bucket_key"] == "DOGE|yes|40_80c|le_1c|10_15m"
+
+
+def test_non_btc_asset_can_merge_spread_bands_for_sparse_assets():
+    settings = _settings(
+        crypto_15m_touch20_asset_settings={
+            "DOGE": {
+                "rules_enabled": True,
+                "allowed_sides": "yes",
+                "max_contract_price_dollars": 0.85,
+                "min_aligned_momentum": 0.0,
+                "min_rule_score": 0.30,
+                "bucket_spread_band_cents": 2,
+            }
+        }
+    )
+    gate = _gate("DOGE|yes|40_50c|le_2c|10_15m")
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            asset_symbol="DOGE",
+            series_ticker="KXDOGE15M",
+            market_ticker="KXDOGE15M-26JUN011200-B40-T50",
+            yes_bid_dollars=Decimal("0.4300"),
+            yes_ask_dollars=Decimal("0.4500"),
+            no_bid_dollars=Decimal("0.5400"),
+            no_ask_dollars=Decimal("0.5600"),
+        ),
+        settings=settings,
+        spot=_spot(),
+        gate_metrics=gate,
+    )
+
+    assert rules._asset_settings(settings, "DOGE").bucket_spread_band_cents == 2
+    assert candidates[0]["candidate_status"] == "live_quality"
+    assert candidates[0]["bucket_key"] == "DOGE|yes|40_50c|le_2c|10_15m"
+
+
+def test_non_btc_asset_can_merge_time_buckets_for_sparse_assets():
+    settings = _settings(
+        crypto_15m_touch20_asset_settings={
+            "XRP": {
+                "rules_enabled": True,
+                "allowed_sides": "yes",
+                "max_contract_price_dollars": 0.85,
+                "min_aligned_momentum": 0.0,
+                "min_rule_score": 0.30,
+                "bucket_time_band_minutes": 10,
+            }
+        }
+    )
+    gate = _gate("XRP|yes|40_50c|le_1c|5_15m")
+    candidates = rules.rules_candidates_for_snapshot(
+        _snapshot(
+            asset_symbol="XRP",
+            series_ticker="KXXRP15M",
+            market_ticker="KXXRP15M-26JUN011200-B40-T50",
+            yes_bid_dollars=Decimal("0.4400"),
+            yes_ask_dollars=Decimal("0.4500"),
+            no_bid_dollars=Decimal("0.5400"),
+            no_ask_dollars=Decimal("0.5500"),
+        ),
+        settings=settings,
+        spot=_spot(),
+        gate_metrics=gate,
+    )
+
+    assert rules._asset_settings(settings, "XRP").bucket_time_band_minutes == 10
+    assert candidates[0]["candidate_status"] == "live_quality"
+    assert candidates[0]["bucket_key"] == "XRP|yes|40_50c|le_1c|5_15m"
 
 
 def test_entry_window_blocks_late_markets_and_allows_early_boundary():
@@ -256,6 +530,22 @@ def test_rules_candidate_blocks_low_ask_target_spread_bucket_and_score():
         gate_metrics=_gate("BTC|yes|30_40c|gt_2c|10_15m"),
     )
     assert next(candidate for candidate in wide_spread if candidate["side"] == "yes")["reason"] == "spread_above_tier_max"
+    wide_spread_override = rules.rules_candidates_for_snapshot(
+        _snapshot(yes_bid_dollars=Decimal("0.3100"), yes_ask_dollars=Decimal("0.3500")),
+        settings=_settings(
+            crypto_15m_touch20_asset_settings={
+                "BTC": {
+                    "max_spread_dollars": 0.05,
+                    "min_aligned_momentum": 0.0,
+                    "min_rule_score": 0.30,
+                }
+            }
+        ),
+        spot=_spot(),
+        gate_metrics=_gate("BTC|yes|30_40c|gt_2c|10_15m"),
+    )
+    assert next(candidate for candidate in wide_spread_override if candidate["side"] == "yes")["candidate_status"] == "live_quality"
+    assert next(candidate for candidate in wide_spread_override if candidate["side"] == "yes")["max_spread_dollars"] == "0.0500"
     assert rules.rules_candidates_for_snapshot(
         _snapshot(yes_bid_dollars=Decimal("0.5400"), yes_ask_dollars=Decimal("0.5500")),
         settings=settings,
@@ -299,6 +589,13 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
         "real_quote_path_row_count": 500,
         "trade_candidate_count": 50,
         "allowed_trade_candidate_count": 50,
+        "gate_candidate_scope": "allowed_replay_buckets",
+        "allowed_net_simulated_pl_dollars": 1.00,
+        "allowed_pnl_per_candidate_dollars": 0.02,
+        "allowed_touch_rate": 0.25,
+        "allowed_stop_loss_rate": 0.10,
+        "allowed_terminal_loss_rate": 0.05,
+        "allowed_hard_cap_breaches": 0,
         "net_simulated_pl_dollars": 1.00,
         "pnl_per_candidate_dollars": 0.02,
         "touch_rate": 0.25,
@@ -313,6 +610,7 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
                 "sample_count": 50,
                 "allowed": True,
                 "net_pnl": "1.0000",
+                "touch_rate": 0.25,
                 "stop_loss_rate": 0.10,
                 "terminal_loss_rate": 0.05,
             },
@@ -321,6 +619,7 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
                 "sample_count": 2,
                 "allowed": False,
                 "net_pnl": "-0.5000",
+                "touch_rate": 0.00,
                 "stop_loss_rate": 0.50,
                 "terminal_loss_rate": 0.00,
             },
@@ -328,6 +627,22 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
     }
 
     assert rules.gate_reasons(good_metrics, settings=settings) == []
+    assert (
+        rules.gate_reasons(
+            {
+                **good_metrics,
+                "trade_candidate_count": 52,
+                "net_simulated_pl_dollars": -10.00,
+                "pnl_per_candidate_dollars": -0.1923,
+                "touch_rate": 0.10,
+                "stop_loss_rate": 0.90,
+                "terminal_loss_rate": 0.90,
+                "hard_cap_breaches": 5,
+            },
+            settings=settings,
+        )
+        == []
+    )
     assert "artifact is missing" in rules.gate_reasons({}, settings=settings)[0]
     assert any(
         "candidate count" in reason
@@ -336,21 +651,23 @@ def test_gate_blocks_missing_negative_undersampled_low_touch_and_passes_supporte
             settings=settings,
         )
     )
-    assert any("net P/L" in reason for reason in rules.gate_reasons({**good_metrics, "net_simulated_pl_dollars": -0.01}, settings=settings))
-    assert any("touch rate" in reason for reason in rules.gate_reasons({**good_metrics, "touch_rate": 0.24}, settings=settings))
-    assert any("hard-cap" in reason for reason in rules.gate_reasons({**good_metrics, "hard_cap_breaches": 1}, settings=settings))
+    assert any("net P/L" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_net_simulated_pl_dollars": -0.01}, settings=settings))
+    assert any("touch rate" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_touch_rate": 0.24}, settings=settings))
+    assert any("hard-cap" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_hard_cap_breaches": 1}, settings=settings))
     assert any("allowed bucket" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_bucket_keys": []}, settings=settings))
     assert any("trained model" in reason for reason in rules.gate_reasons({**good_metrics, "uses_trained_model": True}, settings=settings))
     assert any("simulator version" in reason for reason in rules.gate_reasons({**good_metrics, "simulator_version": "touch_only_v1"}, settings=settings))
-    assert any("stop-loss rate" in reason for reason in rules.gate_reasons({**good_metrics, "stop_loss_rate": 0.36}, settings=settings))
-    assert any("terminal-loss rate" in reason for reason in rules.gate_reasons({**good_metrics, "terminal_loss_rate": 0.16}, settings=settings))
+    assert any("stop-loss rate" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_stop_loss_rate": 0.36}, settings=settings))
+    assert any(
+        "terminal-loss rate" in reason for reason in rules.gate_reasons({**good_metrics, "allowed_terminal_loss_rate": 0.16}, settings=settings)
+    )
     assert any(
         "negative P/L" in reason
         for reason in rules.gate_reasons(
             {
                 **good_metrics,
-                "net_simulated_pl_dollars": -0.01,
-                "touch_rate": 0.90,
+                "allowed_net_simulated_pl_dollars": -0.01,
+                "allowed_touch_rate": 0.90,
                 "bucket_matrix": [{**good_metrics["bucket_matrix"][0], "net_pnl": "-0.0100"}],
             },
             settings=settings,
@@ -485,6 +802,108 @@ def test_live_faithful_replay_enters_only_first_eligible_row_per_market():
     assert report["trade_sample"][0]["decision_ts"] == now.isoformat()
 
 
+def test_live_faithful_replay_keeps_yes_only_quote_rows():
+    settings = _settings(crypto_btc15m_touch20_min_rule_score=0.48, crypto_btc15m_touch20_min_aligned_momentum=0.0)
+    now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    entry = _snapshot(
+        observed_at=now,
+        yes_bid_dollars=Decimal("0.2900"),
+        yes_ask_dollars=Decimal("0.3000"),
+        no_bid_dollars=None,
+        no_ask_dollars=None,
+    )
+    touch_exit = _snapshot(
+        observed_at=now + timedelta(seconds=60),
+        yes_bid_dollars=Decimal("0.7000"),
+        yes_ask_dollars=Decimal("0.7100"),
+        no_bid_dollars=None,
+        no_ask_dollars=None,
+    )
+    spot_rows = [_spot_row(now, Decimal("100.00"))]
+
+    report = rules._evaluate_replay([entry, touch_exit], spot_rows, settings=settings)
+
+    assert report["metrics"]["trade_candidate_count"] == 1
+    assert report["trade_sample"][0]["simulation"]["touched"] is True
+    assert report["trade_sample"][0]["simulation"]["exit_reason"] == "take_profit"
+
+
+def test_live_faithful_replay_keeps_opposite_side_complement_quote_rows():
+    settings = _settings(crypto_btc15m_touch20_min_rule_score=0.48, crypto_btc15m_touch20_min_aligned_momentum=0.0)
+    now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    entry = _snapshot(
+        observed_at=now,
+        yes_bid_dollars=None,
+        yes_ask_dollars=None,
+        no_bid_dollars=Decimal("0.7000"),
+        no_ask_dollars=Decimal("0.7100"),
+    )
+    touch_exit = _snapshot(
+        observed_at=now + timedelta(seconds=60),
+        yes_bid_dollars=None,
+        yes_ask_dollars=None,
+        no_bid_dollars=Decimal("0.2900"),
+        no_ask_dollars=Decimal("0.3000"),
+    )
+    spot_rows = [_spot_row(now, Decimal("100.00"))]
+
+    report = rules._evaluate_replay([entry, touch_exit], spot_rows, settings=settings)
+
+    assert report["metrics"]["trade_candidate_count"] == 1
+    assert report["metrics"]["input_diagnostics"]["side_filter_funnel"]["yes"]["quote_source_rows"] == 2
+    assert "raw_bid_ask_rows" not in report["metrics"]["input_diagnostics"]["side_filter_funnel"]["yes"]
+    assert report["trade_sample"][0]["candidate"]["execution_price_dollars"] == "0.3000"
+    assert report["trade_sample"][0]["simulation"]["touched"] is True
+    assert report["trade_sample"][0]["simulation"]["exit_price_dollars"] == "0.7000"
+
+
+def test_replay_metrics_include_input_quote_diagnostics():
+    settings = _settings()
+    now = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    entry_row = _snapshot(observed_at=now)
+    late_row = _snapshot(
+        market_ticker="KXBTC15M-LATE",
+        event_ticker="KXBTC15M-LATE-E",
+        observed_at=now + timedelta(minutes=10),
+        open_time=now,
+        close_time=now + timedelta(minutes=12),
+        expected_expiration_time=now + timedelta(minutes=12),
+    )
+    spot_rows = [_spot_row(now, Decimal("100.00"))]
+
+    report = rules._evaluate_replay([entry_row, late_row], spot_rows, settings=settings)
+
+    diagnostics = report["metrics"]["input_diagnostics"]
+    assert diagnostics["entry_window_row_count"] == 1
+    assert diagnostics["entry_window_market_count"] == 1
+    assert diagnostics["side_quote_diagnostics"]["yes"]["entry_window_rows"] == 1
+    assert diagnostics["side_quote_diagnostics"]["yes"]["quote_source_rows"] == 1
+    assert diagnostics["side_quote_diagnostics"]["yes"]["executable_bid_ask_rows"] == 1
+    assert diagnostics["side_quote_diagnostics"]["yes"]["configured_price_band_rows"] == 1
+    assert diagnostics["side_quote_diagnostics"]["no"]["executable_bid_ask_rows"] == 1
+    assert "configured_price_band_rows" not in diagnostics["side_quote_diagnostics"]["no"]
+    assert diagnostics["side_filter_funnel"]["yes"]["total_rows"] == 2
+    assert diagnostics["side_filter_funnel"]["yes"]["allowed_side_rows"] == 2
+    assert diagnostics["side_filter_funnel"]["yes"]["entry_window_rows"] == 1
+    assert diagnostics["side_filter_funnel"]["yes"]["quote_source_rows"] == 1
+    assert diagnostics["side_filter_funnel"]["yes"]["executable_bid_ask_rows"] == 1
+    assert diagnostics["side_filter_funnel"]["yes"]["configured_price_band_rows"] == 1
+    assert diagnostics["side_filter_funnel"]["yes"]["target_exit_possible_rows"] == 1
+    assert diagnostics["side_filter_funnel"]["yes"]["spread_within_tier_rows"] == 1
+    assert diagnostics["side_filter_funnel"]["no"]["total_rows"] == 2
+    assert "allowed_side_rows" not in diagnostics["side_filter_funnel"]["no"]
+    assert "entry_window_rows" not in diagnostics["side_filter_funnel"]["no"]
+    assert diagnostics["side_filter_market_funnel"]["yes"]["total_markets"] == 2
+    assert diagnostics["side_filter_market_funnel"]["yes"]["allowed_side_markets"] == 2
+    assert diagnostics["side_filter_market_funnel"]["yes"]["entry_window_markets"] == 1
+    assert diagnostics["side_filter_market_funnel"]["yes"]["executable_bid_ask_markets"] == 1
+    assert diagnostics["side_filter_market_funnel"]["yes"]["configured_price_band_markets"] == 1
+    assert diagnostics["side_filter_market_funnel"]["yes"]["target_exit_possible_markets"] == 1
+    assert diagnostics["side_filter_market_funnel"]["yes"]["spread_within_tier_markets"] == 1
+    assert diagnostics["side_filter_market_funnel"]["no"]["total_markets"] == 2
+    assert "allowed_side_markets" not in diagnostics["side_filter_market_funnel"]["no"]
+
+
 def test_optimizer_profiles_rank_passed_replay_profile():
     settings = _settings(
         crypto_btc15m_touch20_min_rule_score=0.45,
@@ -492,7 +911,7 @@ def test_optimizer_profiles_rank_passed_replay_profile():
     )
     start = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
     snapshots = []
-    spot_rows = []
+    spot_rows = [_spot_row(start - timedelta(minutes=15), Decimal("100.00"), asset_symbol="ETH")]
     for idx in range(6):
         decision_ts = start + timedelta(minutes=15 * idx)
         market_ticker = f"KXBTC15M-OPT-{idx}"
@@ -542,6 +961,155 @@ def test_optimizer_profiles_rank_passed_replay_profile():
     assert len(result["profiles"]) == 3
     assert result["best_profile"]["passed"] is True
     assert result["best_profile"]["trade_candidate_count"] >= 5
+
+
+def test_optimizer_marks_replay_candidate_floor_relaxation_non_promotable():
+    base = _settings(
+        crypto_1h_touch20_replay_min_candidates=50,
+        crypto_1h_touch20_asset_settings={"BTC": {"replay_min_candidates": 50}},
+    )
+    relaxed = _settings(
+        crypto_1h_touch20_replay_min_candidates=50,
+        crypto_1h_touch20_asset_settings={"BTC": {"replay_min_candidates": 15}},
+    )
+
+    reasons = rules._optimizer_non_promotable_reasons(
+        base_settings=base,
+        profile_settings=relaxed,
+        asset_symbol="BTC",
+        frequency="1h",
+    )
+    summary = rules._profile_summary(
+        name="current_rules_min_candidates_only",
+        settings_overrides={"replay_min_candidates": 15},
+        metrics={
+            "trade_candidate_count": 101,
+            "allowed_trade_candidate_count": 17,
+            "allowed_net_simulated_pl_dollars": 1.70,
+            "allowed_pnl_per_candidate_dollars": 0.10,
+        },
+        reasons=[],
+        non_promotable_reasons=reasons,
+        settings=relaxed,
+        asset_symbol="BTC",
+        frequency="1h",
+    )
+
+    assert reasons == ["replay_min_candidates_relaxed_below_configured_gate"]
+    assert summary["status"] == "diagnostic_passed"
+    assert summary["passed"] is True
+    assert summary["promotable"] is False
+    assert summary["promotable_passed"] is False
+    assert rules._optimizer_result_status([summary]) == "diagnostic_profile_found"
+
+
+def test_optimizer_result_status_prefers_promotable_pass():
+    diagnostic = {
+        "passed": True,
+        "promotable": False,
+        "promotable_passed": False,
+    }
+    promotable = {
+        "passed": True,
+        "promotable": True,
+        "promotable_passed": True,
+    }
+
+    assert rules._optimizer_result_status([diagnostic, promotable]) == "passed_profile_found"
+
+
+def test_one_hour_optimizer_fetch_window_matches_loose_profile_entry_window():
+    settings = _settings(
+        crypto_1h_touch20_min_seconds_to_close=1200,
+        crypto_1h_touch20_min_market_age_seconds=60,
+    )
+
+    min_seconds_to_close, min_market_age_seconds = rules._optimizer_replay_fetch_window(
+        settings,
+        asset_symbol="BTC",
+        frequency="1h",
+    )
+
+    assert min_seconds_to_close == 300
+    assert min_market_age_seconds == 60
+
+
+def test_one_hour_optimizer_profiles_include_coarse_time_bucket_options():
+    settings = _settings()
+
+    one_hour_profiles = {
+        profile["name"]: dict(profile.get("settings_overrides") or {})
+        for profile in rules._optimizer_profile_specs(settings, asset_symbol="BTC", frequency="1h")
+    }
+    fifteen_minute_profile_names = {
+        profile["name"]
+        for profile in rules._optimizer_profile_specs(settings, asset_symbol="BTC", frequency="15m")
+    }
+
+    coarse = one_hour_profiles["yes_no_take15_maxspread10_time60_price40_open_s25"]
+    assert coarse["bucket_time_band_minutes"] == 60
+    assert coarse["bucket_price_band_cents"] == 40
+    assert coarse["bucket_spread_band_cents"] == 2
+    assert "yes_no_take15_maxspread10_time60_price40_open_s25" not in fifteen_minute_profile_names
+
+
+
+def test_optimizer_profiles_apply_non_btc_asset_overrides():
+    settings = _settings(
+        crypto_btc15m_touch20_min_rule_score=0.50,
+        crypto_btc15m_touch20_replay_min_candidates=5,
+    )
+    start = datetime(2026, 6, 1, 12, 5, tzinfo=UTC)
+    snapshots = []
+    spot_rows = []
+    for idx in range(6):
+        decision_ts = start + timedelta(minutes=15 * idx)
+        market_ticker = f"KXETH15M-OPT-{idx}"
+        common = {
+            "asset_symbol": "ETH",
+            "series_ticker": "KXETH15M",
+            "market_ticker": market_ticker,
+            "event_ticker": f"KXETH15M-OPT-E{idx}",
+            "open_time": decision_ts - timedelta(seconds=60),
+            "close_time": decision_ts + timedelta(seconds=840),
+            "expected_expiration_time": decision_ts + timedelta(seconds=840),
+            "settlement_result": "no",
+        }
+        snapshots.append(
+            _snapshot(
+                **common,
+                observed_at=decision_ts,
+                yes_bid_dollars=Decimal("0.3700"),
+                yes_ask_dollars=Decimal("0.3800"),
+                no_bid_dollars=Decimal("0.6100"),
+                no_ask_dollars=Decimal("0.6200"),
+            )
+        )
+        snapshots.append(
+            _snapshot(
+                **common,
+                observed_at=decision_ts + timedelta(seconds=60),
+                yes_bid_dollars=Decimal("0.1800"),
+                yes_ask_dollars=Decimal("0.2000"),
+                no_bid_dollars=Decimal("0.8000"),
+                no_ask_dollars=Decimal("0.8200"),
+            )
+        )
+        spot_rows.append(_spot_row(decision_ts, Decimal("99.00") - Decimal(idx), asset_symbol="ETH"))
+
+    result = rules.optimize_replay_profiles(
+        snapshots,
+        spot_rows,
+        settings=settings,
+        asset_symbol="ETH",
+        top_n=5,
+    )
+
+    assert result["status"] == "passed_profile_found"
+    assert result["best_profile"]["passed"] is True
+    assert result["best_profile"]["allowed_trade_candidate_count"] >= 5
+    assert result["best_profile"]["settings_overrides"]["allowed_sides"] in {"yes,no", "no"}
+    assert rules._asset_settings(settings, "ETH").allowed_sides == ("yes",)
 
 
 def test_optimizer_sort_prefers_profitable_clean_near_miss_over_losing_large_sample():
@@ -824,10 +1392,19 @@ def test_zero_fill_terminal_entry_status_does_not_reserve_strategy_cap():
         False,
         "entry_canceled_zero_fill",
     )
+    assert rules._entry_ledger_decision("rejected_400", None) == (
+        False,
+        "entry_rejected_zero_fill",
+    )
+    assert rules._entry_ledger_decision("failed", Decimal("0")) == (
+        False,
+        "entry_rejected_zero_fill",
+    )
 
 
 def test_filled_or_pending_entry_status_updates_strategy_ledger():
     assert rules._entry_ledger_decision("canceled", Decimal("0.25")) == (True, "open")
+    assert rules._entry_ledger_decision("rejected_400", Decimal("0.25")) == (True, "open")
     assert rules._entry_ledger_decision("filled", Decimal("1.00")) == (True, "open")
     assert rules._entry_ledger_decision("executed", None) == (True, "open")
     assert rules._entry_ledger_decision("submitted", None) == (True, "entry_submitted")

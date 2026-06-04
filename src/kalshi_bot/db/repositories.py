@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Select, bindparam, case, func, or_, select, update as sql_update
+from sqlalchemy import Select, and_, bindparam, case, func, or_, select, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,7 +86,36 @@ _CLIENT_ORDER_STRATEGY_PREFIXES = {
     "bnb15t20r:": "bnb15m_touch20_rules",
     "doge15t20r:": "doge15m_touch20_rules",
     "hype15t20r:": "hype15m_touch20_rules",
+    "btc1ht20r:": "btc1h_touch20_rules",
+    "eth1ht20r:": "eth1h_touch20_rules",
+    "sol1ht20r:": "sol1h_touch20_rules",
+    "xrp1ht20r:": "xrp1h_touch20_rules",
+    "bnb1ht20r:": "bnb1h_touch20_rules",
+    "doge1ht20r:": "doge1h_touch20_rules",
+    "hype1ht20r:": "hype1h_touch20_rules",
 }
+
+
+def _crypto_entry_quote_sql(prefix: str = "") -> str:
+    field = f"{prefix}." if prefix else ""
+    return f"""
+    (
+        (
+            {field}yes_bid_dollars > 0
+            AND {field}yes_bid_dollars < 1
+            AND {field}yes_ask_dollars > 0
+            AND {field}yes_ask_dollars < 1
+            AND {field}yes_ask_dollars >= {field}yes_bid_dollars
+        )
+        OR (
+            {field}no_bid_dollars > 0
+            AND {field}no_bid_dollars < 1
+            AND {field}no_ask_dollars > 0
+            AND {field}no_ask_dollars < 1
+            AND {field}no_ask_dollars >= {field}no_bid_dollars
+        )
+    )
+    """
 
 
 def _strategy_code_for_client_order_prefix(client_order_id: str | None) -> str | None:
@@ -135,6 +164,38 @@ def _total_capital_dollars_from_balance_payload(balance_payload: dict[str, Any])
 _PENDING_BUY_ORDER_STATUSES = {"resting", "submitted", "accepted", "open", "pending"}
 _CRYPTO_MARKET_TICKER_RE = re.compile(r"^KX[A-Z0-9]+(?:15M|1H)-")
 _CRYPTO_MARKET_ID_RE = re.compile(r"^KX([A-Z0-9]+)(15M|1H)-")
+
+
+def _crypto_frequency_duration_bounds(frequency: str | None) -> tuple[int, int] | None:
+    frequency_key = str(frequency or "").strip().lower()
+    return {"1h": (3000, 4200), "hourly": (3000, 4200)}.get(frequency_key)
+
+
+def _crypto_snapshot_matches_frequency_duration(row: Any, frequency: str | None) -> bool:
+    duration_bounds = _crypto_frequency_duration_bounds(frequency)
+    if duration_bounds is None:
+        return True
+    open_time = getattr(row, "open_time", None)
+    close_time = getattr(row, "close_time", None)
+    if open_time is None or close_time is None:
+        return True
+    seconds = (close_time - open_time).total_seconds()
+    return duration_bounds[0] <= seconds <= duration_bounds[1]
+
+
+def _crypto_snapshot_duration_condition(frequency: str | None) -> Any | None:
+    duration_bounds = _crypto_frequency_duration_bounds(frequency)
+    if duration_bounds is None:
+        return None
+    duration_seconds = func.extract(
+        "epoch",
+        CryptoMarketSnapshotRecord.close_time - CryptoMarketSnapshotRecord.open_time,
+    )
+    return or_(
+        CryptoMarketSnapshotRecord.open_time.is_(None),
+        CryptoMarketSnapshotRecord.close_time.is_(None),
+        duration_seconds.between(*duration_bounds),
+    )
 
 
 def _is_crypto_market_ticker(market_ticker: str | None) -> bool:
@@ -1094,6 +1155,76 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         ).scalar_one()
         return result
 
+    async def bulk_record_crypto_market_snapshots(
+        self, snapshots: list[dict[str, Any]], *, kalshi_env: str | None = None
+    ) -> int:
+        if not snapshots:
+            return 0
+
+        now = datetime.now(UTC)
+        insert_values: list[dict[str, Any]] = []
+        for snapshot in snapshots:
+            observed = snapshot.get("observed_at") or now
+            env = self._resolved_kalshi_env(snapshot.get("kalshi_env") or kalshi_env)
+            insert_values.append(
+                {
+                    "id": str(uuid4()),
+                    "kalshi_env": env,
+                    "series_ticker": snapshot["series_ticker"],
+                    "market_ticker": snapshot["market_ticker"],
+                    "event_ticker": snapshot.get("event_ticker"),
+                    "asset_symbol": snapshot["asset_symbol"],
+                    "frequency": snapshot.get("frequency") or "15m",
+                    "title": snapshot.get("title"),
+                    "status": snapshot.get("status"),
+                    "open_time": snapshot.get("open_time"),
+                    "close_time": snapshot.get("close_time"),
+                    "expected_expiration_time": snapshot.get("expected_expiration_time"),
+                    "target_price_dollars": snapshot.get("target_price_dollars"),
+                    "yes_bid_dollars": snapshot.get("yes_bid_dollars"),
+                    "yes_ask_dollars": snapshot.get("yes_ask_dollars"),
+                    "no_bid_dollars": snapshot.get("no_bid_dollars"),
+                    "no_ask_dollars": snapshot.get("no_ask_dollars"),
+                    "last_price_dollars": snapshot.get("last_price_dollars"),
+                    "volume": snapshot.get("volume"),
+                    "open_interest": snapshot.get("open_interest"),
+                    "settlement_result": snapshot.get("settlement_result"),
+                    "observed_at": observed,
+                    "source_kind": snapshot.get("source_kind") or "live",
+                    "payload": snapshot.get("payload") or {},
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+        dialect_name = self.session.bind.dialect.name if self.session.bind is not None else ""
+        if dialect_name == "postgresql":
+            stmt = pg_insert(CryptoMarketSnapshotRecord).values(insert_values)
+        elif dialect_name == "sqlite":
+            stmt = sqlite_insert(CryptoMarketSnapshotRecord).values(insert_values)
+        else:
+            self.session.add_all(CryptoMarketSnapshotRecord(**values) for values in insert_values)
+            await self.session.flush()
+            return len(insert_values)
+
+        update_values = {
+            key: getattr(stmt.excluded, key)
+            for key in insert_values[0]
+            if key not in {"id", "created_at"}
+        }
+        await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoMarketSnapshotRecord.kalshi_env,
+                    CryptoMarketSnapshotRecord.market_ticker,
+                    CryptoMarketSnapshotRecord.observed_at,
+                ],
+                set_=update_values,
+            )
+        )
+        await self.session.flush()
+        return len(insert_values)
+
     async def list_crypto_market_snapshots(
         self,
         *,
@@ -1106,12 +1237,25 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         since: datetime | None = None,
         settled_only: bool = False,
         limit: int = 1000,
+        match_frequency_duration: bool = False,
     ) -> list[CryptoMarketSnapshotRecord]:
         stmt = select(CryptoMarketSnapshotRecord).where(
             CryptoMarketSnapshotRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
         )
+        bind = self.session.get_bind()
+        python_duration_filter = False
         if frequency is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
+        if match_frequency_duration:
+            duration_condition = (
+                _crypto_snapshot_duration_condition(frequency)
+                if bind is not None and bind.dialect.name == "postgresql"
+                else None
+            )
+            if duration_condition is not None:
+                stmt = stmt.where(duration_condition)
+            elif _crypto_frequency_duration_bounds(frequency) is not None:
+                python_duration_filter = True
         if status is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.status == status)
         if asset_symbol is not None:
@@ -1125,8 +1269,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
         if settled_only:
             stmt = stmt.where(CryptoMarketSnapshotRecord.settlement_result.isnot(None))
-        stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
-        return list((await self.session.execute(stmt)).scalars())
+        query_limit = max(limit * 10, limit) if python_duration_filter else limit
+        stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(query_limit)
+        rows = list((await self.session.execute(stmt)).scalars())
+        if python_duration_filter:
+            rows = [row for row in rows if _crypto_snapshot_matches_frequency_duration(row, frequency)][:limit]
+        return rows
 
     async def list_latest_crypto_market_snapshots(
         self,
@@ -1141,6 +1289,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             kalshi_env=kalshi_env,
             asset_symbols=asset_symbols,
             limit=max(limit * 6, limit),
+            match_frequency_duration=True,
         )
         latest: list[CryptoMarketSnapshotRecord] = []
         seen: set[str] = set()
@@ -1350,9 +1499,23 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if since is not None:
             where_parts.append("observed_at >= :since")
             params["since"] = since
+        duration_bounds = _crypto_frequency_duration_bounds(frequency)
+        if duration_bounds is not None:
+            where_parts.append(
+                """
+                (
+                    open_time IS NULL
+                    OR close_time IS NULL
+                    OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN :duration_min AND :duration_max
+                )
+                """
+            )
+            params["duration_min"] = duration_bounds[0]
+            params["duration_max"] = duration_bounds[1]
 
         bind = self.session.get_bind()
         if bind is not None and bind.dialect.name != "postgresql":
+            python_duration_filter = _crypto_frequency_duration_bounds(frequency) is not None
             conditions = [
                 CryptoMarketSnapshotRecord.kalshi_env == env,
                 CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
@@ -1370,11 +1533,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 select(CryptoMarketSnapshotRecord)
                 .where(*conditions)
                 .order_by(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.observed_at.desc())
-                .limit(limit)
+                .limit(max(limit * 10, limit) if python_duration_filter else limit)
             )
             if defer_payload:
                 stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
             records = list((await self.session.execute(stmt)).scalars())
+            if python_duration_filter:
+                records = [record for record in records if _crypto_snapshot_matches_frequency_duration(record, frequency)]
             latest: list[CryptoMarketSnapshotRecord] = []
             seen: set[str] = set()
             for record in records:
@@ -1422,6 +1587,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         since: datetime | None = None,
         limit: int = 200000,
         defer_payload: bool = False,
+        include_joined_fallback: bool = True,
+        entry_min_seconds_to_close: int | None = None,
+        entry_min_market_age_seconds: int | None = None,
+        entry_qualified_market_limit: int | None = None,
     ) -> list[CryptoMarketSnapshotRecord]:
         """Return real bid/ask quote paths for settled markets.
 
@@ -1435,6 +1604,232 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
         row_limit = max(1, int(limit or 200000))
         bind = self.session.get_bind()
+        frequency_key = str(frequency or "").strip().lower()
+        duration_bounds = {"1h": (3000, 4200), "hourly": (3000, 4200)}.get(frequency_key)
+
+        def _matches_requested_duration(row: Any) -> bool:
+            if duration_bounds is None:
+                return True
+            open_time = getattr(row, "open_time", None)
+            close_time = getattr(row, "close_time", None)
+            if open_time is None or close_time is None:
+                return True
+            seconds = (close_time - open_time).total_seconds()
+            return duration_bounds[0] <= seconds <= duration_bounds[1]
+
+        def _merge_quote_path_rows(direct_rows: list[Any], fallback_rows: list[Any]) -> list[Any]:
+            merged: list[Any] = []
+            seen: set[Any] = set()
+            for row in [*direct_rows, *fallback_rows]:
+                if not _matches_requested_duration(row):
+                    continue
+                key = getattr(row, "id", None)
+                if key is None:
+                    key = (
+                        getattr(row, "market_ticker", None),
+                        getattr(row, "observed_at", None),
+                        getattr(row, "source_kind", None),
+                    )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(row)
+            merged.sort(
+                key=lambda row: (
+                    -getattr(row, "observed_at", datetime.min.replace(tzinfo=UTC)).timestamp(),
+                    str(getattr(row, "market_ticker", "")),
+                )
+            )
+            return merged[:row_limit]
+
+        direct_conditions = [
+            CryptoMarketSnapshotRecord.kalshi_env == env,
+            CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
+            CryptoMarketSnapshotRecord.settlement_result.in_(["yes", "no"]),
+            or_(
+                and_(
+                    CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
+                    CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
+                ),
+                and_(
+                    CryptoMarketSnapshotRecord.no_bid_dollars.is_not(None),
+                    CryptoMarketSnapshotRecord.no_ask_dollars.is_not(None),
+                ),
+            ),
+        ]
+        if frequency is not None:
+            direct_conditions.append(CryptoMarketSnapshotRecord.frequency == frequency)
+        if symbols:
+            direct_conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
+        if since is not None:
+            direct_conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
+        if duration_bounds is not None and bind is not None and bind.dialect.name == "postgresql":
+            duration_seconds = func.extract(
+                "epoch",
+                CryptoMarketSnapshotRecord.close_time - CryptoMarketSnapshotRecord.open_time,
+            )
+            direct_conditions.append(
+                or_(
+                    CryptoMarketSnapshotRecord.open_time.is_(None),
+                    CryptoMarketSnapshotRecord.close_time.is_(None),
+                    duration_seconds.between(*duration_bounds),
+                )
+            )
+        entry_seconds = max(0, int(entry_min_seconds_to_close or 0))
+        if entry_seconds > 0 and bind is not None and bind.dialect.name == "postgresql" and not include_joined_fallback:
+            from sqlalchemy import text as sql_text
+
+            entry_market_limit = max(
+                1,
+                min(row_limit, int(entry_qualified_market_limit or max(200, row_limit // 20))),
+            )
+            min_market_age_seconds = max(0, int(entry_min_market_age_seconds or 0))
+            entry_where = [
+                "kalshi_env = :env",
+                "source_kind <> 'settled_backfill'",
+                "settlement_result IN ('yes', 'no')",
+                _crypto_entry_quote_sql(),
+                "(status IS NULL OR status IN ('open', 'active'))",
+                "close_time IS NOT NULL",
+                "observed_at <= close_time - (:entry_seconds * INTERVAL '1 second')",
+            ]
+            snapshot_where = [
+                "snapshot.kalshi_env = :env",
+                "snapshot.source_kind <> 'settled_backfill'",
+                "snapshot.settlement_result IN ('yes', 'no')",
+                """
+                (
+                    (snapshot.yes_bid_dollars IS NOT NULL AND snapshot.yes_ask_dollars IS NOT NULL)
+                    OR (snapshot.no_bid_dollars IS NOT NULL AND snapshot.no_ask_dollars IS NOT NULL)
+                )
+                """,
+            ]
+            params: dict[str, Any] = {
+                "env": env,
+                "limit": row_limit,
+                "entry_seconds": entry_seconds,
+                "entry_market_limit": entry_market_limit,
+            }
+            if min_market_age_seconds > 0:
+                entry_where.append(
+                    "(open_time IS NULL OR observed_at >= open_time + (:entry_min_market_age_seconds * INTERVAL '1 second'))"
+                )
+                params["entry_min_market_age_seconds"] = min_market_age_seconds
+            if frequency is not None:
+                entry_where.append("frequency = :frequency")
+                snapshot_where.append("snapshot.frequency = :frequency")
+                params["frequency"] = frequency
+            if symbols:
+                entry_where.append("asset_symbol IN :symbols")
+                snapshot_where.append("snapshot.asset_symbol IN :symbols")
+                params["symbols"] = symbols
+            if since is not None:
+                entry_where.append("observed_at >= :since")
+                snapshot_where.append("snapshot.observed_at >= :since")
+                params["since"] = since
+            if duration_bounds is not None:
+                entry_where.append(
+                    """
+                    (
+                        open_time IS NULL
+                        OR close_time IS NULL
+                        OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN :duration_min AND :duration_max
+                    )
+                    """
+                )
+                snapshot_where.append(
+                    """
+                    (
+                        snapshot.open_time IS NULL
+                        OR snapshot.close_time IS NULL
+                        OR EXTRACT(EPOCH FROM (snapshot.close_time - snapshot.open_time)) BETWEEN :duration_min AND :duration_max
+                    )
+                    """
+                )
+                params["duration_min"] = duration_bounds[0]
+                params["duration_max"] = duration_bounds[1]
+            raw = sql_text(
+                f"""
+                WITH entry_rows AS (
+                    SELECT market_ticker, observed_at AS entry_observed
+                    FROM crypto_market_snapshots
+                    WHERE {" AND ".join(entry_where)}
+                    ORDER BY observed_at DESC, market_ticker
+                    LIMIT :entry_market_limit
+                ),
+                entry_markets AS (
+                    SELECT market_ticker, MAX(entry_observed) AS latest_entry_observed
+                    FROM entry_rows
+                    GROUP BY market_ticker
+                    ORDER BY latest_entry_observed DESC, market_ticker
+                    LIMIT :entry_market_limit
+                )
+                SELECT
+                    snapshot.id,
+                    snapshot.kalshi_env,
+                    snapshot.series_ticker,
+                    snapshot.market_ticker,
+                    snapshot.event_ticker,
+                    snapshot.asset_symbol,
+                    snapshot.frequency,
+                    snapshot.title,
+                    snapshot.status,
+                    snapshot.open_time,
+                    snapshot.close_time,
+                    snapshot.expected_expiration_time,
+                    snapshot.target_price_dollars,
+                    snapshot.yes_bid_dollars,
+                    snapshot.yes_ask_dollars,
+                    snapshot.no_bid_dollars,
+                    snapshot.no_ask_dollars,
+                    snapshot.last_price_dollars,
+                    snapshot.volume,
+                    snapshot.open_interest,
+                    snapshot.settlement_result,
+                    snapshot.observed_at,
+                    snapshot.source_kind,
+                    snapshot.created_at,
+                    snapshot.updated_at
+                FROM entry_markets
+                JOIN crypto_market_snapshots AS snapshot
+                  ON snapshot.market_ticker = entry_markets.market_ticker
+                WHERE {" AND ".join(snapshot_where)}
+                ORDER BY entry_markets.latest_entry_observed DESC, snapshot.market_ticker, snapshot.observed_at
+                LIMIT :limit
+                """
+            )
+            if symbols:
+                raw = raw.bindparams(bindparam("symbols", expanding=True))
+            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
+            rows = (await self.session.execute(raw, params)).mappings().all()
+            direct_rows = [
+                row
+                for row in (SimpleNamespace(**dict(row)) for row in rows)
+                if _matches_requested_duration(row)
+            ]
+            direct_rows.sort(
+                key=lambda row: (
+                    -getattr(row, "observed_at", datetime.min.replace(tzinfo=UTC)).timestamp(),
+                    str(getattr(row, "market_ticker", "")),
+                )
+            )
+            return direct_rows[:row_limit]
+        direct_stmt = (
+            select(CryptoMarketSnapshotRecord)
+            .where(*direct_conditions)
+            .order_by(CryptoMarketSnapshotRecord.observed_at.desc(), CryptoMarketSnapshotRecord.market_ticker)
+            .limit(row_limit)
+        )
+        if defer_payload:
+            direct_stmt = direct_stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+        direct_rows = [
+            row
+            for row in (await self.session.execute(direct_stmt)).scalars()
+            if _matches_requested_duration(row)
+        ]
+        if len(direct_rows) >= row_limit or not include_joined_fallback:
+            return direct_rows
+
         if bind is not None and bind.dialect.name == "postgresql":
             from sqlalchemy import text as sql_text
 
@@ -1446,10 +1841,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             snapshot_where = [
                 "snapshot.kalshi_env = :env",
                 "snapshot.source_kind <> 'settled_backfill'",
-                "snapshot.yes_bid_dollars IS NOT NULL",
-                "snapshot.yes_ask_dollars IS NOT NULL",
-                "snapshot.no_bid_dollars IS NOT NULL",
-                "snapshot.no_ask_dollars IS NOT NULL",
+                """
+                (
+                    (snapshot.yes_bid_dollars IS NOT NULL AND snapshot.yes_ask_dollars IS NOT NULL)
+                    OR (snapshot.no_bid_dollars IS NOT NULL AND snapshot.no_ask_dollars IS NOT NULL)
+                )
+                """,
                 "snapshot.market_ticker = labels.market_ticker",
             ]
             params: dict[str, Any] = {"env": env, "limit": row_limit}
@@ -1465,6 +1862,27 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 label_where.append("observed_at >= :since")
                 snapshot_where.append("snapshot.observed_at >= :since")
                 params["since"] = since
+            if duration_bounds is not None:
+                label_where.append(
+                    """
+                    (
+                        open_time IS NULL
+                        OR close_time IS NULL
+                        OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN :duration_min AND :duration_max
+                    )
+                    """
+                )
+                snapshot_where.append(
+                    """
+                    (
+                        snapshot.open_time IS NULL
+                        OR snapshot.close_time IS NULL
+                        OR EXTRACT(EPOCH FROM (snapshot.close_time - snapshot.open_time)) BETWEEN :duration_min AND :duration_max
+                    )
+                    """
+                )
+                params["duration_min"] = duration_bounds[0]
+                params["duration_max"] = duration_bounds[1]
             raw = sql_text(
                 f"""
                 WITH labels AS (
@@ -1541,7 +1959,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
             await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
             rows = (await self.session.execute(raw, params)).mappings().all()
-            return [SimpleNamespace(**dict(row)) for row in rows]
+            fallback_rows = [
+                row
+                for row in (SimpleNamespace(**dict(row)) for row in rows)
+                if _matches_requested_duration(row)
+            ]
+            if direct_rows:
+                return _merge_quote_path_rows(direct_rows, fallback_rows)
+            return fallback_rows
 
         label_conditions = [
             CryptoMarketSnapshotRecord.kalshi_env == env,
@@ -1566,14 +1991,20 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             if ticker and result in {"yes", "no"} and ticker not in label_map:
                 label_map[ticker] = result
         if not label_map:
-            return []
+            return direct_rows
         conditions = [
             CryptoMarketSnapshotRecord.kalshi_env == env,
             CryptoMarketSnapshotRecord.source_kind != "settled_backfill",
-            CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
-            CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
-            CryptoMarketSnapshotRecord.no_bid_dollars.is_not(None),
-            CryptoMarketSnapshotRecord.no_ask_dollars.is_not(None),
+            or_(
+                and_(
+                    CryptoMarketSnapshotRecord.yes_bid_dollars.is_not(None),
+                    CryptoMarketSnapshotRecord.yes_ask_dollars.is_not(None),
+                ),
+                and_(
+                    CryptoMarketSnapshotRecord.no_bid_dollars.is_not(None),
+                    CryptoMarketSnapshotRecord.no_ask_dollars.is_not(None),
+                ),
+            ),
         ]
         if frequency is not None:
             conditions.append(CryptoMarketSnapshotRecord.frequency == frequency)
@@ -1599,6 +2030,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 if str(snapshot.settlement_result or "").lower() not in {"yes", "no"} and joined in {"yes", "no"}:
                     set_committed_value(snapshot, "settlement_result", joined)
                 snapshots.append(snapshot)
+        if direct_rows:
+            return _merge_quote_path_rows(direct_rows, snapshots)
+        snapshots = [snapshot for snapshot in snapshots if _matches_requested_duration(snapshot)]
         snapshots.sort(key=lambda row: (row.observed_at, row.market_ticker), reverse=True)
         return snapshots[:row_limit]
 
@@ -1649,23 +2083,23 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             from sqlalchemy import text as sql_text
 
             filters = [
-                "kalshi_env = :kalshi_env",
-                "market_ticker = :market_ticker",
-                "source_kind != 'settled_backfill'",
-                "settlement_result IS NULL",
+                "snapshot.kalshi_env = :kalshi_env",
+                "snapshot.market_ticker = :market_ticker",
+                "snapshot.source_kind != 'settled_backfill'",
+                "snapshot.settlement_result IS NULL",
             ]
             params: dict[str, Any] = {"kalshi_env": env}
             if frequency is not None:
-                filters.append("frequency = :frequency")
+                filters.append("snapshot.frequency = :frequency")
                 params["frequency"] = frequency
             if observed_since is not None:
-                filters.append("observed_at >= :observed_since")
+                filters.append("snapshot.observed_at >= :observed_since")
                 params["observed_since"] = observed_since
             await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
             await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
             stmt = sql_text(
                 f"""
-                UPDATE crypto_market_snapshots
+                UPDATE crypto_market_snapshots AS snapshot
                 SET settlement_result = :settlement_result,
                     updated_at = now()
                 WHERE {" AND ".join(filters)}
@@ -1681,8 +2115,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                         "settlement_result": settlement_result,
                     },
                 )
-                if result.rowcount is not None and result.rowcount > 0:
-                    total += result.rowcount
+                total += int(result.rowcount or 0)
             return total
         total = 0
         for market_ticker, settlement_result in rows:
@@ -1700,7 +2133,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 stmt = stmt.where(CryptoMarketSnapshotRecord.frequency == frequency)
             if observed_since is not None:
                 stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= observed_since)
-            result = await self.session.execute(stmt)
+            result = await self.session.execute(stmt.execution_options(synchronize_session=False))
             if result.rowcount is not None and result.rowcount > 0:
                 total += result.rowcount
         return total
@@ -1735,6 +2168,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             kalshi_env=kalshi_env,
             asset_symbols=asset_symbols,
             limit=max(limit * 6, limit),
+            match_frequency_duration=True,
         )
         latest: list[CryptoMarketSnapshotRecord] = []
         seen: set[str] = set()
