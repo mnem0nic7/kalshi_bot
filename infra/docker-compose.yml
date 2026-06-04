@@ -760,41 +760,48 @@ services:
           cycle=$((cycle + 1))
           assets="$${CRYPTO_15M_TOUCH20_RULES_ASSETS:-BTC}"
           assets="$${assets//,/ }"
+          pids=()
           for asset in $$assets; do
-            replay_gate_every="$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES:-80}"
-            if [[ "$$replay_gate_every" =~ ^[0-9]+$ ]] && (( replay_gate_every > 0 )) && { (( cycle == 1 )) || (( cycle % replay_gate_every == 0 )); }; then
-              echo "refreshing $$asset 15m non-model touch20 replay/gate" >&2
-              if ! kalshi-bot-cli crypto-non-model-touch20 replay \
-                --kalshi-env production \
-                --frequency 15m \
-                --asset "$$asset" \
-                --days "$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS:-30}" \
-                --json; then
-                echo "$$asset 15m non-model touch20 replay refresh failed" >&2
-              elif ! kalshi-bot-cli crypto-non-model-touch20 gate \
-                --kalshi-env production \
-                --frequency 15m \
-                --asset "$$asset" \
-                --json; then
-                echo "$$asset 15m non-model touch20 gate refresh failed" >&2
+            (
+              replay_gate_every="$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES:-80}"
+              if [[ "$$replay_gate_every" =~ ^[0-9]+$ ]] && (( replay_gate_every > 0 )) && { (( cycle == 1 )) || (( cycle % replay_gate_every == 0 )); }; then
+                echo "refreshing $$asset 15m non-model touch20 replay/gate" >&2
+                if ! kalshi-bot-cli crypto-non-model-touch20 replay \
+                  --kalshi-env production \
+                  --frequency 15m \
+                  --asset "$$asset" \
+                  --days "$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS:-30}" \
+                  --json; then
+                  echo "$$asset 15m non-model touch20 replay refresh failed" >&2
+                elif ! kalshi-bot-cli crypto-non-model-touch20 gate \
+                  --kalshi-env production \
+                  --frequency 15m \
+                  --asset "$$asset" \
+                  --json; then
+                  echo "$$asset 15m non-model touch20 gate refresh failed" >&2
+                fi
               fi
-            fi
-            echo "starting $$asset 15m non-model touch20 exit pass" >&2
-            if ! kalshi-bot-cli crypto-non-model-touch20 exit-once \
-              --kalshi-env production \
-              --frequency 15m \
-              --asset "$$asset" \
-              --json; then
-              echo "$$asset 15m non-model touch20 exit pass failed" >&2
-            fi
-            echo "starting $$asset 15m non-model touch20 entry pass" >&2
-            if ! kalshi-bot-cli crypto-non-model-touch20 run-once \
-              --kalshi-env production \
-              --frequency 15m \
-              --asset "$$asset" \
-              --json; then
-              echo "$$asset 15m non-model touch20 entry pass failed" >&2
-            fi
+              echo "starting $$asset 15m non-model touch20 exit pass" >&2
+              if ! kalshi-bot-cli crypto-non-model-touch20 exit-once \
+                --kalshi-env production \
+                --frequency 15m \
+                --asset "$$asset" \
+                --json; then
+                echo "$$asset 15m non-model touch20 exit pass failed" >&2
+              fi
+              echo "starting $$asset 15m non-model touch20 entry pass" >&2
+              if ! kalshi-bot-cli crypto-non-model-touch20 run-once \
+                --kalshi-env production \
+                --frequency 15m \
+                --asset "$$asset" \
+                --json; then
+                echo "$$asset 15m non-model touch20 entry pass failed" >&2
+              fi
+            ) &
+            pids+=($$!)
+          done
+          for pid in "$${pids[@]}"; do
+            wait "$$pid" || true
           done
         done
     environment:
