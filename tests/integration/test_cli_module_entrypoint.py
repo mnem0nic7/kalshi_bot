@@ -164,8 +164,35 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     policy_optimize_args = parser.parse_args(
         ["crypto-policy", "optimize", "--kalshi-env", "production", "--frequency", "15m", "--days", "30", "--assets", "BTC", "ETH", "--json"]
     )
+    policy_override_args = parser.parse_args(
+        [
+            "crypto-policy",
+            "set-asset-override",
+            "--kalshi-env",
+            "production",
+            "--asset",
+            "BTC",
+            "--frequency",
+            "1h",
+            "--min-price",
+            "0.40",
+        ]
+    )
     live_path_status_args = parser.parse_args(
-        ["crypto-live-path", "status", "--kalshi-env", "production", "--frequency", "15m", "--assets", "BTC", "ETH", "--baselines", "--json"]
+        [
+            "crypto-live-path",
+            "status",
+            "--kalshi-env",
+            "production",
+            "--frequency",
+            "15m",
+            "--assets",
+            "BTC",
+            "ETH",
+            "--baselines",
+            "--skip-growth",
+            "--json",
+        ]
     )
     live_path_refresh_args = parser.parse_args(
         [
@@ -256,10 +283,13 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert policy_optimize_args.command == "crypto-policy"
     assert policy_optimize_args.crypto_policy_command == "optimize"
     assert policy_optimize_args.assets == ["BTC", "ETH"]
+    assert policy_override_args.crypto_policy_command == "set-asset-override"
+    assert policy_override_args.frequency == "1h"
     assert live_path_status_args.command == "crypto-live-path"
     assert live_path_status_args.crypto_live_path_command == "status"
     assert live_path_status_args.assets == ["BTC", "ETH"]
     assert live_path_status_args.baselines is True
+    assert live_path_status_args.skip_growth is True
     assert live_path_refresh_args.crypto_live_path_command == "refresh"
     assert live_path_refresh_args.history_days == 2
     assert live_path_refresh_args.settled_days == 2
@@ -375,6 +405,69 @@ def test_crypto_live_path_recommends_current_spot_when_spot_is_stale() -> None:
     assert report["next_command"] == (
         "crypto-spot collect-current --kalshi-env production --frequency 1h --assets BTC --json"
     )
+
+
+def test_crypto_live_path_reports_strict_quote_day_blocker_for_oos_replay() -> None:
+    report = cli_module._crypto_live_path_assess_asset(
+        "BTC",
+        history_status={
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {
+                    "BTC": {
+                        "strict_trade_eligible_rows": 80,
+                        "strict_market_day_count": 1,
+                    }
+                },
+                "strict_quote_ingestion_audit_by_asset": {
+                    "BTC": {
+                        "snapshot_present": 80,
+                        "settled_label_joined": 80,
+                        "spot_joined": 80,
+                        "strict_trade_eligible": 80,
+                        "strict_market_day_count": 1,
+                        "strict_market_days": ["2026-06-05"],
+                        "blocker_stage": "ready_for_replay",
+                    }
+                },
+            }
+        },
+        spot_status={
+            "spot_quality": {
+                "coverage_pct": 1.0,
+                "assets": {"BTC": {"row_count": 80}},
+                "missing_assets": [],
+                "stale_assets": [],
+            }
+        },
+        runtime_state={
+            "deployment": {"kalshi_env": "production"},
+            "asset_modes": {"BTC": "live"},
+            "artifacts": {
+                "BTC": {
+                    "model": {"status": "trained"},
+                    "backtest": {
+                        "status": "warn",
+                        "metrics": {
+                            "strict_trade_eligible_count": 80,
+                            "current_model_live_quality_candidate_count": 50,
+                            "oos_trade_candidate_count": 0,
+                            "oos_evaluation_status": "insufficient_data",
+                            "oos_fold_count": 0,
+                            "net_simulated_pl_dollars": 10.0,
+                            "pnl_advantage_vs_market_mid_dollars": 5.0,
+                        },
+                    },
+                    "replay_gate": {"status": "blocked"},
+                }
+            },
+        },
+        frequency="1h",
+        strict_rows_target=60,
+        candidate_target=50,
+    )
+
+    assert "strict_quote_market_day_count 1 < 2 for OOS replay" in report["blockers"]
+    assert report["quote_evidence"]["strict_quote_market_day_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -843,9 +936,12 @@ def test_crypto_live_path_refresh_script_explicit_assets_bypass_discovery(tmp_pa
     assert result.returncode == 0, result.stderr
     calls = (tmp_path / "calls.log").read_text(encoding="utf-8").splitlines()
     assert not any(call.startswith("crypto-asset-mode list ") for call in calls)
-    assert calls == [
-        "crypto-live-path refresh --kalshi-env production --frequency 1h --settled-days 2 --history-days 2 --spot-days 2 --replay-days 30 --assets XRP --json"
-    ]
+    expected = (
+        "crypto-live-path refresh --kalshi-env production --frequency 1h "
+        "--settled-days 2 --history-days 2 --spot-days 2 --replay-days 30 "
+        "--assets XRP --skip-growth --json"
+    )
+    assert calls == [expected]
 
 
 @pytest.mark.asyncio

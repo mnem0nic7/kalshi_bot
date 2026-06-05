@@ -29,6 +29,7 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.crypto.services import (
     _latest_crypto_artifact_for_asset,
+    crypto_entry_override_key,
     crypto_frequency_switch_enabled,
     crypto_strategy_code_for_frequency,
     normalize_asset_symbol,
@@ -1077,6 +1078,12 @@ def _crypto_live_path_args_with_asset_resolution(
     return argparse.Namespace(**values)
 
 
+def _crypto_live_path_args_with_fast_status(args: argparse.Namespace) -> argparse.Namespace:
+    values = vars(args).copy()
+    values["skip_growth"] = True
+    return argparse.Namespace(**values)
+
+
 def _crypto_live_path_preflight_retry_assets(operation_errors: list[dict[str, Any]]) -> list[str]:
     assets: list[str] = []
     seen: set[str] = set()
@@ -1570,7 +1577,7 @@ async def _crypto_live_path_runtime_state(
         },
         "asset_modes": modes,
         "asset_entry_thresholds": {
-            asset: crypto_policy.entry_for_asset(asset)
+            asset: crypto_policy.entry_for_asset(asset, frequency=frequency)
             for asset in assets
         },
         "artifacts": artifacts,
@@ -1615,6 +1622,12 @@ def _crypto_live_path_assess_asset(
         _int_or_zero(support.get("strict_trade_eligible_rows")),
         _int_or_zero(metrics.get("strict_trade_eligible_count")),
     )
+    strict_quote_day_count = max(
+        _int_or_zero(support.get("strict_market_day_count")),
+        _int_or_zero(support.get("strict_settlement_day_count")),
+        _int_or_zero(strict_audit.get("strict_market_day_count")),
+        _int_or_zero(strict_audit.get("strict_settlement_day_count")),
+    )
     current_model_live_candidates = _int_or_zero(
         metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count"))
     )
@@ -1641,6 +1654,8 @@ def _crypto_live_path_assess_asset(
     warnings: list[str] = []
     if strict_rows < strict_rows_target:
         blockers.append(f"strict_trade_eligible_count {strict_rows} < {strict_rows_target}")
+    if strict_quote_day_count and not has_usable_oos and strict_quote_day_count < 2:
+        blockers.append(f"strict_quote_market_day_count {strict_quote_day_count} < 2 for OOS replay")
     if has_usable_oos and oos_trade_candidates < candidate_target:
         blockers.append(f"oos_trade_candidate_count {oos_trade_candidates} < {candidate_target}")
     if current_model_live_candidates < candidate_target:
@@ -1711,6 +1726,7 @@ def _crypto_live_path_assess_asset(
         "next_command": next_command,
         "quote_evidence": {
             "strict_trade_eligible_count": strict_rows,
+            "strict_quote_market_day_count": strict_quote_day_count,
             "trade_candidate_support": support,
             "strict_quote_ingestion_audit": strict_audit,
         },
@@ -1800,14 +1816,17 @@ async def _crypto_live_path_status_payload(
         )
         for asset in assets
     ]
-    strict_row_growth = await _crypto_live_path_strict_row_growth(
-        container,
-        assets=assets,
-        frequency=frequency,
-        asset_reports=asset_reports,
-        strict_rows_target=getattr(args, "strict_rows_target", CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET),
-        candidate_target=getattr(args, "candidate_target", CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET),
-    )
+    if getattr(args, "skip_growth", False):
+        strict_row_growth = {"status": "skipped", "reason": "skip_growth"}
+    else:
+        strict_row_growth = await _crypto_live_path_strict_row_growth(
+            container,
+            assets=assets,
+            frequency=frequency,
+            asset_reports=asset_reports,
+            strict_rows_target=getattr(args, "strict_rows_target", CRYPTO_LIVE_PATH_STRICT_ROWS_TARGET),
+            candidate_target=getattr(args, "candidate_target", CRYPTO_LIVE_PATH_TRADE_CANDIDATES_TARGET),
+        )
     optimization_by_asset: dict[str, Any] = {}
     baseline_comparison = None
     if getattr(args, "baselines", False):
@@ -1917,7 +1936,8 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
         assets=assets,
         asset_discovery=asset_discovery,
     )
-    pre_status = await _crypto_live_path_status_payload(resolved_args, container)
+    status_args = _crypto_live_path_args_with_fast_status(resolved_args)
+    pre_status = await _crypto_live_path_status_payload(status_args, container)
     iteration_results: list[dict[str, Any]] = []
     operation_errors: list[dict[str, Any]] = []
     max_iterations = max(1, int(getattr(args, "max_iterations", 1) or 1))
@@ -2042,7 +2062,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 result["errors"].append(error)
                 operation_errors.append(error)
             asset_results.append(result)
-        iteration_status = await _crypto_live_path_status_payload(resolved_args, container)
+        iteration_status = await _crypto_live_path_status_payload(status_args, container)
         if getattr(args, "until_ready", False):
             current_strict_counts = _crypto_status_strict_counts(iteration_status)
             snapshot_counts = _crypto_status_snapshot_counts(iteration_status)
@@ -2081,7 +2101,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
             await asyncio.sleep(float(args.sleep_seconds))
 
     post_refresh_recovery: list[dict[str, Any]] = []
-    post_status = await _crypto_live_path_status_payload(resolved_args, container)
+    post_status = await _crypto_live_path_status_payload(status_args, container)
     retry_assets = _crypto_live_path_preflight_retry_assets(operation_errors)
     if retry_assets:
         post_refresh_recovery, resolved_retry_assets, retry_errors = await _crypto_live_path_retry_training_after_refresh(
@@ -2101,7 +2121,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 )
             ]
         operation_errors.extend(retry_errors)
-        post_status = await _crypto_live_path_status_payload(resolved_args, container)
+        post_status = await _crypto_live_path_status_payload(status_args, container)
     output = {
         "schema_version": "crypto-live-path-v1",
         "status": "completed" if not operation_errors else "completed_with_errors",
@@ -2156,9 +2176,19 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
                 pack = AgentPack.model_validate(existing_record.payload)
             else:
                 pack = await agent_pack_service.get_active_pack(repo)
-            pack = pack.model_copy(update={"version": _OVERRIDES_VERSION, "source": "operator_override", "description": "Operator asset-level entry overrides on top of builtin defaults"})
+            pack = pack.model_copy(
+                update={
+                    "version": _OVERRIDES_VERSION,
+                    "source": "operator_override",
+                    "description": "Operator asset-level entry overrides on top of builtin defaults",
+                }
+            )
             symbol = args.asset.upper()
-            existing_override = pack.crypto_policy.asset_entry_overrides.get(symbol) or AgentPackCryptoEntryPolicy()
+            override_key = crypto_entry_override_key(symbol, getattr(args, "frequency", None))
+            existing_override = (
+                pack.crypto_policy.asset_entry_overrides.get(override_key)
+                or AgentPackCryptoEntryPolicy()
+            )
             updates: dict[str, Any] = {}
             if args.min_edge_bps is not None:
                 updates["min_fee_adjusted_edge_bps"] = int(args.min_edge_bps)
@@ -2172,13 +2202,25 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
             if args.target_position_pct is not None:
                 updates["target_position_pct"] = float(args.target_position_pct)
             updated_override = existing_override.model_copy(update=updates)
-            pack.crypto_policy.asset_entry_overrides[symbol] = updated_override
+            pack.crypto_policy.asset_entry_overrides[override_key] = updated_override
             await repo.update_agent_pack(pack)
             # Point the active color at the overrides pack
             active_color = control.active_color
             await agent_pack_service.assign_pack_to_color(repo, color=active_color, version=_OVERRIDES_VERSION)
             await session.commit()
-        print(json.dumps({"asset": symbol, "override": updated_override.model_dump(exclude_none=True), "pack_version": _OVERRIDES_VERSION, "assigned_color": active_color}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "asset": symbol,
+                    "frequency": getattr(args, "frequency", None),
+                    "override_key": override_key,
+                    "override": updated_override.model_dump(exclude_none=True),
+                    "pack_version": _OVERRIDES_VERSION,
+                    "assigned_color": active_color,
+                },
+                indent=2,
+            )
+        )
         return 0
     if args.crypto_policy_command == "show":
         from kalshi_bot.services.agent_packs import AgentPackService as _AgentPackService
@@ -4784,6 +4826,7 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_policy_override = crypto_policy_subparsers.add_parser("set-asset-override")
     add_kalshi_env_argument(crypto_policy_override)
     crypto_policy_override.add_argument("--asset", required=True, help="Asset symbol, e.g. HYPE")
+    crypto_policy_override.add_argument("--frequency", default=None, help="Optional frequency scope, e.g. 1h")
     crypto_policy_override.add_argument("--min-edge-bps", type=int, default=None, dest="min_edge_bps")
     crypto_policy_override.add_argument("--min-price", type=float, default=None, dest="min_price")
     crypto_policy_override.add_argument("--max-spread-bps", type=int, default=None, dest="max_spread_bps")
@@ -4809,6 +4852,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
         live_path_command.add_argument("--require-ready", action="store_true")
         live_path_command.add_argument("--baselines", action="store_true")
+        live_path_command.add_argument(
+            "--skip-growth",
+            action="store_true",
+            help="Skip expensive strict-row growth projections in status output.",
+        )
         live_path_command.add_argument("--json", action="store_true")
         if name == "refresh":
             live_path_command.add_argument("--settled-days", type=int, default=2)

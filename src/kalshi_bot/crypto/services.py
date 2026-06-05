@@ -128,7 +128,7 @@ CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
     "max_spread_bps": (80, 150, 250, 400, 600, 1000),
     "min_contract_price_dollars": (0.50, 0.60, 0.70),
-    "min_remaining_payout_bps": (0,),
+    "min_remaining_payout_bps": (0, 100, 300, 500),
 }
 CRYPTO_MICROSTRUCTURE_UPSERT_COMMIT_INTERVAL = 250
 CRYPTO_TRAINING_STEP_RETRY_DELAYS_SECONDS = (5.0, 15.0, 45.0)
@@ -535,6 +535,24 @@ def _filter_crypto_snapshot_rows(rows: list[Any], asset_symbols: list[str] | Non
     if not symbols:
         return rows
     return [row for row in rows if normalize_asset_symbol(str(getattr(row, "asset_symbol", "") or "")) in symbols]
+
+
+def _dedupe_crypto_snapshot_rows(rows: list[Any]) -> list[Any]:
+    deduped: list[Any] = []
+    seen: set[Any] = set()
+    for row in rows:
+        key = getattr(row, "id", None)
+        if key is None:
+            key = (
+                getattr(row, "market_ticker", None),
+                getattr(row, "observed_at", None),
+                getattr(row, "source_kind", None),
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
 def _filter_crypto_dict_rows(rows: list[dict[str, Any]], asset_symbols: list[str] | None) -> list[dict[str, Any]]:
@@ -3193,6 +3211,15 @@ class CryptoForecastService:
                     since=since,
                     limit=self.settings.crypto_train_max_snapshots,
                 )
+                live_quote_rows = await repo.list_crypto_live_quote_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=since,
+                    limit=self.settings.crypto_train_max_snapshots,
+                )
+                if live_quote_rows:
+                    rows = _dedupe_crypto_snapshot_rows([*rows, *live_quote_rows])
                 candles = await repo.list_crypto_market_candlesticks(
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
@@ -3339,6 +3366,15 @@ class CryptoForecastService:
                     settled_only=True,
                     limit=100_000,
                 )
+                live_quote_rows = await repo.list_crypto_live_quote_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=cutoff,
+                    limit=100_000,
+                )
+                if live_quote_rows:
+                    rows = _dedupe_crypto_snapshot_rows([*rows, *live_quote_rows])
                 candles = await repo.list_crypto_market_candlesticks(
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
@@ -3574,7 +3610,7 @@ class CryptoForecastService:
             enforce_empirical_bucket_gate=True,
             touch_replay_gate=touch_gate,
         )
-        entry_policy = crypto_policy.entry_for_asset(market.asset_symbol)
+        entry_policy = crypto_policy.entry_for_asset(market.asset_symbol, frequency=market.frequency)
         runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
         trade_fair = _decimal(trace.get("fair_yes_dollars") or fair)
         confidence = min(0.95, max(float(entry_policy["min_confidence"]), 0.80 + abs(edge_bps) / 20000))
@@ -3687,7 +3723,11 @@ class CryptoForecastService:
                     "backtest_version": backtest.version if backtest is not None else None,
                     "replay_gate_status": gate.status if gate is not None else "missing",
                     "touch_replay_gate_status": touch_gate.status if touch_gate is not None else "missing",
-                    "runtime_crypto_policy": _runtime_crypto_policy_payload(crypto_policy, asset_symbol=market.asset_symbol),
+                    "runtime_crypto_policy": _runtime_crypto_policy_payload(
+                        crypto_policy,
+                        asset_symbol=market.asset_symbol,
+                        frequency=market.frequency,
+                    ),
                 },
             },
             capital_bucket="safe",
@@ -3899,6 +3939,15 @@ class CryptoReplayService:
                     settled_only=True,
                     limit=200_000,
                 )
+                live_quote_snapshots = await repo.list_crypto_live_quote_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=cutoff,
+                    limit=200_000,
+                )
+                if live_quote_snapshots:
+                    snapshots = _dedupe_crypto_snapshot_rows([*snapshots, *live_quote_snapshots])
                 candles = await repo.list_crypto_market_candlesticks(
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
@@ -3938,13 +3987,14 @@ class CryptoReplayService:
                 asset_rows,
                 settings=self.settings,
                 crypto_policy=crypto_policy,
+                frequency=freq,
             )
             asset_reports.append(report)
             winner = report.get("winner")
             if report.get("status") == "stageable" and isinstance(winner, dict):
                 entry = winner.get("entry_policy")
                 if isinstance(entry, dict):
-                    staged_overrides[asset] = entry
+                    staged_overrides[str(report.get("override_key") or crypto_entry_override_key(asset, freq))] = entry
         return {
             "schema_version": "crypto-entry-policy-optimizer-v1",
             "status": "ok",
@@ -4462,6 +4512,15 @@ class CryptoReplayService:
                     settled_only=True,
                     limit=200_000,
                 )
+                live_quote_snapshots = await repo.list_crypto_live_quote_snapshots(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    asset_symbols=requested_assets or None,
+                    since=cutoff,
+                    limit=200_000,
+                )
+                if live_quote_snapshots:
+                    snapshots = _dedupe_crypto_snapshot_rows([*snapshots, *live_quote_snapshots])
                 candles = await repo.list_crypto_market_candlesticks(
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
@@ -4757,6 +4816,7 @@ class CryptoExecutionService:
                     "runtime_crypto_policy": _runtime_crypto_policy_payload(
                         crypto_policy,
                         asset_symbol=market.asset_symbol,
+                        frequency=market.frequency,
                     )
                     if crypto_policy is not None
                     else None,
@@ -4878,7 +4938,12 @@ class CryptoExecutionService:
                         client_order_id=f"{client_order_id}:maker",
                         fair_yes_dollars=fair_yes_dollars,
                         min_edge_bps=(
-                            int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                            int(
+                                crypto_policy.entry_for_asset(
+                                    market.asset_symbol,
+                                    frequency=market.frequency,
+                                )["min_fee_adjusted_edge_bps"]
+                            )
                             if crypto_policy is not None
                             else None
                         ),
@@ -4970,7 +5035,12 @@ class CryptoExecutionService:
             client_order_id=f"{client_order_id}:taker",
             fair_yes_dollars=fair_yes_dollars,
             min_edge_bps=(
-                int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+                int(
+                    crypto_policy.entry_for_asset(
+                        market.asset_symbol,
+                        frequency=market.frequency,
+                    )["min_fee_adjusted_edge_bps"]
+                )
                 if crypto_policy is not None
                 else None
             ),
@@ -5029,7 +5099,12 @@ class CryptoExecutionService:
             return False
         seconds_to_close = (market.close_time - datetime.now(UTC)).total_seconds()
         min_edge_bps = (
-            int(crypto_policy.entry_for_asset(market.asset_symbol)["min_fee_adjusted_edge_bps"])
+            int(
+                crypto_policy.entry_for_asset(
+                    market.asset_symbol,
+                    frequency=market.frequency,
+                )["min_fee_adjusted_edge_bps"]
+            )
             if crypto_policy is not None
             else self.settings.risk_min_edge_bps
         )
@@ -5196,6 +5271,7 @@ class CryptoWorkflowService:
                             "runtime_crypto_policy": _runtime_crypto_policy_payload(
                                 crypto_policy,
                                 asset_symbol=market.asset_symbol,
+                                frequency=market.frequency,
                             ),
                         },
                     },
@@ -6358,9 +6434,10 @@ def _runtime_crypto_policy_payload(
     crypto_policy: RuntimeCryptoPolicy,
     *,
     asset_symbol: str | None = None,
+    frequency: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "entry": crypto_policy.entry_for_asset(asset_symbol),
+        "entry": crypto_policy.entry_for_asset(asset_symbol, frequency=frequency),
         "replay": {
             "min_resolved_markets": crypto_policy.replay_min_resolved_markets,
             "min_trade_candidates": crypto_policy.replay_min_trade_candidates,
@@ -7883,6 +7960,17 @@ def _crypto_quote_evidence_summary(
     *,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
+    def _day_key(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return _as_utc_datetime(value).date().isoformat()
+        if isinstance(value, str):
+            parsed = parse_datetime(value)
+            if parsed is not None:
+                return _as_utc_datetime(parsed).date().isoformat()
+            raw = value.strip()
+            return raw[:10] if raw else None
+        return None
+
     real_snapshots = [
         row
         for row in snapshots
@@ -7898,6 +7986,7 @@ def _crypto_quote_evidence_summary(
     strict_trade_rows = [row for row in decision_rows if row.get("strict_trade_eligible")]
     proxy_rows = [row for row in decision_rows if row.get("quote_source") != "snapshot_quotes"]
     candidates_by_asset: dict[str, dict[str, Any]] = {}
+    strict_days_by_asset: dict[str, dict[str, set[str]]] = {}
     for row in decision_rows:
         asset = normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN"))
         summary = candidates_by_asset.setdefault(
@@ -7910,6 +7999,13 @@ def _crypto_quote_evidence_summary(
                 "prediction_only_rows": 0,
             },
         )
+        days = strict_days_by_asset.setdefault(
+            asset,
+            {
+                "market_days": set(),
+                "settlement_days": set(),
+            },
+        )
         if row.get("quote_source") == "snapshot_quotes":
             summary["real_quote_rows"] += 1
         else:
@@ -7917,12 +8013,50 @@ def _crypto_quote_evidence_summary(
             summary["prediction_only_rows"] += 1
         if row.get("strict_trade_eligible"):
             summary["strict_trade_eligible_rows"] += 1
+            market_day = _day_key(row.get("market_day")) or _day_key(row.get("decision_ts"))
+            settlement_day = _day_key(row.get("settlement_ts"))
+            if market_day:
+                days["market_days"].add(market_day)
+            if settlement_day:
+                days["settlement_days"].add(settlement_day)
             if row.get("label_yes") in {0, 1}:
                 summary["labeled_real_quote_rows"] += 1
+    for asset, days in strict_days_by_asset.items():
+        summary = candidates_by_asset.setdefault(
+            asset,
+            {
+                "real_quote_rows": 0,
+                "labeled_real_quote_rows": 0,
+                "proxy_rows": 0,
+                "strict_trade_eligible_rows": 0,
+                "prediction_only_rows": 0,
+            },
+        )
+        market_days = sorted(days["market_days"])
+        settlement_days = sorted(days["settlement_days"])
+        summary["strict_market_day_count"] = len(market_days)
+        summary["strict_market_days"] = market_days
+        summary["strict_settlement_day_count"] = len(settlement_days)
+        summary["strict_settlement_days"] = settlement_days
     strict_quote_ingestion_audit: dict[str, dict[str, Any]] = {}
     for asset in sorted({row.asset_symbol for row in snapshots} | {str(row.get("asset_symbol") or "UNKNOWN") for row in decision_rows}):
         asset_snapshots = [row for row in snapshots if normalize_asset_symbol(row.asset_symbol) == normalize_asset_symbol(asset)]
         asset_decisions = [row for row in decision_rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == normalize_asset_symbol(asset)]
+        strict_asset_decisions = [row for row in asset_decisions if row.get("strict_trade_eligible")]
+        strict_market_days = sorted(
+            {
+                day
+                for row in strict_asset_decisions
+                if (day := (_day_key(row.get("market_day")) or _day_key(row.get("decision_ts"))))
+            }
+        )
+        strict_settlement_days = sorted(
+            {
+                day
+                for row in strict_asset_decisions
+                if (day := _day_key(row.get("settlement_ts")))
+            }
+        )
         candidate_generated = 0
         eligible_candidate_generated = 0
         if settings is not None:
@@ -7953,6 +8087,10 @@ def _crypto_quote_evidence_summary(
                 or _crypto_spot_is_proxy(row.get("spot_provider"), row.get("spot_source_kind"))
             ),
             "strict_trade_eligible": sum(1 for row in asset_decisions if row.get("strict_trade_eligible")),
+            "strict_market_day_count": len(strict_market_days),
+            "strict_market_days": strict_market_days,
+            "strict_settlement_day_count": len(strict_settlement_days),
+            "strict_settlement_days": strict_settlement_days,
             "candidate_generated": candidate_generated,
             "eligible_candidate_generated": eligible_candidate_generated,
         }
@@ -11083,21 +11221,27 @@ def _runtime_crypto_policy_with_asset_entry(
     crypto_policy: RuntimeCryptoPolicy,
     asset_symbol: str,
     entry_policy: dict[str, Any],
+    *,
+    frequency: str | None = None,
 ) -> RuntimeCryptoPolicy:
     overrides = {
         symbol: dict(values)
         for symbol, values in (crypto_policy.asset_entry_overrides or {}).items()
     }
-    overrides[normalize_asset_symbol(asset_symbol)] = {
-        **dict(entry_policy),
-        "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
-    }
+    override_key = crypto_entry_override_key(asset_symbol, frequency)
+    override_entry = dict(entry_policy)
+    override_entry["min_remaining_payout_bps"] = int(
+        override_entry.get("min_remaining_payout_bps")
+        if override_entry.get("min_remaining_payout_bps") is not None
+        else crypto_policy.min_remaining_payout_bps
+    )
+    overrides[override_key] = override_entry
     return RuntimeCryptoPolicy(
         min_fee_adjusted_edge_bps=crypto_policy.min_fee_adjusted_edge_bps,
         max_spread_bps=crypto_policy.max_spread_bps,
         min_confidence=crypto_policy.min_confidence,
         min_contract_price_dollars=crypto_policy.min_contract_price_dollars,
-        min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
+        min_remaining_payout_bps=crypto_policy.min_remaining_payout_bps,
         max_credible_edge_bps=crypto_policy.max_credible_edge_bps,
         target_position_pct=crypto_policy.target_position_pct,
         replay_min_resolved_markets=crypto_policy.replay_min_resolved_markets,
@@ -11288,15 +11432,18 @@ def _crypto_optimize_asset_entry_policy(
     *,
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy,
+    frequency: str | None = None,
 ) -> dict[str, Any]:
     asset = normalize_asset_symbol(asset_symbol)
-    base_entry = crypto_policy.entry_for_asset(asset)
+    override_key = crypto_entry_override_key(asset, frequency)
+    base_entry = crypto_policy.entry_for_asset(asset, frequency=frequency)
     predicted_rows, folds = _crypto_oos_prediction_rows(rows, settings=settings, crypto_policy=crypto_policy)
     strict_rows = sum(1 for row in rows if row.get("strict_trade_eligible"))
     spot_coverage = _spot_feature_coverage(rows)
     if not predicted_rows:
         return {
             "asset": asset,
+            "override_key": override_key,
             "status": "blocked",
             "current_entry_policy": base_entry,
             "evaluated_policy_count": 0,
@@ -11311,7 +11458,12 @@ def _crypto_optimize_asset_entry_policy(
         }
     evaluations: list[dict[str, Any]] = []
     for entry_policy in _crypto_entry_policy_grid(base_entry):
-        candidate_policy = _runtime_crypto_policy_with_asset_entry(crypto_policy, asset, entry_policy)
+        candidate_policy = _runtime_crypto_policy_with_asset_entry(
+            crypto_policy,
+            asset,
+            entry_policy,
+            frequency=frequency,
+        )
         metrics, market_mid_metrics = _crypto_evaluate_oos_predictions_for_entry(
             predicted_rows,
             settings=settings,
@@ -11334,6 +11486,7 @@ def _crypto_optimize_asset_entry_policy(
     best = evaluations[0] if evaluations else None
     return {
         "asset": asset,
+        "override_key": override_key,
         "status": "stageable" if winner else "blocked",
         "current_entry_policy": base_entry,
         "evaluated_policy_count": len(evaluations),
@@ -11346,7 +11499,7 @@ def _crypto_optimize_asset_entry_policy(
         "blockers": [] if winner else list(best.get("blockers") or ["no_policy_passed"]) if best else ["no_policy_evaluated"],
         "top_policies": evaluations[:10],
         "staged_override_payload": (
-            {"crypto_policy": {"asset_entry_overrides": {asset: winner["entry_policy"]}}}
+            {"crypto_policy": {"asset_entry_overrides": {override_key: winner["entry_policy"]}}}
             if winner
             else None
         ),
@@ -11712,7 +11865,12 @@ def _crypto_entry_policy_for_row(
     crypto_policy: RuntimeCryptoPolicy | None = None,
 ) -> dict[str, Any]:
     if crypto_policy is not None:
-        entry = dict(crypto_policy.entry_for_asset(str(row.get("asset_symbol") or "")))
+        entry = dict(
+            crypto_policy.entry_for_asset(
+                str(row.get("asset_symbol") or ""),
+                frequency=_crypto_frequency_for_row(row),
+            )
+        )
         entry["min_fee_adjusted_edge_bps"] = max(
             int(entry["min_fee_adjusted_edge_bps"]),
             int(settings.risk_min_edge_bps),
@@ -11722,7 +11880,17 @@ def _crypto_entry_policy_for_row(
             float(settings.risk_min_contract_price_dollars),
         )
         entry["max_entry_price_dollars"] = max(0.0, float(settings.crypto_max_entry_price_dollars))
-        entry["min_remaining_payout_bps"] = CRYPTO_MIN_REMAINING_PAYOUT_BPS
+        entry["min_remaining_payout_bps"] = max(
+            0,
+            min(
+                10000,
+                int(
+                    entry.get("min_remaining_payout_bps")
+                    if entry.get("min_remaining_payout_bps") is not None
+                    else CRYPTO_MIN_REMAINING_PAYOUT_BPS
+                ),
+            ),
+        )
         return entry
     return {
         "min_fee_adjusted_edge_bps": int(settings.risk_min_edge_bps),

@@ -163,6 +163,7 @@ for asset in "${assets[@]}"; do
     --spot-days "${spot_days}" \
     --replay-days "${replay_days}" \
     --assets "${asset}" \
+    --skip-growth \
     --json >"${report}" 2>"${log}"; then
     echo "completed ${asset}" >&2
   else

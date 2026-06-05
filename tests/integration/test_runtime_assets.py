@@ -142,10 +142,10 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert "ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false" in env_lines
     assert "CRYPTO_CURRENT_15M_INTERVAL_SECONDS=0" in env_lines
     assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS=0" in env_lines
-    assert "CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=0" in env_lines
+    assert "CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=20" in env_lines
     assert "CRYPTO_1H_CURRENT_SETTLED_DAYS=2" in env_lines
     assert "CRYPTO_1H_CURRENT_REPLAY_GATE_ENABLED=false" in env_lines
-    assert "CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=false" in env_lines
+    assert "CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=true" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS=0" in env_lines
     assert "CRYPTO_1H_TOUCH20_LOOP_INTERVAL_SECONDS=0" in env_lines
     assert "runtime_services+=(crypto_current_1h_production)" in start_stack

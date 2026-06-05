@@ -484,7 +484,7 @@ class AgentPackService:
                 "max_spread_bps": raw_entry.max_spread_bps,
                 "min_confidence": raw_entry.min_confidence,
                 "min_contract_price_dollars": raw_entry.min_contract_price_dollars,
-                "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
+                "min_remaining_payout_bps": raw_entry.min_remaining_payout_bps,
                 "max_credible_edge_bps": raw_entry.max_credible_edge_bps,
                 "target_position_pct": raw_entry.target_position_pct,
             }
@@ -512,7 +512,19 @@ class AgentPackService:
                     max(float(override["target_position_pct"]), 0.0),
                     max_target_position_pct,
                 )
+            if override["min_remaining_payout_bps"] is not None:
+                override["min_remaining_payout_bps"] = self._clamp_int(
+                    override["min_remaining_payout_bps"],
+                    0,
+                    10000,
+                )
             overrides[_normalize_crypto_entry_override_key(raw_symbol)] = override
+
+        resolved_min_remaining_payout_bps = self._clamp_int(
+            value_or_settings(entry.min_remaining_payout_bps, CRYPTO_MIN_REMAINING_PAYOUT_BPS),
+            0,
+            10000,
+        )
 
         return RuntimeCryptoPolicy(
             min_fee_adjusted_edge_bps=resolved_min_edge_bps,
@@ -524,7 +536,11 @@ class AgentPackService:
             min_contract_price_dollars=self._contract_price_floor(
                 value_or_settings(entry.min_contract_price_dollars, self.settings.risk_min_contract_price_dollars)
             ),
-            min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
+            min_remaining_payout_bps=(
+                resolved_min_remaining_payout_bps
+                if resolved_min_remaining_payout_bps is not None
+                else CRYPTO_MIN_REMAINING_PAYOUT_BPS
+            ),
             max_credible_edge_bps=int(
                 value_or_settings(entry.max_credible_edge_bps, self.settings.risk_max_credible_edge_bps)
             ),
@@ -748,7 +764,7 @@ class AgentPackService:
                 min_contract_price,
                 0.99,
             ),
-            min_remaining_payout_bps=CRYPTO_MIN_REMAINING_PAYOUT_BPS,
+            min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, 0, 10000),
             max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
             target_position_pct=self._clamp_float(entry.target_position_pct, 0.0, max_target_position_pct),
         )

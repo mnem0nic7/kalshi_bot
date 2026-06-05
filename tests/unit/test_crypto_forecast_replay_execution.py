@@ -51,11 +51,13 @@ from kalshi_bot.crypto.services import (
     _crypto_last_minute_passive_price_ladder,
     _crypto_last_minute_passive_price_matrix,
     _crypto_lightweight_settled_data_quality,
+    _crypto_entry_policy_for_row,
     _crypto_live_pnl_gate_blocks,
     _crypto_live_pnl_gate_payload,
     _eligible_market_per_asset,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
+    _crypto_quote_evidence_summary,
     _crypto_recommendation,
     _crypto_replay_gate_note_updates,
     _crypto_replay_gate_dashboard_summary,
@@ -3954,6 +3956,46 @@ def test_crypto_entry_optimizer_stages_only_passing_policy(tmp_path) -> None:
     assert result["staged_override_payload"]["crypto_policy"]["asset_entry_overrides"]["BTC"]
 
 
+def test_crypto_entry_optimizer_scopes_staged_policy_to_frequency(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_trade_candidates=1,
+        crypto_replay_require_pnl_beats_market_mid=False,
+        risk_min_edge_bps=750,
+    )
+    policy = AgentPackService(settings).runtime_crypto_policy()
+    rows = [
+        _replay_row(
+            frequency="1h",
+            market_day=f"2026-05-0{day}",
+            market_ticker=f"KXBTC1H-OPT-{day}",
+            mid_yes_dollars=Decimal("0.5800"),
+            yes_bid_dollars=Decimal("0.4900"),
+            yes_ask_dollars=Decimal("0.5000"),
+            no_ask_dollars=Decimal("0.5100"),
+            spread_bps=100,
+            time_to_close_seconds=1800,
+            label_yes=1,
+        )
+        for day in range(1, 5)
+    ]
+
+    result = _crypto_optimize_asset_entry_policy(
+        "BTC",
+        rows,
+        settings=settings,
+        crypto_policy=policy,
+        frequency="1h",
+    )
+
+    overrides = result["staged_override_payload"]["crypto_policy"]["asset_entry_overrides"]
+    assert result["status"] == "stageable"
+    assert result["override_key"] == "BTC:1h"
+    assert "BTC:1h" in overrides
+    assert "BTC" not in overrides
+
+
 def test_crypto_entry_optimizer_leaves_policy_unchanged_when_no_policy_passes(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -5686,6 +5728,98 @@ def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
     assert candidates[0]["runtime_thresholds"]["min_contract_price_dollars"] == 0.5
 
 
+def test_crypto_entry_policy_uses_frequency_specific_asset_override(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
+        risk_min_contract_price_dollars=0.05,
+    )
+    service = AgentPackService(settings)
+    policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    asset_entry_overrides={
+                        "BTC": AgentPackCryptoEntryPolicy(min_contract_price_dollars=0.35),
+                        "BTC:1h": AgentPackCryptoEntryPolicy(
+                            min_contract_price_dollars=0.40,
+                            min_remaining_payout_bps=100,
+                        ),
+                    },
+                )
+            }
+        )
+    )
+
+    entry = _crypto_entry_policy_for_row(
+        {"asset_symbol": "BTC", "frequency": "1h"},
+        settings=settings,
+        crypto_policy=policy,
+    )
+
+    assert entry["min_contract_price_dollars"] == 0.40
+    assert entry["min_remaining_payout_bps"] == 100
+
+
+def test_crypto_candidate_quality_honors_frequency_specific_remaining_payout(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=50,
+        risk_min_contract_price_dollars=0.05,
+        crypto_max_entry_price_dollars=0.0,
+        crypto_live_min_market_age_seconds=60,
+        crypto_market_price_anchor_weight=0.0,
+        kalshi_taker_fee_rate=0.0,
+    )
+    service = AgentPackService(settings)
+    base_policy = service.runtime_crypto_policy(service.default_pack())
+    one_hour_policy = service.runtime_crypto_policy(
+        service.default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    asset_entry_overrides={
+                        "BTC:1h": AgentPackCryptoEntryPolicy(min_remaining_payout_bps=100),
+                    },
+                )
+            }
+        )
+    )
+    row = {
+        "market_ticker": "KXBTC1H-REMAINING",
+        "asset_symbol": "BTC",
+        "frequency": "1h",
+        "mid_yes_dollars": Decimal("0.9750"),
+        "yes_bid_dollars": Decimal("0.9750"),
+        "yes_ask_dollars": Decimal("0.9750"),
+        "no_ask_dollars": Decimal("0.0250"),
+        "spread_bps": 0,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_ohlc",
+        "time_to_close_seconds": 1800,
+        "market_age_seconds": 300,
+    }
+
+    default_candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.9950"),
+        settings=settings,
+        crypto_policy=base_policy,
+    )
+    one_hour_candidates = _crypto_trade_candidates(
+        row,
+        Decimal("0.9950"),
+        settings=settings,
+        crypto_policy=one_hour_policy,
+    )
+
+    default_yes = next(candidate for candidate in default_candidates if candidate["side"] == "yes")
+    one_hour_yes = next(candidate for candidate in one_hour_candidates if candidate["side"] == "yes")
+    assert default_yes["reason"] == "remaining_payout_below_crypto_min"
+    assert default_yes["runtime_thresholds"]["min_remaining_payout_bps"] == 300
+    assert one_hour_yes["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert one_hour_yes["runtime_thresholds"]["min_remaining_payout_bps"] == 100
+
+
 def test_crypto_candidate_quality_blocks_entry_above_max_price(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -6121,6 +6255,72 @@ def test_crypto_lightweight_settled_data_quality_reports_requested_assets() -> N
     }
 
 
+def test_crypto_quote_evidence_summary_counts_strict_quote_days() -> None:
+    snapshots = [
+        SimpleNamespace(
+            asset_symbol="BTC",
+            market_ticker="KXBTC1H-DAY1",
+            source_kind="live_quote_evidence",
+            settlement_result="yes",
+            observed_at=datetime(2026, 6, 5, 12, 0, tzinfo=UTC),
+            yes_bid_dollars=Decimal("0.4800"),
+            yes_ask_dollars=Decimal("0.5000"),
+            payload={},
+        ),
+        SimpleNamespace(
+            asset_symbol="BTC",
+            market_ticker="KXBTC1H-DAY2",
+            source_kind="live_quote_evidence",
+            settlement_result="no",
+            observed_at=datetime(2026, 6, 6, 12, 0, tzinfo=UTC),
+            yes_bid_dollars=Decimal("0.4800"),
+            yes_ask_dollars=Decimal("0.5000"),
+            payload={},
+        ),
+    ]
+    decision_rows = [
+        {
+            "asset_symbol": "BTC",
+            "quote_source": "snapshot_quotes",
+            "strict_trade_eligible": True,
+            "label_yes": 1,
+            "market_day": "2026-06-05",
+            "decision_ts": datetime(2026, 6, 5, 12, 0, tzinfo=UTC),
+            "settlement_ts": datetime(2026, 6, 5, 13, 0, tzinfo=UTC),
+            "leakage_status": "point_in_time",
+            "spot_feature_status": "available",
+        },
+        {
+            "asset_symbol": "BTC",
+            "quote_source": "snapshot_quotes",
+            "strict_trade_eligible": True,
+            "label_yes": 0,
+            "market_day": "2026-06-06",
+            "decision_ts": datetime(2026, 6, 6, 12, 0, tzinfo=UTC),
+            "settlement_ts": datetime(2026, 6, 6, 13, 0, tzinfo=UTC),
+            "leakage_status": "point_in_time",
+            "spot_feature_status": "available",
+        },
+        {
+            "asset_symbol": "BTC",
+            "quote_source": "candlestick_close_proxy",
+            "strict_trade_eligible": False,
+            "label_yes": 1,
+            "market_day": "2026-06-07",
+        },
+    ]
+
+    quote_evidence = _crypto_quote_evidence_summary(snapshots, decision_rows)
+    support = quote_evidence["trade_candidate_support_by_asset"]["BTC"]
+    audit = quote_evidence["strict_quote_ingestion_audit_by_asset"]["BTC"]
+
+    assert support["strict_market_day_count"] == 2
+    assert support["strict_market_days"] == ["2026-06-05", "2026-06-06"]
+    assert support["strict_settlement_day_count"] == 2
+    assert audit["strict_market_day_count"] == 2
+    assert audit["strict_settlement_days"] == ["2026-06-05", "2026-06-06"]
+
+
 @pytest.mark.asyncio
 async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> None:
     settings = _settings(tmp_path, crypto_min_training_samples=4, crypto_replay_min_resolved_markets=4)
@@ -6198,7 +6398,12 @@ async def test_crypto_replay_run_validate_and_gate_use_backtest_metrics(tmp_path
     assert btc_audit["point_in_time_rows"] == 5
     assert btc_audit["spot_joined"] == 5
     assert btc_audit["strict_trade_eligible"] == 5
+    assert btc_audit["strict_market_day_count"] == 5
+    assert btc_audit["strict_settlement_day_count"] == 5
     assert btc_audit["candidate_generated"] == 5
+    btc_support = history_status["quote_evidence"]["trade_candidate_support_by_asset"]["BTC"]
+    assert btc_support["strict_market_day_count"] == 5
+    assert btc_support["strict_settlement_day_count"] == 5
     assert run_report["data_quality"]["candle_count"] == 10
     assert "baseline_policy" in run_report["walk_forward"]
     assert {item["policy_name"] for item in run_report["walk_forward"]["baseline_policies"]} >= {

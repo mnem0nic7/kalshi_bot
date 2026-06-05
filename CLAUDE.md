@@ -100,6 +100,8 @@ All crypto services are wired through `AppContainer` alongside weather services.
 
 Active crypto assets (as of 2026-05-20): **BTC, ETH, SOL, XRP, BNB, DOGE, HYPE**. ADA and BCH were removed from all active asset lists (`crypto_model_nightly_assets`, the CLI live-path default, passive-bid, overnight-readiness prefixes) because they have no backfilled spot history yet — configured-but-untrainable. Their inert lookup/parsing tables (Coinbase/CoinGecko product-id maps, ticker-recognition lists) are intentionally kept, so re-adding them after a backfill is a config-only change.
 
+All 7 assets are live on the **CRYPTO_15M trained model** (XGBoost/LightGBM) as of 2026-06-05. Touch20 (`btc15m_touch20`, `1h_touch20`) is a separate, fully disabled strategy — `RULES_ENABLED=false`, `RULES_TRADING_ENABLED=false`, containers disabled. Do not conflate touch20 with the model path. The 1h model path is also currently disabled (insufficient OOS data). Promotion process and per-asset gate/model artifact history: `docs/operations/crypto-live-asset-promotion.md`.
+
 ### Persistence (`db/`)
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
 
