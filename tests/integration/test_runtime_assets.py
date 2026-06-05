@@ -133,13 +133,13 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert "CRYPTO_1H_TOUCH20_LOOP_INTERVAL_SECONDS: ${CRYPTO_1H_TOUCH20_LOOP_INTERVAL_SECONDS:-0}" in compose_text
     assert "CRYPTO_TRADING_ENABLED: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED:-false}" in compose_text
     assert 'sleep "$${CRYPTO_1H_TOUCH20_LOOP_INTERVAL_SECONDS:-0}"' in compose_text
-    assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=true" in env_lines
-    assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=true" in env_lines
+    assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
+    assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false" in env_lines
     assert "PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0" in env_lines
     assert "CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
     assert "CRYPTO_1H_TOUCH20_BUCKET_TIME_BAND_MINUTES=15" in env_lines
     assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER=true" in env_lines
-    assert "ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=true" in env_lines
+    assert "ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false" in env_lines
     assert "CRYPTO_CURRENT_15M_INTERVAL_SECONDS=0" in env_lines
     assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS=0" in env_lines
     assert "CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=0" in env_lines

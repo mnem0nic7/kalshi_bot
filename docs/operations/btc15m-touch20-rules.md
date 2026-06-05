@@ -8,18 +8,17 @@ assets use their own lanes, settings, gates, approvals, ledgers, and order
 prefixes. The path is additive. It must not disable or retune the model-trained
 crypto bot.
 
-The same rules module can now evaluate 1-hour Touch20 lanes with frequency-
-scoped strategy codes, gates, approvals, ledgers, and order prefixes. Those 1h
-lanes are enabled for the configured production assets, but entry submission
-still requires each asset to have a passed 1h gate and an explicit operator
-approval tied to that exact gate and simulator version.
+The same rules module can evaluate 1-hour Touch20 lanes with frequency-scoped
+strategy codes, gates, approvals, ledgers, and order prefixes. The 1h touch
+worker is disabled in the current production posture and should not be restarted
+unless an operator explicitly re-enables the container, rules, and trading
+switches.
 
 ## 1h Evidence Expansion Status
 
-As of 2026-06-05 15:00 UTC, the 1h path is configured for continuous evidence
-collection and gated rule evaluation across BTC, HYPE, ETH, BNB, SOL, DOGE, and
-XRP. The worker may submit live orders only after the per-asset gate and
-operator approval checks pass.
+As of 2026-06-05, the 1h path is configured for continuous data-only evidence
+collection across BTC, HYPE, ETH, BNB, SOL, DOGE, and XRP. The separate 1h
+Touch20 worker is stopped and disabled.
 
 Current production settings:
 
@@ -34,8 +33,8 @@ Current production settings:
 - `CRYPTO_1H_CURRENT_REPLAY_GATE_DAYS=30`
 - `CRYPTO_1H_CURRENT_REPLAY_GATE_LIMIT=50000`
 - `CRYPTO_1H_CURRENT_REPLAY_JOINED_FALLBACK_ENABLED=false`
-- `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=true`
-- `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=true`
+- `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=false`
+- `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_ALLOWED_SIDES=yes,no`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_TAKE_PROFIT_PCT=0.15`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_MIN_SECONDS_TO_CLOSE=300`
@@ -48,16 +47,15 @@ Current production settings:
 - `PRODUCTION_CRYPTO_1H_TOUCH20_BUCKET_TIME_BAND_MINUTES=60`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP`
-- `ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=true`
+- `ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false`
 
 The production 1h current collector is data-only: `CRYPTO_TRADING_ENABLED=false`
 inside the container. It collects open-market quote evidence and fresh Coinbase
-spot rows. The separate 1h Touch20 worker runs `exit-once` and `run-once` across
-all configured 1h assets, with container-level `CRYPTO_TRADING_ENABLED` mapped
-to `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED`. Entry order submission
-still remains blocked by the per-asset gate and approval checks until they pass.
-Automatic settled-label refresh and replay/gate refresh remain disabled in the
-current production posture.
+spot rows. The separate 1h Touch20 worker remains stopped; container-level
+`CRYPTO_TRADING_ENABLED` is still mapped to
+`PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED` for any future explicit
+operator re-enable. Automatic settled-label refresh and replay/gate refresh
+remain disabled in the current production posture.
 
 The current 1h data collector and 1h Touch20 order service defaults both keep
 automatic replay/gate refresh disabled while the production entry-qualified
