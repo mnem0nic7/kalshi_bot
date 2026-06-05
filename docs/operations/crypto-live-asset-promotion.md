@@ -61,6 +61,19 @@ SOL 15m became live-order-ready and was promoted live on 2026-06-05:
 - Model: `crypto-15m-model-20260605171305-0471d37016ea`, `trained`.
 - Backtest: `crypto-15m-backtest-20260605171352-c962d1305ac9`, `pass`.
 
+ETH 15m became live-order-ready and was promoted live on 2026-06-05:
+
+- `crypto-live-path status --require-ready` returned `status=ready`.
+- `ready_assets=["ETH"]` and `live_order_ready_assets=["ETH"]`.
+- ETH asset mode was `live`.
+- Strict eligible real-quote rows: `4195`.
+- Current-model live-quality candidates: `605`.
+- OOS trade candidates: `464`.
+- Replay net simulated P/L: `$147.79`.
+- Replay gate: `crypto-15m-gate-20260605172654-b0ed8233c062`, `passed`.
+- Model: `crypto-15m-model-20260605172512-776c4638f0fe`, `trained`.
+- Backtest: `crypto-15m-backtest-20260605172649-edd3d591cc57`, `pass`.
+
 ## Process
 
 Set the target asset once and substitute only that asset through the whole run:
