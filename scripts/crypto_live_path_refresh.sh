@@ -109,7 +109,7 @@ else
 fi
 
 discover_current_assets() {
-  python -c '
+  "${PYTHON:-python3}" -c '
 import json
 import sys
 

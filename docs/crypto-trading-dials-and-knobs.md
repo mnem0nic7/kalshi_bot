@@ -623,6 +623,13 @@ only if discovery fails or returns empty.
 | `crypto-live-path refresh --max-iterations` | `1` | Max refresh loops. |
 | `crypto-live-path refresh --sleep-seconds` | `0.0` | Sleep between refresh loops. |
 
+After each refresh pass, the command performs one extra train/replay/gate retry
+for assets whose initial training preflight was blocked but whose newly
+refreshed evidence may now pass preflight. This handles the common recovery case
+where settled labels collected during the refresh create enough strict
+real-quote rows only after the first preflight attempt has already skipped
+training.
+
 For 1h, use `--assets all` or omit `--assets` so newly listed hourly assets
 enter evidence collection automatically. The daily 1h refresh container defaults
 to seven-day settled/history/spot windows because hourly settlements accumulate

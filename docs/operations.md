@@ -66,6 +66,8 @@ Crypto policy is separate from weather thresholds and promotes per asset. A BTC 
 ## Crypto Live Path
 
 Use `crypto-live-path` to collect production evidence and show the exact blockers before any crypto asset is promoted out of shadow mode. The command does not relax replay gates, promote assets, or enable production crypto switches.
+For the one-asset-at-a-time promotion procedure, use
+`docs/operations/crypto-live-asset-promotion.md`.
 
 The independent 15-minute non-model Touch20 path has its own runbook:
 [Crypto 15m Touch20 Rules](operations/btc15m-touch20-rules.md). It is additive

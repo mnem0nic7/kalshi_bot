@@ -1077,6 +1077,106 @@ def _crypto_live_path_args_with_asset_resolution(
     return argparse.Namespace(**values)
 
 
+def _crypto_live_path_preflight_retry_assets(operation_errors: list[dict[str, Any]]) -> list[str]:
+    assets: list[str] = []
+    seen: set[str] = set()
+    for error in operation_errors:
+        if error.get("step") != "training_preflight" or error.get("error") != "blocked":
+            continue
+        asset = normalize_asset_symbol(str(error.get("asset") or ""))
+        if not asset or asset in seen:
+            continue
+        seen.add(asset)
+        assets.append(asset)
+    return assets
+
+
+async def _crypto_live_path_retry_training_after_refresh(
+    *,
+    container: AppContainer,
+    assets: list[str],
+    frequency: str,
+    replay_days: int,
+) -> tuple[list[dict[str, Any]], set[str], list[dict[str, Any]]]:
+    retry_results: list[dict[str, Any]] = []
+    resolved_assets: set[str] = set()
+    retry_errors: list[dict[str, Any]] = []
+    for asset in assets:
+        result: dict[str, Any] = {"asset": asset, "steps": {}, "errors": []}
+        preflight_ok = True
+        try:
+            preflight = await container.crypto_training_backfill_service.prepare(
+                frequency=frequency,
+                asset_symbols=[asset],
+                run_source_backfill=False,
+            )
+            result["steps"]["training_preflight"] = _crypto_live_path_step_summary(preflight)
+            preflight_ok = preflight.get("status") == "ok"
+            if not preflight_ok:
+                error = {
+                    "asset": asset,
+                    "step": "training_preflight_retry",
+                    "error": "blocked",
+                    "blockers": preflight.get("blockers") or [],
+                }
+                result["errors"].append(error)
+                retry_errors.append(error)
+        except Exception as exc:  # pragma: no cover - surfaced in CLI JSON for operator action.
+            preflight_ok = False
+            error = {"asset": asset, "step": "training_preflight_retry", "error": str(exc)}
+            result["errors"].append(error)
+            retry_errors.append(error)
+        try:
+            if preflight_ok:
+                train = await container.crypto_forecast_service.train(
+                    frequency=frequency,
+                    asset_symbols=[asset],
+                    use_feature_store=True,
+                    feature_store_only=True,
+                )
+                result["steps"]["model_train"] = _crypto_live_path_step_summary(train)
+                if train.get("status") != "trained":
+                    error = {
+                        "asset": asset,
+                        "step": "model_train_retry",
+                        "error": str(train.get("status") or "not_trained"),
+                    }
+                    result["errors"].append(error)
+                    retry_errors.append(error)
+            else:
+                result["steps"]["model_train"] = {"status": "skipped", "reason": "training_preflight_blocked"}
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "model_train_retry", "error": str(exc)}
+            result["errors"].append(error)
+            retry_errors.append(error)
+        try:
+            replay_run = await container.crypto_replay_service.run(
+                frequency=frequency,
+                days=replay_days,
+                limit=None,
+                asset_symbols=[asset],
+            )
+            result["steps"]["replay_run"] = _crypto_live_path_step_summary(replay_run)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "replay_run_retry", "error": str(exc)}
+            result["errors"].append(error)
+            retry_errors.append(error)
+        try:
+            replay_gate = await container.crypto_replay_service.gate(
+                frequency=frequency,
+                asset_symbols=[asset],
+            )
+            result["steps"]["replay_gate"] = _crypto_live_path_step_summary(replay_gate)
+        except Exception as exc:  # pragma: no cover
+            error = {"asset": asset, "step": "replay_gate_retry", "error": str(exc)}
+            result["errors"].append(error)
+            retry_errors.append(error)
+        if not result["errors"]:
+            resolved_assets.add(asset)
+        retry_results.append(result)
+    return retry_results, resolved_assets, retry_errors
+
+
 def _crypto_artifact_payload(record: Any | None) -> dict[str, Any] | None:
     if record is None:
         return None
@@ -1980,7 +2080,28 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
         if iteration < max_iterations and float(getattr(args, "sleep_seconds", 0.0) or 0.0) > 0:
             await asyncio.sleep(float(args.sleep_seconds))
 
+    post_refresh_recovery: list[dict[str, Any]] = []
     post_status = await _crypto_live_path_status_payload(resolved_args, container)
+    retry_assets = _crypto_live_path_preflight_retry_assets(operation_errors)
+    if retry_assets:
+        post_refresh_recovery, resolved_retry_assets, retry_errors = await _crypto_live_path_retry_training_after_refresh(
+            container=container,
+            assets=retry_assets,
+            frequency=frequency,
+            replay_days=args.replay_days,
+        )
+        if resolved_retry_assets:
+            operation_errors = [
+                error
+                for error in operation_errors
+                if not (
+                    normalize_asset_symbol(str(error.get("asset") or "")) in resolved_retry_assets
+                    and error.get("step") == "training_preflight"
+                    and error.get("error") == "blocked"
+                )
+            ]
+        operation_errors.extend(retry_errors)
+        post_status = await _crypto_live_path_status_payload(resolved_args, container)
     output = {
         "schema_version": "crypto-live-path-v1",
         "status": "completed" if not operation_errors else "completed_with_errors",
@@ -1993,6 +2114,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
         },
         "iterations": iteration_results,
         "asset_results": iteration_results[-1]["asset_results"] if iteration_results else [],
+        "post_refresh_recovery": post_refresh_recovery,
         "post_status": post_status,
         "operation_errors": operation_errors,
     }

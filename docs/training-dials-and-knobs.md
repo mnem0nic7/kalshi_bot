@@ -593,7 +593,7 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `crypto-asset-mode set --kalshi-env SYMBOL off|shadow|live` | Overrides one asset mode. |
 | `crypto-policy optimize --kalshi-env --frequency --days --assets` | Optimizes crypto runtime policy from replay evidence. |
 | `crypto-live-path status --kalshi-env --frequency --assets --status-days --strict-rows-target --candidate-target --require-ready --baselines` | Readiness report for explicit assets, or discovered frequency-scoped assets when `--assets` is omitted or `all`; defaults are `14` status days, `60` strict rows, and `50` trade candidates. |
-| `crypto-live-path refresh --kalshi-env --frequency --assets --settled-days --history-days --spot-days --replay-days --until-ready --max-iterations --sleep-seconds` | Runs history, spot, replay, and gate refresh loop toward live readiness; omitted assets and `--assets all` use discovery. |
+| `crypto-live-path refresh --kalshi-env --frequency --assets --settled-days --history-days --spot-days --replay-days --until-ready --max-iterations --sleep-seconds` | Runs history, spot, model training, replay, and gate refresh loop toward live readiness; omitted assets and `--assets all` use discovery. If refresh creates enough strict rows after an initial training-preflight block, it performs one post-refresh train/replay/gate retry. |
 
 ### Crypto Settings
 

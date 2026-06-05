@@ -591,6 +591,11 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
             calls.append(("spot_current", kwargs))
             return {"status": "ok", "stored": 1}
 
+    class TrainingBackfillService:
+        async def prepare(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("training_preflight", kwargs))
+            return {"status": "ok"}
+
     class ForecastService:
         async def train(self, **kwargs: object) -> dict[str, object]:
             calls.append(("forecast_train", kwargs))
@@ -620,6 +625,7 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
     container = SimpleNamespace(
         crypto_history_service=HistoryService(),
         crypto_spot_service=SpotService(),
+        crypto_training_backfill_service=TrainingBackfillService(),
         crypto_forecast_service=ForecastService(),
         crypto_replay_service=ReplayService(),
     )
@@ -633,6 +639,113 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         "bootstrap",
         "spot_backfill",
         "spot_current",
+        "training_preflight",
+        "forecast_train",
+        "replay_run",
+        "replay_gate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_crypto_live_path_refresh_retries_training_after_strict_rows_grow(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    status_calls = 0
+
+    async def fake_status_payload(args: SimpleNamespace, container: SimpleNamespace) -> dict[str, object]:
+        nonlocal status_calls
+        del args, container
+        status_calls += 1
+        if status_calls < 4:
+            return {"status": "collecting", "ready_assets": [], "summary": {}}
+        return {
+            "status": "ready",
+            "ready_assets": ["BTC"],
+            "summary": {},
+        }
+
+    class HistoryService:
+        async def collect_open(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("collect_open", kwargs))
+            return {"status": "ok"}
+
+        async def collect_settled(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("collect_settled", kwargs))
+            return {"status": "ok", "settled_markets_stored": 1}
+
+        async def bootstrap(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("bootstrap", kwargs))
+            return {"status": "ok"}
+
+    class SpotService:
+        async def backfill(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("spot_backfill", kwargs))
+            return {"status": "ok"}
+
+        async def collect_current(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("spot_current", kwargs))
+            return {"status": "ok", "stored": 1}
+
+    class TrainingBackfillService:
+        async def prepare(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("training_preflight", kwargs))
+            if len([name for name, _kwargs in calls if name == "training_preflight"]) == 1:
+                return {"status": "blocked", "blockers": ["strict_trade_eligible_rows_below_min:991<1000"]}
+            return {"status": "ok"}
+
+    class ForecastService:
+        async def train(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("forecast_train", kwargs))
+            return {"status": "trained"}
+
+    class ReplayService:
+        async def run(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("replay_run", kwargs))
+            return {"status": "pass"}
+
+        async def gate(self, **kwargs: object) -> dict[str, object]:
+            calls.append(("replay_gate", kwargs))
+            return {"status": "passed"}
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(cli_module, "_crypto_live_path_status_payload", fake_status_payload)
+    args = SimpleNamespace(
+        crypto_live_path_command="refresh",
+        assets=["BTC"],
+        frequency="15m",
+        settled_days=2,
+        history_days=2,
+        spot_days=2,
+        replay_days=30,
+        require_ready=True,
+    )
+    container = SimpleNamespace(
+        crypto_history_service=HistoryService(),
+        crypto_spot_service=SpotService(),
+        crypto_training_backfill_service=TrainingBackfillService(),
+        crypto_forecast_service=ForecastService(),
+        crypto_replay_service=ReplayService(),
+    )
+
+    exit_code = await cli_module._run_crypto_live_path_command(args, container)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["status"] == "completed"
+    assert payload["operation_errors"] == []
+    assert payload["post_status"]["status"] == "ready"
+    assert payload["post_refresh_recovery"][0]["steps"]["model_train"]["status"] == "trained"
+    assert [name for name, _kwargs in calls] == [
+        "collect_open",
+        "collect_settled",
+        "bootstrap",
+        "spot_backfill",
+        "spot_current",
+        "training_preflight",
+        "replay_run",
+        "replay_gate",
+        "training_preflight",
         "forecast_train",
         "replay_run",
         "replay_gate",
