@@ -171,7 +171,7 @@ runs over `CRYPTO_15M_TOUCH20_RULES_ASSETS`, default `BTC`:
 
 1. `crypto-non-model-touch20 exit-once` for each configured asset
 2. `crypto-non-model-touch20 run-once` for each configured asset
-3. sleep for `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS`, default 15 seconds
+3. sleep for `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS`, default 0 seconds
 
 The exit pass runs first so existing strategy-owned positions get a chance to
 take profit before the process considers a new entry.

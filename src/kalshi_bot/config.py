@@ -366,7 +366,7 @@ class Settings(BaseSettings):
     crypto_btc15m_touch20_max_replay_terminal_loss_rate: float = 0.15
     crypto_btc15m_touch20_profit_protection_threshold_pct: float = 0.10
     crypto_btc15m_touch20_profit_protection_floor_pct: float = 0.05
-    crypto_btc15m_touch20_loop_interval_seconds: int = 15
+    crypto_btc15m_touch20_loop_interval_seconds: int = 0
     crypto_btc15m_touch20_min_contract_price_dollars: float = 0.20
     crypto_btc15m_touch20_max_contract_price_dollars: float = 0.50
     crypto_btc15m_touch20_max_spread_dollars: float = 0.0
@@ -400,7 +400,7 @@ class Settings(BaseSettings):
     crypto_1h_touch20_max_replay_terminal_loss_rate: float = 0.15
     crypto_1h_touch20_profit_protection_threshold_pct: float = 0.10
     crypto_1h_touch20_profit_protection_floor_pct: float = 0.05
-    crypto_1h_touch20_loop_interval_seconds: int = 15
+    crypto_1h_touch20_loop_interval_seconds: int = 0
     crypto_1h_touch20_min_contract_price_dollars: float = 0.20
     crypto_1h_touch20_max_contract_price_dollars: float = 0.50
     crypto_1h_touch20_max_spread_dollars: float = 0.10
@@ -412,7 +412,7 @@ class Settings(BaseSettings):
     crypto_1h_touch20_quote_fresh_seconds: int = 30
     crypto_1h_touch20_spot_fresh_seconds: int = 3600
     crypto_1h_touch20_entry_qualified_market_limit: int = 500
-    crypto_1h_touch20_rules_assets: str = "BTC"
+    crypto_1h_touch20_rules_assets: str = "BTC,HYPE,ETH,BNB,SOL,DOGE,XRP"
     crypto_1h_touch20_asset_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     crypto_take_profit_enabled: bool = True

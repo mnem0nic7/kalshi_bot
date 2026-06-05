@@ -1,6 +1,6 @@
 # Crypto 15m Touch20 Rules Runbook
 
-Last updated: 2026-06-04
+Last updated: 2026-06-05
 
 This runbook covers the independent non-model 15-minute Touch20 rules strategy.
 BTC keeps the legacy strategy code `btc15m_touch20_rules`; other supported
@@ -10,21 +10,22 @@ crypto bot.
 
 The same rules module can now evaluate 1-hour Touch20 lanes with frequency-
 scoped strategy codes, gates, approvals, ledgers, and order prefixes. Those 1h
-lanes are evidence-gated and disabled by default. Do not turn on 1h live order
-submission until each asset has a passed 1h gate and an explicit operator
+lanes are enabled for the configured production assets, but entry submission
+still requires each asset to have a passed 1h gate and an explicit operator
 approval tied to that exact gate and simulator version.
 
 ## 1h Evidence Expansion Status
 
-As of 2026-06-04 04:00 UTC, the 1h path is configured for evidence collection
-and safe rule evaluation across BTC, HYPE, ETH, BNB, SOL, DOGE, and XRP. Live
-1h order submission remains disabled.
+As of 2026-06-05 15:00 UTC, the 1h path is configured for continuous evidence
+collection and gated rule evaluation across BTC, HYPE, ETH, BNB, SOL, DOGE, and
+XRP. The worker may submit live orders only after the per-asset gate and
+operator approval checks pass.
 
 Current production settings:
 
 - `ENABLE_CRYPTO_CURRENT_1H_CONTAINER=true`
 - `PRODUCTION_CRYPTO_CURRENT_1H_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP`
-- `CRYPTO_1H_CURRENT_INTERVAL_SECONDS=15`
+- `CRYPTO_1H_CURRENT_INTERVAL_SECONDS=0`
 - `CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=0`
 - `CRYPTO_1H_CURRENT_SETTLED_DAYS=2`
 - `CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=false`
@@ -34,7 +35,7 @@ Current production settings:
 - `CRYPTO_1H_CURRENT_REPLAY_GATE_LIMIT=50000`
 - `CRYPTO_1H_CURRENT_REPLAY_JOINED_FALLBACK_ENABLED=false`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=true`
-- `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false`
+- `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=true`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_ALLOWED_SIDES=yes,no`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_TAKE_PROFIT_PCT=0.15`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_MIN_SECONDS_TO_CLOSE=300`
@@ -52,9 +53,10 @@ Current production settings:
 The production 1h current collector is data-only: `CRYPTO_TRADING_ENABLED=false`
 inside the container. It collects open-market quote evidence and fresh Coinbase
 spot rows. The separate 1h Touch20 worker runs `exit-once` and `run-once` across
-all configured 1h assets, while entry order submission remains disabled by
-`CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false`. Automatic settled-label refresh,
-replay/gate refresh, approval, and entry order submission remain disabled in the
+all configured 1h assets, with container-level `CRYPTO_TRADING_ENABLED` mapped
+to `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED`. Entry order submission
+still remains blocked by the per-asset gate and approval checks until they pass.
+Automatic settled-label refresh and replay/gate refresh remain disabled in the
 current production posture.
 
 The current 1h data collector and 1h Touch20 order service defaults both keep
@@ -573,7 +575,7 @@ All live flags are disabled by default.
 | `CRYPTO_BTC15M_TOUCH20_MAX_REPLAY_TERMINAL_LOSS_RATE` | `0.15` | Max replay terminal-loss rate for the gate and bucket allowance. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_THRESHOLD_PCT` | `0.10` | Profit level that arms profit protection. |
 | `CRYPTO_BTC15M_TOUCH20_PROFIT_PROTECTION_FLOOR_PCT` | `0.05` | Armed profit-protection floor. |
-| `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS` | `15` | Docker process loop sleep. |
+| `CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS` | `0` | Docker process loop sleep. `0` immediately starts the next pass. |
 | `CRYPTO_BTC15M_TOUCH20_MIN_CONTRACT_PRICE_DOLLARS` | `0.20` | Strategy-owned minimum entry ask. |
 | `CRYPTO_BTC15M_TOUCH20_MAX_CONTRACT_PRICE_DOLLARS` | `0.50` | Strategy-owned maximum entry ask. |
 | `CRYPTO_BTC15M_TOUCH20_MIN_ALIGNED_MOMENTUM` | `0.0005` | Minimum side-aligned spot momentum. |
