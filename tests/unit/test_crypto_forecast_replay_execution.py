@@ -61,6 +61,7 @@ from kalshi_bot.crypto.services import (
     _crypto_replay_gate_dashboard_summary,
     _crypto_raw_feature_vector,
     _crypto_select_champion,
+    _crypto_champion_selection_reason,
     _crypto_signal_stand_down_content,
     _crypto_signal_stand_down_payload,
     _crypto_signal_payload_with_current_quote_metrics,
@@ -3856,6 +3857,67 @@ def test_crypto_model_selection_rejects_guardrail_failed_positive_pnl_candidate(
                 },
             },
         ]
+    )
+
+    assert champion == "market_mid_baseline"
+
+
+def test_crypto_model_selection_allows_diagnostic_guardrail_profitable_candidate() -> None:
+    champion_entry = {
+        "name": "spot_distance_residual",
+        "status": "guardrail_failed",
+        "metrics": {"brier": 0.0900},
+        "policy_metrics": {
+            "selected_count": 50,
+            "net_pnl": "2.0000",
+            "pnl_advantage_vs_market_mid_dollars": "2.0000",
+        },
+    }
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0300},
+            },
+            champion_entry,
+        ],
+        min_selected_count=50,
+        allow_guardrail_failed_profit_candidates=True,
+    )
+
+    assert champion == "spot_distance_residual"
+    assert (
+        _crypto_champion_selection_reason(
+            champion_entry,
+            min_selected_count=50,
+            allow_guardrail_failed_profit_candidates=True,
+        )
+        == "selected_non_market_candidate_with_diagnostic_guardrail_warnings"
+    )
+
+
+def test_crypto_model_selection_keeps_diagnostic_guardrail_candidate_support_floor() -> None:
+    champion = _crypto_select_champion(
+        [
+            {
+                "name": "market_mid_baseline",
+                "status": "available",
+                "metrics": {"brier": 0.0300},
+            },
+            {
+                "name": "spot_distance_residual",
+                "status": "guardrail_failed",
+                "metrics": {"brier": 0.0900},
+                "policy_metrics": {
+                    "selected_count": 11,
+                    "net_pnl": "2.0000",
+                    "pnl_advantage_vs_market_mid_dollars": "2.0000",
+                },
+            },
+        ],
+        min_selected_count=50,
+        allow_guardrail_failed_profit_candidates=True,
     )
 
     assert champion == "market_mid_baseline"

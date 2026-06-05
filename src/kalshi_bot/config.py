@@ -229,6 +229,7 @@ class Settings(BaseSettings):
     crypto_dynamic_order_max_position_pct: float = 0.15
     crypto_dynamic_order_pnl_scale_per_candidate_dollars: float = 0.20
     crypto_pnl_sizing_auto_enabled: bool = True
+    crypto_model_candidate_max_walk_forward_folds: int = 24
     crypto_max_entry_loss_dollars: float = 20.0
     crypto_asset_daily_loss_limit_dollars: float = 20.0
     crypto_live_pnl_gate_enabled: bool = True

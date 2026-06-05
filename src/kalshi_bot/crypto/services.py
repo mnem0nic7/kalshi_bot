@@ -444,6 +444,11 @@ def _crypto_artifact_type(base: str, asset_symbols: list[str] | None = None) -> 
     return base
 
 
+def _crypto_objective_is_touch20(objective: str | None) -> bool:
+    value = str(objective or "settlement").strip().lower().replace("-", "_")
+    return value in {"touch20", "touch_20", "touch_20pct", "touch_20pct_before_close"}
+
+
 def _crypto_replay_gate_note_updates(
     *,
     frequency: str,
@@ -10396,11 +10401,32 @@ def _crypto_candidate_has_min_policy_support(entry: dict[str, Any], *, min_selec
     return _candidate_policy_selected_count(policy) >= max(1, int(min_selected_count))
 
 
-def _crypto_candidate_is_profit_deployable(entry: dict[str, Any], *, min_selected_count: int = 1) -> bool:
+def _crypto_candidate_selection_status_ok(entry: dict[str, Any], *, allow_guardrail_failed: bool = False) -> bool:
+    status = entry.get("status")
+    return status == "available" or (allow_guardrail_failed and status == "guardrail_failed")
+
+
+def _crypto_guardrail_warnings_are_diagnostic(
+    settings: Settings | None,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+) -> bool:
+    if crypto_policy is not None:
+        return not bool(crypto_policy.replay_require_calibration_better_than_mid)
+    if settings is not None:
+        return not bool(settings.crypto_replay_require_calibration_better_than_mid)
+    return False
+
+
+def _crypto_candidate_is_profit_deployable(
+    entry: dict[str, Any],
+    *,
+    min_selected_count: int = 1,
+    allow_guardrail_failed: bool = False,
+) -> bool:
     policy = entry.get("policy_metrics") if isinstance(entry.get("policy_metrics"), dict) else None
     return (
         policy is not None
-        and entry.get("status") == "available"
+        and _crypto_candidate_selection_status_ok(entry, allow_guardrail_failed=allow_guardrail_failed)
         and entry.get("name") not in CRYPTO_MODEL_BASELINE_CANDIDATES
         and _candidate_policy_selected_count(policy) >= max(1, int(min_selected_count))
         and _candidate_policy_net(policy) > Decimal("0")
@@ -10421,11 +10447,19 @@ def _crypto_candidate_profit_sort_key(entry: dict[str, Any]) -> tuple[Decimal, D
     )
 
 
-def _crypto_select_champion(candidates: list[dict[str, Any]], *, min_selected_count: int = 1) -> str:
+def _crypto_select_champion(
+    candidates: list[dict[str, Any]],
+    *,
+    min_selected_count: int = 1,
+    allow_guardrail_failed_profit_candidates: bool = False,
+) -> str:
     profit_candidates = [
         candidate
         for candidate in candidates
-        if _crypto_model_selection_usable(candidate)
+        if _crypto_model_selection_usable(
+            candidate,
+            allow_guardrail_failed=allow_guardrail_failed_profit_candidates,
+        )
         and _crypto_candidate_has_profit_metrics(candidate)
         and candidate.get("name") not in CRYPTO_MODEL_BASELINE_CANDIDATES
     ]
@@ -10437,7 +10471,11 @@ def _crypto_select_champion(candidates: list[dict[str, Any]], *, min_selected_co
     deployable = [
         candidate
         for candidate in supported_profit_candidates
-        if _crypto_candidate_is_profit_deployable(candidate, min_selected_count=min_selected_count)
+        if _crypto_candidate_is_profit_deployable(
+            candidate,
+            min_selected_count=min_selected_count,
+            allow_guardrail_failed=allow_guardrail_failed_profit_candidates,
+        )
     ]
     if deployable:
         deployable.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
@@ -10573,7 +10611,12 @@ def _crypto_in_sample_candidate_report(
                 trade_rows_by_name["calibrated_weighted_ensemble"].append({**row, "simulation": trade})
     guarded_entries = _crypto_attach_candidate_policy_metrics(guarded_entries, trade_rows_by_name, settings=settings)
     min_policy_selected_count = _crypto_model_min_policy_selected_count(settings, crypto_policy)
-    champion = _crypto_select_champion(guarded_entries, min_selected_count=min_policy_selected_count)
+    allow_guardrail_failed_profit_candidates = _crypto_guardrail_warnings_are_diagnostic(settings, crypto_policy)
+    champion = _crypto_select_champion(
+        guarded_entries,
+        min_selected_count=min_policy_selected_count,
+        allow_guardrail_failed_profit_candidates=allow_guardrail_failed_profit_candidates,
+    )
     champion_entry = _crypto_candidate_entry_by_name(guarded_entries, champion)
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
@@ -10587,12 +10630,17 @@ def _crypto_in_sample_candidate_report(
             "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
             "references": ["market_mid_baseline", "sklearn_logistic"],
             "mode": "diagnostic_for_non_market_selection",
+            "allow_guardrail_failed_profit_candidates": allow_guardrail_failed_profit_candidates,
         },
         "fold_count": 0,
         "candidates": sorted(guarded_entries, key=_crypto_candidate_sort_key),
         "champion_name": champion,
         "champion_status": champion_entry.get("status") if champion_entry else None,
-        "champion_selection_reason": _crypto_champion_selection_reason(champion_entry),
+        "champion_selection_reason": _crypto_champion_selection_reason(
+            champion_entry,
+            min_selected_count=min_policy_selected_count,
+            allow_guardrail_failed_profit_candidates=allow_guardrail_failed_profit_candidates,
+        ),
         "champion_validation_metrics": _metrics_for_candidate(guarded_entries, champion),
         "champion_policy_metrics": champion_entry.get("policy_metrics") if champion_entry else None,
         "ensemble_weights": ensemble_weights,
@@ -10608,7 +10656,8 @@ def _crypto_model_candidate_report(
     full_candidate_status: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     min_train_rows = max(2, min(settings.crypto_min_training_samples, 20)) if settings is not None else max(2, min(len(rows) // 2, 20))
-    folds = _crypto_walk_forward_folds(rows, min_train_rows=min_train_rows)
+    max_folds = max(0, int(settings.crypto_model_candidate_max_walk_forward_folds)) if settings is not None else 0
+    folds = _crypto_walk_forward_folds(rows, min_train_rows=min_train_rows, max_folds=max_folds or None)
     if not folds:
         report = _crypto_in_sample_candidate_report(
             rows,
@@ -10709,7 +10758,12 @@ def _crypto_model_candidate_report(
     entries = _crypto_attach_candidate_policy_metrics(entries, trade_rows_by_candidate, settings=settings)
     ensemble_entry = next((entry for entry in entries if entry["name"] == "calibrated_weighted_ensemble"), None)
     min_policy_selected_count = _crypto_model_min_policy_selected_count(settings, crypto_policy)
-    champion = _crypto_select_champion(entries, min_selected_count=min_policy_selected_count)
+    allow_guardrail_failed_profit_candidates = _crypto_guardrail_warnings_are_diagnostic(settings, crypto_policy)
+    champion = _crypto_select_champion(
+        entries,
+        min_selected_count=min_policy_selected_count,
+        allow_guardrail_failed_profit_candidates=allow_guardrail_failed_profit_candidates,
+    )
     champion_entry = _crypto_candidate_entry_by_name(entries, champion)
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
@@ -10723,13 +10777,18 @@ def _crypto_model_candidate_report(
             "log_loss_ece_max_regression_pct": CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE,
             "references": ["market_mid_baseline", "sklearn_logistic"],
             "mode": "diagnostic_for_non_market_selection",
+            "allow_guardrail_failed_profit_candidates": allow_guardrail_failed_profit_candidates,
         },
         "fold_count": len(folds),
         "folds": fold_summaries,
         "candidates": sorted(entries, key=_crypto_candidate_sort_key),
         "champion_name": champion,
         "champion_status": champion_entry.get("status") if champion_entry else None,
-        "champion_selection_reason": _crypto_champion_selection_reason(champion_entry),
+        "champion_selection_reason": _crypto_champion_selection_reason(
+            champion_entry,
+            min_selected_count=min_policy_selected_count,
+            allow_guardrail_failed_profit_candidates=allow_guardrail_failed_profit_candidates,
+        ),
         "champion_validation_metrics": _metrics_for_candidate(entries, champion),
         "champion_policy_metrics": champion_entry.get("policy_metrics") if champion_entry else None,
         "ensemble_weights": _crypto_ensemble_weights_from_metrics(entries) if ensemble_entry and ensemble_entry.get("status") == "available" else {},
@@ -10818,22 +10877,33 @@ def _metrics_for_candidate(entries: list[dict[str, Any]], name: str) -> dict[str
     return None
 
 
-def _crypto_model_selection_usable(entry: dict[str, Any]) -> bool:
+def _crypto_model_selection_usable(entry: dict[str, Any], *, allow_guardrail_failed: bool = False) -> bool:
     if entry.get("name") in CRYPTO_MODEL_BASELINE_CANDIDATES:
         return False
-    if entry.get("status") != "available":
+    if not _crypto_candidate_selection_status_ok(entry, allow_guardrail_failed=allow_guardrail_failed):
         return False
     metrics = entry.get("metrics")
     return isinstance(metrics, dict) and metrics.get("brier") is not None
 
 
-def _crypto_champion_selection_reason(entry: dict[str, Any] | None) -> str:
+def _crypto_champion_selection_reason(
+    entry: dict[str, Any] | None,
+    *,
+    min_selected_count: int = 1,
+    allow_guardrail_failed_profit_candidates: bool = False,
+) -> str:
     if not entry:
         return "no_candidate_entry"
     if entry.get("name") in CRYPTO_MODEL_BASELINE_CANDIDATES:
         return "fallback_market_mid_no_non_market_candidate"
     if _crypto_candidate_has_profit_metrics(entry):
-        if _crypto_candidate_is_profit_deployable(entry):
+        if _crypto_candidate_is_profit_deployable(
+            entry,
+            min_selected_count=min_selected_count,
+            allow_guardrail_failed=allow_guardrail_failed_profit_candidates,
+        ):
+            if entry.get("status") == "guardrail_failed":
+                return "selected_non_market_candidate_with_diagnostic_guardrail_warnings"
             return "selected_positive_oos_pnl_non_market_candidate"
         return "diagnostic_only_best_non_market_oos_pnl"
     if entry.get("status") == "guardrail_failed":
@@ -11110,7 +11180,12 @@ def _crypto_oos_prediction_rows(
     settings: Settings,
     crypto_policy: RuntimeCryptoPolicy,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    folds = _crypto_walk_forward_folds(rows, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
+    max_folds = max(0, int(settings.crypto_model_candidate_max_walk_forward_folds))
+    folds = _crypto_walk_forward_folds(
+        rows,
+        min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)),
+        max_folds=max_folds or None,
+    )
     predicted_rows: list[dict[str, Any]] = []
     fold_summaries: list[dict[str, Any]] = []
     for fold in folds:
@@ -11305,7 +11380,12 @@ def _evaluate_crypto_walk_forward(
     diagnostic_live_policy = diagnostic_quality["live_quality_policy"]
     diagnostic_shadow_policy = diagnostic_quality["shadow_exploration_policy"]
     last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix(rows, settings=settings)
-    folds = _crypto_walk_forward_folds(rows, min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)))
+    max_folds = max(0, int(settings.crypto_model_candidate_max_walk_forward_folds))
+    folds = _crypto_walk_forward_folds(
+        rows,
+        min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)),
+        max_folds=max_folds or None,
+    )
     if not folds:
         empty_metrics = _crypto_model_metrics([], {}, settings=settings, crypto_policy=crypto_policy)
         empty_metrics.update(
@@ -11599,11 +11679,17 @@ def _evaluate_crypto_walk_forward(
     }
 
 
-def _crypto_walk_forward_folds(rows: list[dict[str, Any]], *, min_train_rows: int) -> list[dict[str, Any]]:
+def _crypto_walk_forward_folds(
+    rows: list[dict[str, Any]],
+    *,
+    min_train_rows: int,
+    max_folds: int | None = None,
+) -> list[dict[str, Any]]:
     ordered = sorted(rows, key=lambda row: (str(row.get("market_day")), row.get("decision_ts") or datetime.max.replace(tzinfo=UTC)))
     days = sorted({str(row["market_day"]) for row in ordered if row.get("market_day")})
+    fold_days = days[-max_folds:] if max_folds is not None and max_folds > 0 else days
     folds: list[dict[str, Any]] = []
-    for day in days:
+    for day in fold_days:
         train = [row for row in ordered if str(row.get("market_day")) < day]
         test = [row for row in ordered if str(row.get("market_day")) == day]
         if len(train) < min_train_rows or not test:
