@@ -48,6 +48,19 @@ BNB 15m became live-order-ready and was promoted live on 2026-06-05:
 - Model: `crypto-15m-model-20260605170515-24a698005c6a`, `trained`.
 - Backtest: `crypto-15m-backtest-20260605170606-29f14b53c0fe`, `pass`.
 
+SOL 15m became live-order-ready and was promoted live on 2026-06-05:
+
+- `crypto-live-path status --require-ready` returned `status=ready`.
+- `ready_assets=["SOL"]` and `live_order_ready_assets=["SOL"]`.
+- SOL asset mode was `live`.
+- Strict eligible real-quote rows: `3903`.
+- Current-model live-quality candidates: `340`.
+- OOS trade candidates: `327`.
+- Replay net simulated P/L: `$66.55`.
+- Replay gate: `crypto-15m-gate-20260605171353-b0ed8233c062`, `passed`.
+- Model: `crypto-15m-model-20260605171305-0471d37016ea`, `trained`.
+- Backtest: `crypto-15m-backtest-20260605171352-c962d1305ac9`, `pass`.
+
 ## Process
 
 Set the target asset once and substitute only that asset through the whole run:
