@@ -9,12 +9,13 @@ that separate strategy.
 
 ## Current BTC 15m State
 
-BTC 15m was recovered to live-order-ready on 2026-06-05:
+BTC 15m was recovered to live-order-ready on 2026-06-05 and is the only
+currently live model asset:
 
 - `crypto-live-path status --require-ready` returned `status=ready`.
 - `ready_assets=["BTC"]` and `live_order_ready_assets=["BTC"]`.
 - BTC asset mode was `live`.
-- Strict eligible real-quote rows: `1963`.
+- Strict eligible real-quote rows: `2629`.
 - Current-model live-quality candidates: `117`.
 - OOS trade candidates: `109`.
 - Replay net simulated P/L: `$17.82`.
@@ -22,9 +23,31 @@ BTC 15m was recovered to live-order-ready on 2026-06-05:
 - Model: `crypto-15m-model-20260605160706-9f5261f436d4`, `trained`.
 - Backtest: `crypto-15m-backtest-20260605160316-8228958d7f96`, `pass`.
 
+## Current XRP 15m Evidence
+
+XRP 15m became live-order-ready on 2026-06-05 but remains in `shadow` while the
+operational live surface is pinned to BTC 15m only:
+
+- `crypto-live-path status --require-ready` returned `status=ready`.
+- `ready_assets=["XRP"]` and `live_order_ready_assets=["XRP"]`.
+- XRP asset mode was `shadow`.
+- Strict eligible real-quote rows: `2605`.
+- Current-model live-quality candidates: `158`.
+- OOS trade candidates: `114`.
+- Replay net simulated P/L: `$19.67`.
+- Replay gate: `crypto-15m-gate-20260605162646-b0ed8233c062`, `passed`.
+- Model: `crypto-15m-model-20260605162545-162f5fcc347f`, `trained`.
+- Backtest: `crypto-15m-backtest-20260605162646-099927b2236d`, `pass`.
+
 ## Process
 
-1. Confirm production safety posture.
+Set the target asset once and substitute only that asset through the whole run:
+
+```bash
+ASSET=BTC
+```
+
+1. Confirm production safety posture and the intended live surface.
 
    ```bash
    docker compose --env-file .env -f infra/docker-compose.yml ps
@@ -32,7 +55,12 @@ BTC 15m was recovered to live-order-ready on 2026-06-05:
    docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-asset-mode list \
      --kalshi-env production \
      --frequency 15m
+   docker exec infra-app_production_green-1 sh -lc 'printf "AUTO=%s\n1H_TOUCH_CONTAINER=%s\n1H_TOUCH_RULES=%s\n1H_TOUCH_TRADING=%s\n15M_TOUCH_CONTAINER=%s\n" "$CRYPTO_AUTO_FREQUENCIES" "$ENABLE_CRYPTO_1H_TOUCH20_CONTAINER" "$PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED" "$PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED" "$ENABLE_BTC15M_TOUCH20_CONTAINER"'
    ```
+
+   For a 15m-only promotion, `CRYPTO_AUTO_FREQUENCIES` must include `15m` and
+   must not include `1h`. Touch20 container/rule/trading flags must stay
+   disabled unless that separate strategy is intentionally being deployed.
 
 2. Check the target asset before changing anything.
 
@@ -40,7 +68,7 @@ BTC 15m was recovered to live-order-ready on 2026-06-05:
    docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-live-path status \
      --kalshi-env production \
      --frequency 15m \
-     --assets BTC \
+     --assets "$ASSET" \
      --json
    ```
 
@@ -54,7 +82,7 @@ BTC 15m was recovered to live-order-ready on 2026-06-05:
      --history-days 2 \
      --spot-days 2 \
      --replay-days 30 \
-     --assets BTC \
+     --assets "$ASSET" \
      --docker-container infra-app_production_green-1
    ```
 
@@ -70,7 +98,7 @@ BTC 15m was recovered to live-order-ready on 2026-06-05:
    docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-live-path status \
      --kalshi-env production \
      --frequency 15m \
-     --assets BTC \
+     --assets "$ASSET" \
      --require-ready \
      --json
    ```
@@ -80,8 +108,12 @@ BTC 15m was recovered to live-order-ready on 2026-06-05:
    ```bash
    docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-asset-mode set \
      --kalshi-env production \
-     BTC live
+     "$ASSET" live
    ```
+
+   The asset-mode command is asset-scoped. Before promoting a 15m-only asset,
+   verify the active runtime is constrained to 15m and that 1h strategy services
+   are not running.
 
 6. Recheck runtime.
 
