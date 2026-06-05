@@ -7,10 +7,9 @@ for the `CRYPTO_15M` and `CRYPTO_1H` model path, not the non-model Touch20 path.
 Keep Touch20 containers and fuses disabled unless an operator explicitly chooses
 that separate strategy.
 
-## Current BTC 15m State
+## Current 15m Live Model State
 
-BTC 15m was recovered to live-order-ready on 2026-06-05 and is the only
-currently live model asset:
+BTC 15m was recovered to live-order-ready on 2026-06-05:
 
 - `crypto-live-path status --require-ready` returned `status=ready`.
 - `ready_assets=["BTC"]` and `live_order_ready_assets=["BTC"]`.
@@ -23,15 +22,12 @@ currently live model asset:
 - Model: `crypto-15m-model-20260605160706-9f5261f436d4`, `trained`.
 - Backtest: `crypto-15m-backtest-20260605160316-8228958d7f96`, `pass`.
 
-## Current XRP 15m Evidence
-
-XRP 15m became live-order-ready on 2026-06-05 but remains in `shadow` while the
-operational live surface is pinned to BTC 15m only:
+XRP 15m became live-order-ready and was promoted live on 2026-06-05:
 
 - `crypto-live-path status --require-ready` returned `status=ready`.
 - `ready_assets=["XRP"]` and `live_order_ready_assets=["XRP"]`.
-- XRP asset mode was `shadow`.
-- Strict eligible real-quote rows: `2605`.
+- XRP asset mode was `live`.
+- Strict eligible real-quote rows: `2975`.
 - Current-model live-quality candidates: `158`.
 - OOS trade candidates: `114`.
 - Replay net simulated P/L: `$19.67`.
