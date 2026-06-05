@@ -285,10 +285,29 @@ def test_one_hour_assets_have_frequency_scoped_identity_and_settings():
     assert rules._asset_settings(settings, "BTC", frequency="1h").min_seconds_to_close == 1200
     assert rules._asset_settings(settings, "ETH", frequency="1h").rules_enabled is True
     assert rules._asset_settings(settings, "ETH", frequency="1h").trading_enabled is True
+    assert rules._asset_settings(settings, "HYPE", frequency="1h").rules_enabled is True
+    assert rules._asset_settings(settings, "HYPE", frequency="1h").trading_enabled is False
     assert rules._time_bucket(3600, width_minutes=15, interval_seconds=3600) == "45_60m"
     assert rules._time_bucket(1200, width_minutes=15, interval_seconds=3600) == "15_30m"
     assert rules._bucket_time_band_minutes(60) == 60
     assert rules._time_bucket(3600, width_minutes=60, interval_seconds=3600) == "0_60m"
+
+
+def test_one_hour_default_asset_scope_is_all_supported_markets():
+    settings = _settings(crypto_1h_touch20_rules_enabled=True)
+
+    assert rules._configured_assets(settings, frequency="1h") == [
+        "BTC",
+        "HYPE",
+        "ETH",
+        "BNB",
+        "SOL",
+        "DOGE",
+        "XRP",
+    ]
+    assert rules._asset_settings(settings, "XRP", frequency="1h").rules_enabled is True
+    assert rules._asset_settings(settings, "XRP", frequency="1h").trading_enabled is False
+    assert rules._asset_settings(settings, "XRP", frequency="15m").rules_enabled is False
 
 
 def test_one_hour_asset_can_use_full_interval_bucket_for_sparse_replay():
@@ -1078,8 +1097,11 @@ def test_one_hour_optimizer_profiles_include_coarse_time_bucket_options():
     assert coarse["bucket_time_band_minutes"] == 60
     assert coarse["bucket_price_band_cents"] == 40
     assert coarse["bucket_spread_band_cents"] == 2
+    assert one_hour_profiles["yes_take10_maxspread10_time60_price40_open_s25"]["allowed_sides"] == "yes"
+    assert one_hour_profiles["no_take10_maxspread10_time60_price40_open_s25"]["allowed_sides"] == "no"
+    assert one_hour_profiles["yes_no_take10_stop40_maxspread10_time60_price40_open_s25"]["stop_loss_pct"] == 0.40
     assert "yes_no_take15_maxspread10_time60_price40_open_s25" not in fifteen_minute_profile_names
-
+    assert "yes_take10_maxspread10_time60_price40_open_s25" not in fifteen_minute_profile_names
 
 
 def test_optimizer_profiles_apply_non_btc_asset_overrides():

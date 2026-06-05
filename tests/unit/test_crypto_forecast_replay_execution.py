@@ -2168,19 +2168,23 @@ async def test_settled_quote_path_entry_window_uses_joined_fallback_postgres_sql
     assert len(rows) == 1
     assert rows[0].market_ticker == "KXBTC-1H"
     assert rows[0].settlement_result == "yes"
-    assert "WITH entry_rows AS" in query_sql
+    assert "WITH label_candidates AS" in query_sql
     assert "JOIN labels" in query_sql
-    assert "JOIN crypto_market_snapshots AS label" in query_sql
+    assert "label.source_kind = 'settled_backfill'" in query_sql
+    assert "LIMIT :label_candidate_limit" in query_sql
     assert "entry.yes_bid_dollars > 0" in query_sql
-    assert "EXISTS" in query_sql
-    assert "entry_label.market_ticker = entry.market_ticker" in query_sql
     assert "labels.settlement_result" in query_sql
     assert "snapshot.market_ticker = entry_markets.market_ticker" in query_sql
     assert query_params["entry_seconds"] == 300
     assert query_params["entry_min_market_age_seconds"] == 60
     assert query_params["entry_market_limit"] == 10
+    assert query_params["label_candidate_limit"] == 50
     assert query_params["frequency"] == "1h"
     assert query_params["symbols"] == ["BTC"]
+    guard_sql = "\n".join(sql for sql, _params in fake_session.calls)
+    assert "SET LOCAL statement_timeout = '45s'" in guard_sql
+    assert "SET LOCAL enable_seqscan = off" in guard_sql
+    assert "SET LOCAL enable_bitmapscan = off" in guard_sql
 
 
 @pytest.mark.asyncio

@@ -25,10 +25,10 @@ Current production settings:
 - `ENABLE_CRYPTO_CURRENT_1H_CONTAINER=true`
 - `PRODUCTION_CRYPTO_CURRENT_1H_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP`
 - `CRYPTO_1H_CURRENT_INTERVAL_SECONDS=15`
-- `CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=20`
-- `CRYPTO_1H_CURRENT_SETTLED_DAYS=1`
-- `CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=true`
-- `CRYPTO_1H_CURRENT_REPLAY_GATE_ENABLED=true`
+- `CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=0`
+- `CRYPTO_1H_CURRENT_SETTLED_DAYS=2`
+- `CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=false`
+- `CRYPTO_1H_CURRENT_REPLAY_GATE_ENABLED=false`
 - `CRYPTO_1H_CURRENT_REPLAY_GATE_EVERY_CYCLES=80`
 - `CRYPTO_1H_CURRENT_REPLAY_GATE_DAYS=30`
 - `CRYPTO_1H_CURRENT_REPLAY_GATE_LIMIT=50000`
@@ -45,23 +45,24 @@ Current production settings:
 - `PRODUCTION_CRYPTO_1H_TOUCH20_BUCKET_PRICE_BAND_CENTS=40`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_BUCKET_SPREAD_BAND_CENTS=2`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_BUCKET_TIME_BAND_MINUTES=60`
+- `PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0`
 - `PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP`
-- `ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false`
+- `ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=true`
 
 The production 1h current collector is data-only: `CRYPTO_TRADING_ENABLED=false`
 inside the container. It collects open-market quote evidence and fresh Coinbase
-spot rows, periodically stores recent settled labels so replay can use real
-quote paths after those markets settle, and refreshes replay/gate artifacts on
-an evaluation-only cadence. It does not call `run-once`, `exit-once`, approval,
-or any order-submission path.
+spot rows. The separate 1h Touch20 worker runs `exit-once` and `run-once` across
+all configured 1h assets, while entry order submission remains disabled by
+`CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false`. Automatic settled-label refresh,
+replay/gate refresh, approval, and entry order submission remain disabled in the
+current production posture.
 
-The current 1h evaluation replay uses direct labeled quote-path rows by default
-and skips the joined settled-label fallback scan. The settled refresh therefore
-keeps label propagation enabled so newly settled markets can attach labels to
-their earlier live quote rows. That keeps evaluation bounded to rows that
-already have propagated settlement labels and prevents the data-only collector
-from parking on expensive fallback joins. Manual replay and optimize commands
-can still include the fallback unless run with `--skip-joined-fallback`.
+The current 1h data collector and 1h Touch20 order service defaults both keep
+automatic replay/gate refresh disabled while the production entry-qualified
+quote-path access path is being indexed and stabilized. Manual replay and
+optimize commands can include the joined settled-label fallback unless run with
+`--skip-joined-fallback`, but those commands should only be run after confirming
+no production index build or replay query is already active.
 
 The 2026-06-04 15:08 UTC runtime check confirmed the 15m blue live service was
 still running with BTC, HYPE, ETH, BNB, SOL, DOGE, and XRP configured in the
@@ -437,6 +438,55 @@ closest to the gate:
 The blocker remains evidence support: BTC needs `6` more allowed replay-bucket
 candidates to clear the configured `50` minimum, and every non-BTC lane is much
 farther away. The 1h order-submission service is still stopped.
+
+At 2026-06-04 23:00 UTC, the 1h entry-qualified joined fallback path was moved
+behind an online partial index,
+`ix_crypto_market_snapshots_touch20_entry_quote`, matching strict executable
+entry quote predicates. The migration was made resilient to interrupted
+`CREATE INDEX CONCURRENTLY` runs by dropping and rebuilding missing or invalid
+index shells instead of trusting `IF NOT EXISTS`. The repository replay/update
+paths that force index plans also set a local `45s` statement timeout so failed
+or unindexed 1h evidence refreshes fail fast instead of lingering in production.
+
+A fresh 1h status read at that time showed all seven assets configured with
+`enabled=true` and `trading_enabled=false`. BTC had `49` candidates and `0`
+allowed candidates; HYPE had `0`; ETH had `24` and `0`; BNB, SOL, and XRP each
+had `2` and `0`; DOGE had `16` and `0`. Every 1h gate remained blocked and
+there was no operator approval for any 1h asset.
+
+To keep live loops from competing with the production index build or minting
+new timestamped gate versions during normal entry/exit cycles, the 15m Touch20
+service also defaults `CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0`.
+Manual replay/gate refresh remains available and still requires fresh operator
+approval for any new gate version before entries can resume under that gate.
+
+Post-index 1h refresh sequence:
+
+1. Confirm `ix_crypto_market_snapshots_touch20_entry_quote` is valid and no
+   `pg_stat_progress_create_index` row remains for it.
+2. Confirm no stale replay query is active in `pg_stat_activity`.
+3. Run a bounded manual replay and gate for each 1h asset:
+
+```bash
+for asset in BTC HYPE ETH BNB SOL DOGE XRP; do
+  kalshi-bot-cli crypto-non-model-touch20 replay \
+    --kalshi-env production \
+    --frequency 1h \
+    --asset "$asset" \
+    --days 30 \
+    --limit 50000 \
+    --json
+  kalshi-bot-cli crypto-non-model-touch20 gate \
+    --kalshi-env production \
+    --frequency 1h \
+    --asset "$asset" \
+    --json
+done
+```
+
+4. Inspect each 1h status. Only assets with a passed gate, valid simulator
+   version, and exact operator approval for that gate version may move to
+   `trading_enabled=true`.
 
 Do not start `crypto_non_model_1h_touch20_production` for live order submission
 until the direct label path produces replay rows, each asset's 1h gate passes,

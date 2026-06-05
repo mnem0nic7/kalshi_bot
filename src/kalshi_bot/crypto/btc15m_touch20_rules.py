@@ -37,7 +37,9 @@ TOUCH20_RULES_SUPPORTED_FREQUENCIES = {
     BTC15M_TOUCH20_RULES_FREQ: BTC15M_TOUCH20_RULES_INTERVAL_SECONDS,
     "1h": 3600,
 }
-TOUCH20_RULES_SUPPORTED_ASSETS = frozenset({"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"})
+TOUCH20_RULES_SUPPORTED_ASSET_ORDER = ("BTC", "HYPE", "ETH", "BNB", "SOL", "DOGE", "XRP")
+TOUCH20_RULES_SUPPORTED_ASSETS = frozenset(TOUCH20_RULES_SUPPORTED_ASSET_ORDER)
+TOUCH20_RULES_DEFAULT_1H_ASSETS = ",".join(TOUCH20_RULES_SUPPORTED_ASSET_ORDER)
 TOUCH20_RULES_REPLAY_SIMULATOR_VERSION = "live_exit_v3"
 TOUCH20_RULES_REMEDIATION_BLOCKED_BTC_BUCKETS = frozenset(
     {
@@ -129,7 +131,11 @@ def _configured_assets(settings: Settings, frequency: str | None = BTC15M_TOUCH2
     setting_name = "crypto_1h_touch20_rules_assets" if freq == "1h" else "crypto_15m_touch20_rules_assets"
     raw = str(getattr(settings, setting_name, "") or "").replace(";", ",")
     assets = [_normalize_asset_symbol(item) for item in raw.split(",") if _normalize_asset_symbol(item)]
-    return assets or [BTC15M_TOUCH20_RULES_ASSET]
+    if assets:
+        return assets
+    if freq == "1h":
+        return list(TOUCH20_RULES_SUPPORTED_ASSET_ORDER)
+    return [BTC15M_TOUCH20_RULES_ASSET]
 
 
 def _strategy_code(asset_symbol: str | None, frequency: str | None = BTC15M_TOUCH20_RULES_FREQ) -> str:
@@ -237,10 +243,16 @@ def _asset_settings(
     freq = _normalize_touch_frequency(frequency)
     overrides = _asset_overrides(settings, asset, frequency=freq)
     is_btc = asset == BTC15M_TOUCH20_RULES_ASSET
-    enabled_default = bool(_touch_setting(settings, freq, "rules_enabled", settings.crypto_btc15m_touch20_rules_enabled)) if is_btc else False
+    is_configured_1h_asset = freq == "1h" and asset in set(_configured_assets(settings, freq))
+    uses_frequency_defaults = is_btc or is_configured_1h_asset
+    enabled_default = (
+        bool(_touch_setting(settings, freq, "rules_enabled", settings.crypto_btc15m_touch20_rules_enabled))
+        if uses_frequency_defaults
+        else False
+    )
     trading_default = (
         bool(_touch_setting(settings, freq, "rules_trading_enabled", settings.crypto_btc15m_touch20_rules_trading_enabled))
-        if is_btc
+        if uses_frequency_defaults
         else False
     )
     return Touch20AssetSettings(
@@ -2564,6 +2576,91 @@ def _optimizer_profile_specs(
                     min_aligned_momentum=0.0,
                     min_rule_score=0.30,
                     bucket_price_band_cents=40,
+                    bucket_time_band_minutes=60,
+                ),
+                spec(
+                    "yes_take10_maxspread10_time60_price40_open_s25",
+                    allowed_sides="yes",
+                    take_profit_pct=0.10,
+                    max_spread_dollars=0.10,
+                    min_seconds_to_close=300,
+                    min_contract_price_dollars=0.10,
+                    max_contract_price_dollars=0.85,
+                    min_aligned_momentum=0.0,
+                    min_rule_score=0.25,
+                    bucket_price_band_cents=40,
+                    bucket_spread_band_cents=2,
+                    bucket_time_band_minutes=60,
+                ),
+                spec(
+                    "no_take10_maxspread10_time60_price40_open_s25",
+                    allowed_sides="no",
+                    take_profit_pct=0.10,
+                    max_spread_dollars=0.10,
+                    min_seconds_to_close=300,
+                    min_contract_price_dollars=0.10,
+                    max_contract_price_dollars=0.85,
+                    min_aligned_momentum=0.0,
+                    min_rule_score=0.25,
+                    bucket_price_band_cents=40,
+                    bucket_spread_band_cents=2,
+                    bucket_time_band_minutes=60,
+                ),
+                spec(
+                    "yes_take15_maxspread10_time60_price40_open_s25",
+                    allowed_sides="yes",
+                    take_profit_pct=0.15,
+                    max_spread_dollars=0.10,
+                    min_seconds_to_close=300,
+                    min_contract_price_dollars=0.10,
+                    max_contract_price_dollars=0.85,
+                    min_aligned_momentum=0.0,
+                    min_rule_score=0.25,
+                    bucket_price_band_cents=40,
+                    bucket_spread_band_cents=2,
+                    bucket_time_band_minutes=60,
+                ),
+                spec(
+                    "no_take15_maxspread10_time60_price40_open_s25",
+                    allowed_sides="no",
+                    take_profit_pct=0.15,
+                    max_spread_dollars=0.10,
+                    min_seconds_to_close=300,
+                    min_contract_price_dollars=0.10,
+                    max_contract_price_dollars=0.85,
+                    min_aligned_momentum=0.0,
+                    min_rule_score=0.25,
+                    bucket_price_band_cents=40,
+                    bucket_spread_band_cents=2,
+                    bucket_time_band_minutes=60,
+                ),
+                spec(
+                    "yes_no_take10_stop40_maxspread10_time60_price40_open_s25",
+                    allowed_sides="yes,no",
+                    take_profit_pct=0.10,
+                    stop_loss_pct=0.40,
+                    max_spread_dollars=0.10,
+                    min_seconds_to_close=300,
+                    min_contract_price_dollars=0.10,
+                    max_contract_price_dollars=0.85,
+                    min_aligned_momentum=0.0,
+                    min_rule_score=0.25,
+                    bucket_price_band_cents=40,
+                    bucket_spread_band_cents=2,
+                    bucket_time_band_minutes=60,
+                ),
+                spec(
+                    "yes_no_take10_maxspread10_time60_price40_20_70_s20",
+                    allowed_sides="yes,no",
+                    take_profit_pct=0.10,
+                    max_spread_dollars=0.10,
+                    min_seconds_to_close=300,
+                    min_contract_price_dollars=0.20,
+                    max_contract_price_dollars=0.70,
+                    min_aligned_momentum=0.0,
+                    min_rule_score=0.20,
+                    bucket_price_band_cents=40,
+                    bucket_spread_band_cents=2,
                     bucket_time_band_minutes=60,
                 ),
             ]

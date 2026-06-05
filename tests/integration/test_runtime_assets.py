@@ -86,14 +86,14 @@ def test_btc_current_collector_refreshes_settled_labels() -> None:
     assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES" in compose_text
     assert "CRYPTO_BTC15M_TOUCH20_BUCKET_PRICE_BAND_CENTS" in compose_text
     assert 'assets="$${CRYPTO_15M_TOUCH20_RULES_ASSETS:-BTC}"' in compose_text
-    assert 'replay_gate_every="$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES:-80}"' in compose_text
+    assert 'replay_gate_every="$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES:-0}"' in compose_text
     assert '--days "$${CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS:-30}"' in compose_text
     assert 'sleep "$${CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS:-15}"' in compose_text
     assert "crypto-non-model-touch20 replay" in compose_text
     assert "crypto-non-model-touch20 gate" in compose_text
-    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
+    assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0" in env_lines
     assert "PRODUCTION_CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS=30" in env_lines
-    assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
+    assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_REPLAY_GATE_DAYS=30" in env_lines
     assert "CRYPTO_CURRENT_15M_SETTLED_EVERY_CYCLES" in compose_text
     assert "CRYPTO_CURRENT_15M_SETTLED_DAYS" in compose_text
@@ -116,26 +116,29 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert "CRYPTO_CURRENT_1H_ASSETS" in compose_text
     assert 'assets="$${CRYPTO_CURRENT_1H_ASSETS:-$${PRODUCTION_CRYPTO_CURRENT_1H_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}}"' in compose_text
     assert 'CRYPTO_1H_TOUCH20_ASSET_SETTINGS: "${PRODUCTION_CRYPTO_1H_TOUCH20_ASSET_SETTINGS:-{}}"' in compose_text
-    assert "CRYPTO_1H_TOUCH20_RULES_ASSETS: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC}" in compose_text
-    assert 'settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-20}"' in compose_text
-    assert '--days "$${CRYPTO_1H_CURRENT_SETTLED_DAYS:-7}"' in compose_text
+    assert "CRYPTO_1H_TOUCH20_RULES_ASSETS: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}" in compose_text
+    assert 'settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-0}"' in compose_text
+    assert '--days "$${CRYPTO_1H_CURRENT_SETTLED_DAYS:-2}"' in compose_text
     assert 'sleep "$${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-15}"' in compose_text
     assert "PRODUCTION_CRYPTO_CURRENT_1H_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP" in env_lines
     assert "crypto_non_model_1h_touch20_production:" in compose_text
     assert "--frequency 1h" in compose_text
-    assert 'assets="$${CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC}"' in compose_text
+    assert 'assets="$${CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}"' in compose_text
     assert "CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES" in compose_text
     assert "crypto-non-model-touch20 replay" in compose_text
     assert "crypto-non-model-touch20 gate" in compose_text
     assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
     assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false" in env_lines
-    assert "PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=80" in env_lines
+    assert "PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0" in env_lines
     assert "CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
     assert "CRYPTO_1H_TOUCH20_BUCKET_TIME_BAND_MINUTES=15" in env_lines
     assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER=false" in env_lines
     assert "ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false" in env_lines
     assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS=15" in env_lines
+    assert "CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=0" in env_lines
     assert "CRYPTO_1H_CURRENT_SETTLED_DAYS=2" in env_lines
+    assert "CRYPTO_1H_CURRENT_REPLAY_GATE_ENABLED=false" in env_lines
+    assert "CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=false" in env_lines
     assert "runtime_services+=(crypto_current_1h_production)" in start_stack
     assert "runtime_services+=(crypto_non_model_1h_touch20_production)" in start_stack
     assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER" in restart_color

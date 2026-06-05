@@ -370,6 +370,14 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         env = (kalshi_env or self.kalshi_env or "demo").strip()
         return env or "demo"
 
+    async def _apply_crypto_snapshot_index_query_guards(self, *, disable_bitmapscan: bool = True) -> None:
+        from sqlalchemy import text as sql_text
+
+        await self.session.execute(sql_text("SET LOCAL statement_timeout = '45s'"))
+        await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
+        if disable_bitmapscan:
+            await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
+
     def _env_stream_name(self, prefix: str, *, kalshi_env: str | None = None, suffix: str | None = None) -> str:
         parts = [prefix, self._resolved_kalshi_env(kalshi_env)]
         if suffix:
@@ -1751,12 +1759,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             min_market_age_seconds = max(0, int(entry_min_market_age_seconds or 0))
             label_where = [
                 "label.kalshi_env = :env",
+                "label.source_kind = 'settled_backfill'",
                 "label.settlement_result IN ('yes', 'no')",
-            ]
-            entry_label_where = [
-                "entry_label.kalshi_env = :env",
-                "entry_label.settlement_result IN ('yes', 'no')",
-                "entry_label.market_ticker = entry.market_ticker",
             ]
             entry_where = [
                 "entry.kalshi_env = :env",
@@ -1777,6 +1781,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 "limit": row_limit,
                 "entry_seconds": entry_seconds,
                 "entry_market_limit": entry_market_limit,
+                "label_candidate_limit": max(entry_market_limit, min(row_limit, entry_market_limit * 5)),
             }
             if min_market_age_seconds > 0:
                 entry_where.append(
@@ -1785,19 +1790,16 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 params["entry_min_market_age_seconds"] = min_market_age_seconds
             if frequency is not None:
                 label_where.append("label.frequency = :frequency")
-                entry_label_where.append("entry_label.frequency = :frequency")
                 entry_where.append("entry.frequency = :frequency")
                 snapshot_where.append("snapshot.frequency = :frequency")
                 params["frequency"] = frequency
             if symbols:
                 label_where.append("label.asset_symbol IN :symbols")
-                entry_label_where.append("entry_label.asset_symbol IN :symbols")
                 entry_where.append("entry.asset_symbol IN :symbols")
                 snapshot_where.append("snapshot.asset_symbol IN :symbols")
                 params["symbols"] = symbols
             if since is not None:
                 label_where.append("label.observed_at >= :since")
-                entry_label_where.append("entry_label.observed_at >= :since")
                 entry_where.append("entry.observed_at >= :since")
                 snapshot_where.append("snapshot.observed_at >= :since")
                 params["since"] = since
@@ -1808,15 +1810,6 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                         label.open_time IS NULL
                         OR label.close_time IS NULL
                         OR EXTRACT(EPOCH FROM (label.close_time - label.open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                entry_label_where.append(
-                    """
-                    (
-                        entry_label.open_time IS NULL
-                        OR entry_label.close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (entry_label.close_time - entry_label.open_time)) BETWEEN :duration_min AND :duration_max
                     )
                     """
                 )
@@ -1842,16 +1835,31 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 params["duration_max"] = duration_bounds[1]
             raw = sql_text(
                 f"""
-                WITH entry_rows AS (
+                WITH label_candidates AS (
+                    SELECT
+                           label.market_ticker,
+                           label.settlement_result,
+                           label.observed_at
+                    FROM crypto_market_snapshots AS label
+                    WHERE {" AND ".join(label_where)}
+                    ORDER BY label.observed_at DESC, label.market_ticker
+                    LIMIT :label_candidate_limit
+                ),
+                labels AS (
+                    SELECT DISTINCT ON (market_ticker)
+                           market_ticker,
+                           settlement_result
+                    FROM label_candidates
+                    ORDER BY
+                        market_ticker,
+                        observed_at DESC
+                ),
+                entry_rows AS (
                     SELECT entry.market_ticker, entry.observed_at AS entry_observed
                     FROM crypto_market_snapshots AS entry
+                    JOIN labels
+                      ON labels.market_ticker = entry.market_ticker
                     WHERE {" AND ".join(entry_where)}
-                      AND EXISTS (
-                          SELECT 1
-                          FROM crypto_market_snapshots AS entry_label
-                          WHERE {" AND ".join(entry_label_where)}
-                          LIMIT 1
-                      )
                     ORDER BY entry.observed_at DESC, entry.market_ticker
                     LIMIT :entry_market_limit
                 ),
@@ -1861,19 +1869,6 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                     GROUP BY market_ticker
                     ORDER BY latest_entry_observed DESC, market_ticker
                     LIMIT :entry_market_limit
-                ),
-                labels AS (
-                    SELECT DISTINCT ON (label.market_ticker)
-                           label.market_ticker,
-                           label.settlement_result
-                    FROM entry_markets
-                    JOIN crypto_market_snapshots AS label
-                      ON label.market_ticker = entry_markets.market_ticker
-                    WHERE {" AND ".join(label_where)}
-                    ORDER BY
-                        label.market_ticker,
-                        CASE WHEN label.source_kind = 'settled_backfill' THEN 0 ELSE 1 END,
-                        label.observed_at DESC
                 )
                 SELECT
                     snapshot.id,
@@ -1913,8 +1908,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             )
             if symbols:
                 raw = raw.bindparams(bindparam("symbols", expanding=True))
-            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
-            await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
+            await self._apply_crypto_snapshot_index_query_guards()
             rows = (await self.session.execute(raw, params)).mappings().all()
             fallback_rows = [
                 row
@@ -2047,7 +2041,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             )
             if symbols:
                 raw = raw.bindparams(bindparam("symbols", expanding=True))
-            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
+            await self._apply_crypto_snapshot_index_query_guards(disable_bitmapscan=False)
             rows = (await self.session.execute(raw, params)).mappings().all()
             direct_rows = [
                 row
@@ -2203,8 +2197,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             )
             if symbols:
                 raw = raw.bindparams(bindparam("symbols", expanding=True))
-            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
-            await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
+            await self._apply_crypto_snapshot_index_query_guards()
             rows = (await self.session.execute(raw, params)).mappings().all()
             fallback_rows = [
                 row
@@ -2352,8 +2345,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                     )
                     """
                 )
-            await self.session.execute(sql_text("SET LOCAL enable_seqscan = off"))
-            await self.session.execute(sql_text("SET LOCAL enable_bitmapscan = off"))
+            await self._apply_crypto_snapshot_index_query_guards()
             stmt = sql_text(
                 f"""
                 UPDATE crypto_market_snapshots AS snapshot
