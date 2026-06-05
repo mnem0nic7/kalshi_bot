@@ -87,6 +87,19 @@ DOGE 15m became live-order-ready and was promoted live on 2026-06-05:
 - Model: `crypto-15m-model-20260605173602-9546f1c4d0a9`, `trained`.
 - Backtest: `crypto-15m-backtest-20260605173707-92f42be92c7e`, `pass`.
 
+HYPE 15m became live-order-ready and was promoted live on 2026-06-05:
+
+- `crypto-live-path status --require-ready` returned `status=ready`.
+- `ready_assets=["HYPE"]` and `live_order_ready_assets=["HYPE"]`.
+- HYPE asset mode was `live`.
+- Strict eligible real-quote rows: `4685`.
+- Current-model live-quality candidates: `104`.
+- OOS trade candidates: `380`.
+- Replay net simulated P/L: `$46.09`.
+- Replay gate: `crypto-15m-gate-20260605174605-b0ed8233c062`, `passed`.
+- Model: `crypto-15m-model-20260605174501-2fe69fa1e911`, `trained`.
+- Backtest: `crypto-15m-backtest-20260605174601-99fe5d9b027c`, `pass`.
+
 ## Process
 
 Set the target asset once and substitute only that asset through the whole run:
