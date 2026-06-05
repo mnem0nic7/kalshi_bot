@@ -74,6 +74,19 @@ ETH 15m became live-order-ready and was promoted live on 2026-06-05:
 - Model: `crypto-15m-model-20260605172512-776c4638f0fe`, `trained`.
 - Backtest: `crypto-15m-backtest-20260605172649-edd3d591cc57`, `pass`.
 
+DOGE 15m became live-order-ready and was promoted live on 2026-06-05:
+
+- `crypto-live-path status --require-ready` returned `status=ready`.
+- `ready_assets=["DOGE"]` and `live_order_ready_assets=["DOGE"]`.
+- DOGE asset mode was `live`.
+- Strict eligible real-quote rows: `4452`.
+- Current-model live-quality candidates: `405`.
+- OOS trade candidates: `355`.
+- Replay net simulated P/L: `$67.45`.
+- Replay gate: `crypto-15m-gate-20260605173717-b0ed8233c062`, `passed`.
+- Model: `crypto-15m-model-20260605173602-9546f1c4d0a9`, `trained`.
+- Backtest: `crypto-15m-backtest-20260605173707-92f42be92c7e`, `pass`.
+
 ## Process
 
 Set the target asset once and substitute only that asset through the whole run:
