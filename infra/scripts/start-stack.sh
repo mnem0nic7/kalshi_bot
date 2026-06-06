@@ -129,7 +129,7 @@ fi
 if [[ "${ENABLE_CRYPTO_1H_CONTAINER:-false}" == "true" ]]; then
   runtime_services+=(crypto_1h_production)
 fi
-if [[ "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
+if [[ "${ENABLE_CRYPTO_1H_DAEMON:-false}" == "true" ]]; then
   runtime_services+=(daemon_production_crypto_1h_blue daemon_production_crypto_1h_green)
 fi
 if [[ "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then

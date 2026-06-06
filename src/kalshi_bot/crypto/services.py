@@ -1333,6 +1333,44 @@ class CryptoMarketService:
                     asset_symbol=requested_assets[0],
                 )
                 await session.commit()
+        elif model is None or gate is None or backtest is None:
+            # Per-asset training mode: no aggregate artifact exists, fall back to per-asset lookup.
+            # Iterate assets until all three are found (first asset that has a full set wins).
+            _fallback_assets = requested_assets or sorted({s.asset_symbol for s in snapshots})
+            if _fallback_assets:
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session)
+                    for _asset in _fallback_assets:
+                        if model is None:
+                            model = await _latest_crypto_artifact_for_asset(
+                                repo,
+                                frequency=normalize_frequency(frequency) or "15m",
+                                artifact_type="model",
+                                kalshi_env=self.settings.kalshi_env,
+                                asset_symbol=_asset,
+                                allow_generic_fallback=False,
+                            )
+                        if gate is None:
+                            gate = await _latest_crypto_artifact_for_asset(
+                                repo,
+                                frequency=normalize_frequency(frequency) or "15m",
+                                artifact_type="replay_gate",
+                                kalshi_env=self.settings.kalshi_env,
+                                asset_symbol=_asset,
+                                allow_generic_fallback=False,
+                            )
+                        if backtest is None:
+                            backtest = await _latest_crypto_artifact_for_asset(
+                                repo,
+                                frequency=normalize_frequency(frequency) or "15m",
+                                artifact_type="backtest",
+                                kalshi_env=self.settings.kalshi_env,
+                                asset_symbol=_asset,
+                                allow_generic_fallback=False,
+                            )
+                        if model is not None and gate is not None and backtest is not None:
+                            break
+                    await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,

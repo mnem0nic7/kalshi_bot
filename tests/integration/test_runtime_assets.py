@@ -170,6 +170,9 @@ def test_sync_web_color_can_disable_strategies_site_container() -> None:
 def test_compose_declares_opt_in_crypto_1h_refresh_container() -> None:
     compose_text = Path("infra/docker-compose.yml").read_text(encoding="utf-8")
     start_stack = Path("infra/scripts/start-stack.sh").read_text(encoding="utf-8")
+    dockerfile_text = Path("infra/docker/Dockerfile").read_text(encoding="utf-8")
+    status_script = Path("scripts/crypto_live_path_status.sh").read_text(encoding="utf-8")
+    refresh_script = Path("scripts/crypto_live_path_refresh.sh").read_text(encoding="utf-8")
 
     assert "crypto_1h_production:" in compose_text
     assert "--frequency 1h" in compose_text
@@ -178,9 +181,14 @@ def test_compose_declares_opt_in_crypto_1h_refresh_container() -> None:
     assert "scripts/crypto_live_path_refresh.sh" in compose_text
     assert "ENABLE_CRYPTO_1H_CONTAINER" in start_stack
     assert "runtime_services+=(crypto_1h_production)" in start_stack
-    assert "COPY scripts/crypto_live_path_refresh.sh ./scripts/crypto_live_path_refresh.sh" in Path(
-        "infra/docker/Dockerfile"
-    ).read_text(encoding="utf-8")
+    assert "COPY scripts/crypto_live_path_refresh.sh ./scripts/crypto_live_path_refresh.sh" in dockerfile_text
+    assert "COPY scripts/crypto_live_path_status.sh ./scripts/crypto_live_path_status.sh" in dockerfile_text
+    assert "--skip-growth" in status_script
+    assert "--require-ready" in status_script
+    assert "--docker-env" in refresh_script
+    assert "--replay-limit" in refresh_script
+    assert 'replay_args+=(--replay-limit "${replay_limit}")' in refresh_script
+    assert 'docker_exec_env+=(-e "${env_pair}")' in refresh_script
 
 
 def test_compose_declares_opt_in_crypto_1h_daemon_pair() -> None:
@@ -194,9 +202,12 @@ def test_compose_declares_opt_in_crypto_1h_daemon_pair() -> None:
     assert "DAEMON_HEARTBEAT_ROLE: crypto_1h" in compose_text
     assert 'CRYPTO_AUTO_FREQUENCIES: "1h"' in compose_text
     assert "ENABLE_CRYPTO_1H_DAEMON" in start_stack
+    assert 'ENABLE_CRYPTO_1H_DAEMON:-false' in start_stack
     assert "daemon_production_crypto_1h_blue daemon_production_crypto_1h_green" in start_stack
     assert "ENABLE_CRYPTO_1H_DAEMON" in restart_color
+    assert 'ENABLE_CRYPTO_1H_DAEMON:-false' in restart_color
     assert 'runtime_services+=("daemon_production_crypto_1h_${color}")' in restart_color
+    assert "ENABLE_CRYPTO_1H_DAEMON=false" in Path(".env.example").read_text(encoding="utf-8")
 
 
 def test_compose_uses_env_scoped_live_weather_switches() -> None:

@@ -21,7 +21,8 @@ COPY alembic.ini ./
 COPY docs ./docs
 COPY infra/config ./infra/config
 COPY scripts/crypto_live_path_refresh.sh ./scripts/crypto_live_path_refresh.sh
-RUN chmod +x ./scripts/crypto_live_path_refresh.sh
+COPY scripts/crypto_live_path_status.sh ./scripts/crypto_live_path_status.sh
+RUN chmod +x ./scripts/crypto_live_path_refresh.sh ./scripts/crypto_live_path_status.sh
 
 # The cached editable install points at /app/src; PYTHONPATH keeps source-only
 # rebuilds from paying another package installation step.

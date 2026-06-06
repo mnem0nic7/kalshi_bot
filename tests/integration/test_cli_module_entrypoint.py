@@ -210,6 +210,8 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
             "2",
             "--replay-days",
             "30",
+            "--replay-limit",
+            "5000",
             "--assets",
             "XRP",
             "--until-ready",
@@ -295,6 +297,7 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert live_path_refresh_args.settled_days == 2
     assert live_path_refresh_args.spot_days == 2
     assert live_path_refresh_args.replay_days == 30
+    assert live_path_refresh_args.replay_limit == 5000
     assert live_path_refresh_args.assets == ["XRP"]
     assert live_path_refresh_args.until_ready is True
     assert live_path_refresh_args.max_iterations == 3
@@ -535,6 +538,118 @@ async def test_crypto_live_path_asset_resolution_falls_back_when_discovery_fails
     assert "kalshi unavailable" in discovery["error"]
 
 
+@pytest.mark.asyncio
+async def test_crypto_live_path_skip_growth_uses_fast_status_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    class HeavyStatusService:
+        async def status(self, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("full status should not run when skip_growth is set")
+
+    container = SimpleNamespace(
+        settings=SimpleNamespace(kalshi_env="production"),
+        crypto_history_service=HeavyStatusService(),
+        crypto_spot_service=HeavyStatusService(),
+    )
+    calls: list[str] = []
+
+    async def fast_history(container_arg: object, **kwargs: object) -> dict[str, object]:
+        assert container_arg is container
+        calls.append("history")
+        return {
+            "quote_evidence": {
+                "trade_candidate_support_by_asset": {
+                    "BTC": {
+                        "strict_trade_eligible_rows": 100,
+                        "strict_market_day_count": 1,
+                        "strict_settlement_day_count": 1,
+                    }
+                },
+                "strict_quote_ingestion_audit_by_asset": {
+                    "BTC": {
+                        "snapshot_present": 100,
+                        "real_bid_ask_present": 100,
+                        "settled_label_joined": 100,
+                        "strict_trade_eligible": 100,
+                        "strict_market_day_count": 1,
+                        "strict_settlement_day_count": 1,
+                    }
+                },
+            }
+        }
+
+    async def fast_spot(container_arg: object, **kwargs: object) -> dict[str, object]:
+        assert container_arg is container
+        calls.append("spot")
+        return {
+            "spot_quality": {
+                "coverage_pct": 1.0,
+                "missing_assets": [],
+                "stale_assets": [],
+                "assets": {
+                    "BTC": {
+                        "row_count": 10,
+                        "provider_counts": {"coinbase": 10},
+                        "source_kind_counts": {"spot_tick": 10},
+                        "proxy_only": False,
+                    }
+                },
+            }
+        }
+
+    async def runtime_state(container_arg: object, **kwargs: object) -> dict[str, object]:
+        assert container_arg is container
+        calls.append("runtime")
+        return {
+            "deployment": {
+                "kalshi_env": "production",
+                "live_switch_blockers": [],
+                "live_order_blockers": [],
+            },
+            "policy_requirements": {},
+            "asset_modes": {"BTC": "shadow"},
+            "asset_entry_thresholds": {"BTC": {"min_fee_adjusted_edge_bps": 500}},
+            "artifacts": {
+                "BTC": {
+                    "model": {"status": "trained", "payload": {}},
+                    "backtest": {
+                        "status": "warn",
+                        "metrics": {
+                            "strict_trade_eligible_count": 100,
+                            "current_model_live_quality_candidate_count": 0,
+                            "oos_trade_candidate_count": 0,
+                            "oos_evaluation_status": "insufficient_data",
+                            "oos_fold_count": 0,
+                            "net_simulated_pl_dollars": 0.0,
+                        },
+                    },
+                    "replay_gate": {"status": "blocked", "payload": {"reasons": ["blocked"]}},
+                }
+            },
+        }
+
+    monkeypatch.setattr(cli_module, "_crypto_live_path_fast_history_status", fast_history)
+    monkeypatch.setattr(cli_module, "_crypto_live_path_fast_spot_status", fast_spot)
+    monkeypatch.setattr(cli_module, "_crypto_live_path_runtime_state", runtime_state)
+
+    result = await cli_module._crypto_live_path_status_payload(
+        SimpleNamespace(
+            frequency="1h",
+            assets=["BTC"],
+            status_days=14,
+            strict_rows_target=60,
+            candidate_target=50,
+            skip_growth=True,
+            baselines=False,
+        ),
+        container,
+    )
+
+    assert calls == ["history", "spot", "runtime"]
+    assert result["strict_row_growth"] == {"status": "skipped", "reason": "skip_growth"}
+    btc_report = result["asset_reports"][0]
+    assert btc_report["quote_evidence"]["strict_quote_market_day_count"] == 1
+    assert "strict_quote_market_day_count 1 < 2 for OOS replay" in btc_report["blockers"]
+
+
 def test_crypto_live_path_surfaces_candidate_rejection_counts() -> None:
     report = cli_module._crypto_live_path_assess_asset(
         "BTC",
@@ -713,6 +828,7 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         history_days=2,
         spot_days=2,
         replay_days=30,
+        replay_limit=1234,
         require_ready=False,
     )
     container = SimpleNamespace(
@@ -736,6 +852,9 @@ async def test_crypto_live_path_refresh_uses_forecast_service(monkeypatch: pytes
         "forecast_train",
         "replay_run",
         "replay_gate",
+    ]
+    assert [kwargs for name, kwargs in calls if name == "replay_run"] == [
+        {"frequency": "15m", "days": 30, "limit": 1234, "asset_symbols": ["XRP"]}
     ]
 
 
@@ -811,6 +930,7 @@ async def test_crypto_live_path_refresh_retries_training_after_strict_rows_grow(
         history_days=2,
         spot_days=2,
         replay_days=30,
+        replay_limit=4321,
         require_ready=True,
     )
     container = SimpleNamespace(
@@ -842,6 +962,10 @@ async def test_crypto_live_path_refresh_retries_training_after_strict_rows_grow(
         "forecast_train",
         "replay_run",
         "replay_gate",
+    ]
+    assert [kwargs for name, kwargs in calls if name == "replay_run"] == [
+        {"frequency": "15m", "days": 30, "limit": 4321, "asset_symbols": ["BTC"]},
+        {"frequency": "15m", "days": 30, "limit": 4321, "asset_symbols": ["BTC"]},
     ]
 
 
@@ -926,6 +1050,8 @@ def test_crypto_live_path_refresh_script_explicit_assets_bypass_discovery(tmp_pa
             str(tmp_path / "reports"),
             "--assets",
             "XRP",
+            "--replay-limit",
+            "5000",
         ],
         capture_output=True,
         text=True,
@@ -939,6 +1065,7 @@ def test_crypto_live_path_refresh_script_explicit_assets_bypass_discovery(tmp_pa
     expected = (
         "crypto-live-path refresh --kalshi-env production --frequency 1h "
         "--settled-days 2 --history-days 2 --spot-days 2 --replay-days 30 "
+        "--replay-limit 5000 "
         "--assets XRP --skip-growth --json"
     )
     assert calls == [expected]

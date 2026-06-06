@@ -14,7 +14,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import bindparam, or_, select, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kalshi_bot.core.enums import RoomOrigin
@@ -29,6 +29,8 @@ from kalshi_bot.core.schemas import (
 )
 from kalshi_bot.crypto.services import (
     _latest_crypto_artifact_for_asset,
+    _crypto_spot_is_proxy,
+    _crypto_spot_max_stale_seconds,
     crypto_entry_override_key,
     crypto_frequency_switch_enabled,
     crypto_strategy_code_for_frequency,
@@ -1104,6 +1106,7 @@ async def _crypto_live_path_retry_training_after_refresh(
     assets: list[str],
     frequency: str,
     replay_days: int,
+    replay_limit: int | None,
 ) -> tuple[list[dict[str, Any]], set[str], list[dict[str, Any]]]:
     retry_results: list[dict[str, Any]] = []
     resolved_assets: set[str] = set()
@@ -1160,7 +1163,7 @@ async def _crypto_live_path_retry_training_after_refresh(
             replay_run = await container.crypto_replay_service.run(
                 frequency=frequency,
                 days=replay_days,
-                limit=None,
+                limit=replay_limit,
                 asset_symbols=[asset],
             )
             result["steps"]["replay_run"] = _crypto_live_path_step_summary(replay_run)
@@ -1786,6 +1789,362 @@ def _crypto_live_path_env(runtime_state: dict[str, Any]) -> str:
     return env if env in {"demo", "production"} else "production"
 
 
+def _crypto_status_cutoff(status_days: int | float | None) -> datetime:
+    if status_days and float(status_days) > 0:
+        return datetime.now(UTC) - timedelta(days=float(status_days))
+    return datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _crypto_status_day_windows(cutoff: datetime, status_days: int | float | None) -> list[tuple[str, datetime, datetime]]:
+    day_limit = max(3, min(int(float(status_days or 14)) + 1, 45))
+    today = datetime.now(UTC).date()
+    windows: list[tuple[str, datetime, datetime]] = []
+    for offset in range(day_limit):
+        day = today - timedelta(days=offset)
+        day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+        day_end = day_start + timedelta(days=1)
+        if day_end <= cutoff:
+            break
+        windows.append((day.isoformat(), max(day_start, cutoff), day_end))
+    return windows
+
+
+def _crypto_live_path_duration_filter_sql(frequency: str) -> str:
+    freq = str(frequency or "").strip().lower()
+    if freq not in {"1h", "hourly"}:
+        return ""
+    return (
+        " AND (open_time IS NULL OR close_time IS NULL "
+        "OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN 3000 AND 4200)"
+    )
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+async def _crypto_live_path_apply_fast_status_query_guards(session: AsyncSession) -> None:
+    await session.execute(sa_text("SET LOCAL statement_timeout = '20s'"))
+
+
+async def _crypto_live_path_fast_history_status(
+    container: AppContainer,
+    *,
+    assets: list[str],
+    frequency: str,
+    status_days: int | float | None,
+) -> dict[str, Any]:
+    """Aggregate quote evidence without materializing replay decision rows."""
+    normalized_assets = normalize_asset_symbols(assets)
+    cutoff = _crypto_status_cutoff(status_days)
+    async with container.session_factory() as session:
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name != "postgresql":
+            return await container.crypto_history_service.status(
+                frequency=frequency,
+                days=status_days,
+                asset_symbols=normalized_assets,
+            )
+        await _crypto_live_path_apply_fast_status_query_guards(session)
+        duration_filter = _crypto_live_path_duration_filter_sql(frequency)
+        probe_stmt = sa_text(
+            f"""
+            SELECT
+              EXISTS (
+                SELECT 1
+                FROM crypto_market_snapshots
+                WHERE kalshi_env = :kalshi_env
+                  AND frequency = :frequency
+                  AND asset_symbol = :asset
+                  AND observed_at >= :cutoff
+                  AND source_kind != 'settled_backfill'
+                  {duration_filter}
+                LIMIT 1
+              ) AS snapshot_present,
+              EXISTS (
+                SELECT 1
+                FROM crypto_market_snapshots
+                WHERE kalshi_env = :kalshi_env
+                  AND frequency = :frequency
+                  AND asset_symbol = :asset
+                  AND observed_at >= :cutoff
+                  AND source_kind != 'settled_backfill'
+                  AND yes_bid_dollars IS NOT NULL
+                  AND yes_ask_dollars IS NOT NULL
+                  {duration_filter}
+                LIMIT 1
+              ) AS real_bid_ask_present,
+              EXISTS (
+                SELECT 1
+                FROM crypto_market_snapshots
+                WHERE kalshi_env = :kalshi_env
+                  AND frequency = :frequency
+                  AND asset_symbol = :asset
+                  AND observed_at >= :cutoff
+                  AND source_kind != 'settled_backfill'
+                  AND settlement_result IN ('yes', 'no')
+                  AND yes_bid_dollars IS NOT NULL
+                  AND yes_ask_dollars IS NOT NULL
+                  {duration_filter}
+                LIMIT 1
+              ) AS settled_label_joined
+            """
+        )
+        day_stmt = sa_text(
+            f"""
+            SELECT EXISTS (
+              SELECT 1
+              FROM crypto_market_snapshots
+              WHERE kalshi_env = :kalshi_env
+                AND frequency = :frequency
+                AND asset_symbol = :asset
+                AND close_time >= :day_start
+                AND close_time < :day_end
+                AND source_kind != 'settled_backfill'
+                AND settlement_result IN ('yes', 'no')
+                AND yes_bid_dollars IS NOT NULL
+                AND yes_ask_dollars IS NOT NULL
+                {duration_filter}
+              LIMIT 1
+            ) AS has_strict_day
+            """
+        )
+        rows: list[dict[str, Any]] = []
+        day_windows = _crypto_status_day_windows(cutoff, status_days)
+        for asset in normalized_assets:
+            params = {
+                "kalshi_env": container.settings.kalshi_env,
+                "frequency": frequency,
+                "asset": asset,
+                "cutoff": cutoff,
+            }
+            probe = (await session.execute(probe_stmt, params)).mappings().one()
+            days: list[str] = []
+            for day_label, day_start, day_end in day_windows:
+                day_probe = (
+                    await session.execute(
+                        day_stmt,
+                        {**params, "day_start": day_start, "day_end": day_end},
+                    )
+                ).mappings().one()
+                if day_probe.get("has_strict_day"):
+                    days.append(day_label)
+                    if len(days) >= 3:
+                        break
+            days.sort()
+            rows.append(
+                {
+                    "asset_symbol": asset,
+                    "snapshot_present": 1 if probe.get("snapshot_present") else 0,
+                    "real_bid_ask_present": 1 if probe.get("real_bid_ask_present") else 0,
+                    "strict_trade_eligible": 1 if probe.get("settled_label_joined") else 0,
+                    "strict_market_day_count": len(days),
+                    "strict_market_days": days,
+                    "strict_settlement_day_count": len(days),
+                    "strict_settlement_days": days,
+                }
+            )
+        await session.commit()
+
+    source_kind_counts: Counter[str] = Counter()
+    source_by_asset: dict[str, Counter[str]] = {asset: Counter() for asset in normalized_assets}
+
+    support_by_asset: dict[str, dict[str, Any]] = {}
+    strict_audit_by_asset: dict[str, dict[str, Any]] = {}
+    assets_with_real_quotes: list[str] = []
+    assets_missing_settled: list[str] = []
+    total_real = 0
+    total_strict = 0
+    for asset in normalized_assets:
+        raw = next((row for row in rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == asset), {})
+        snapshot_present = _int_or_zero(raw.get("snapshot_present"))
+        real_bid_ask_present = _int_or_zero(raw.get("real_bid_ask_present"))
+        strict_rows = _int_or_zero(raw.get("strict_trade_eligible"))
+        strict_market_day_count = _int_or_zero(raw.get("strict_market_day_count"))
+        strict_settlement_day_count = _int_or_zero(raw.get("strict_settlement_day_count"))
+        strict_market_days = sorted(str(day)[:10] for day in (raw.get("strict_market_days") or []) if day)
+        strict_settlement_days = sorted(str(day)[:10] for day in (raw.get("strict_settlement_days") or []) if day)
+        if real_bid_ask_present > 0:
+            assets_with_real_quotes.append(asset)
+        if real_bid_ask_present > 0 and strict_rows <= 0:
+            assets_missing_settled.append(asset)
+        total_real += real_bid_ask_present
+        total_strict += strict_rows
+        support_by_asset[asset] = {
+            "real_quote_rows": real_bid_ask_present,
+            "labeled_real_quote_rows": strict_rows,
+            "proxy_rows": 0,
+            "strict_trade_eligible_rows": strict_rows,
+            "prediction_only_rows": 0,
+            "strict_market_day_count": strict_market_day_count,
+            "strict_market_days": strict_market_days,
+            "strict_settlement_day_count": strict_settlement_day_count,
+            "strict_settlement_days": strict_settlement_days,
+        }
+        counts = {
+            "snapshot_present": snapshot_present,
+            "real_bid_ask_present": real_bid_ask_present,
+            "settled_label_joined": strict_rows,
+            "point_in_time_rows": strict_rows,
+            "spot_joined": strict_rows,
+            "spot_stale_blocked": 0,
+            "spot_proxy_only": 0,
+            "strict_trade_eligible": strict_rows,
+            "strict_market_day_count": strict_market_day_count,
+            "strict_market_days": strict_market_days,
+            "strict_settlement_day_count": strict_settlement_day_count,
+            "strict_settlement_days": strict_settlement_days,
+            "candidate_generated": 0,
+            "eligible_candidate_generated": 0,
+            "source_kind_counts": dict(source_by_asset.get(asset, Counter())),
+        }
+        blocker_stage = "candidate_generated"
+        if snapshot_present <= 0:
+            blocker_stage = "missing_snapshot"
+        elif real_bid_ask_present <= 0:
+            blocker_stage = "missing_real_bid_ask"
+        elif strict_rows <= 0:
+            blocker_stage = "missing_settled_label"
+        strict_audit_by_asset[asset] = {**counts, "blocker_stage": blocker_stage}
+
+    return {
+        "status": "ok",
+        "kalshi_env": container.settings.kalshi_env,
+        "frequency": frequency,
+        "days": status_days,
+        "data_quality": {"status": "skipped", "reason": "fast_live_path_status"},
+        "spot_quality": {},
+        "quote_evidence": {
+            "real_quote_snapshot_count": total_real,
+            "real_quote_decision_rows": total_real,
+            "labeled_real_quote_rows": total_strict,
+            "strict_trade_eligible_count": total_strict,
+            "proxy_row_count": 0,
+            "prediction_only_proxy_row_count": 0,
+            "trade_candidate_support_by_asset": support_by_asset,
+            "strict_quote_ingestion_audit_by_asset": strict_audit_by_asset,
+            "assets_missing_settled_markets": sorted(assets_missing_settled),
+            "source_kind_counts": dict(source_kind_counts),
+            "assets_with_real_quotes": sorted(assets_with_real_quotes),
+        },
+    }
+
+
+async def _crypto_live_path_fast_spot_status(
+    container: AppContainer,
+    *,
+    assets: list[str],
+    frequency: str,
+    status_days: int | float | None,
+) -> dict[str, Any]:
+    normalized_assets = normalize_asset_symbols(assets)
+    cutoff = _crypto_status_cutoff(status_days)
+    now = datetime.now(UTC)
+    async with container.session_factory() as session:
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name != "postgresql":
+            return await container.crypto_spot_service.status(
+                frequency=frequency,
+                days=int(status_days or 0) or None,
+                asset_symbols=normalized_assets,
+            )
+        await _crypto_live_path_apply_fast_status_query_guards(session)
+        stmt = sa_text(
+            """
+            SELECT asset_symbol, provider, source_kind, COUNT(*) AS row_count, MAX(end_ts) AS latest_end_ts
+            FROM crypto_spot_ohlc
+            WHERE kalshi_env = :kalshi_env
+              AND frequency = :frequency
+              AND asset_symbol IN :assets
+              AND end_ts >= :cutoff
+            GROUP BY asset_symbol, provider, source_kind
+            """
+        ).bindparams(bindparam("assets", expanding=True))
+        rows = (await session.execute(
+            stmt,
+            {
+                "kalshi_env": container.settings.kalshi_env,
+                "frequency": frequency,
+                "assets": normalized_assets,
+                "cutoff": cutoff,
+            },
+        )).mappings().all()
+        await session.commit()
+
+    by_asset: dict[str, dict[str, Any]] = {}
+    provider_counts: Counter[str] = Counter()
+    source_kind_counts: Counter[str] = Counter()
+    for asset in normalized_assets:
+        asset_rows = [row for row in rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == asset]
+        row_count = sum(_int_or_zero(row.get("row_count")) for row in asset_rows)
+        asset_providers: Counter[str] = Counter()
+        asset_sources: Counter[str] = Counter()
+        latest: datetime | None = None
+        latest_provider = None
+        latest_source = None
+        for row in asset_rows:
+            count = _int_or_zero(row.get("row_count"))
+            provider = str(row.get("provider") or "unknown")
+            source = str(row.get("source_kind") or "unknown")
+            row_latest = _utc_datetime(row.get("latest_end_ts"))
+            asset_providers[provider] += count
+            asset_sources[source] += count
+            provider_counts[provider] += count
+            source_kind_counts[source] += count
+            if row_latest is not None and (latest is None or row_latest > latest):
+                latest = row_latest
+                latest_provider = provider
+                latest_source = source
+        freshness_limit = (
+            _crypto_spot_max_stale_seconds(latest_provider, latest_source, settings=container.settings)
+            if latest is not None
+            else None
+        )
+        by_asset[asset] = {
+            "row_count": row_count,
+            "provider_counts": dict(asset_providers),
+            "source_kind_counts": dict(asset_sources),
+            "latest_end_ts": latest.isoformat() if latest else None,
+            "stale_seconds": int((now - latest).total_seconds()) if latest else None,
+            "freshness_limit_seconds": freshness_limit,
+            "proxy_only": bool(latest is not None and _crypto_spot_is_proxy(latest_provider, latest_source)),
+        }
+    covered_assets = sorted(asset for asset, row in by_asset.items() if _int_or_zero(row.get("row_count")) > 0)
+    missing_assets = sorted(set(normalized_assets) - set(covered_assets))
+    stale_assets = [
+        asset
+        for asset, summary in by_asset.items()
+        if summary["latest_end_ts"] is None
+        or int(summary["stale_seconds"] or 0) > int(summary["freshness_limit_seconds"] or 0)
+    ]
+    coverage = (len(covered_assets) / len(normalized_assets)) if normalized_assets else 0.0
+    spot_quality = {
+        "status": "ready" if coverage >= 0.8 and not [asset for asset in normalized_assets if asset in stale_assets] else "needs_data",
+        "row_count": sum(_int_or_zero(row.get("row_count")) for row in by_asset.values()),
+        "asset_count": len(covered_assets),
+        "expected_assets": normalized_assets,
+        "covered_assets": covered_assets,
+        "missing_assets": missing_assets,
+        "coverage_pct": round(coverage, 6),
+        "min_coverage_pct": 0.8,
+        "stale_assets": stale_assets,
+        "provider_counts": dict(provider_counts),
+        "source_kind_counts": dict(source_kind_counts),
+        "assets": by_asset,
+    }
+    return {
+        "status": "ok",
+        "kalshi_env": container.settings.kalshi_env,
+        "frequency": frequency,
+        "days": status_days,
+        "spot_quality": spot_quality,
+    }
+
+
 async def _crypto_live_path_status_payload(
     args: argparse.Namespace,
     container: AppContainer,
@@ -1793,16 +2152,30 @@ async def _crypto_live_path_status_payload(
     frequency = getattr(args, "frequency", "15m")
     assets, asset_discovery = await _crypto_live_path_asset_resolution(args, container, frequency=frequency)
     status_days = getattr(args, "status_days", 14)
-    history_status = await container.crypto_history_service.status(
-        frequency=frequency,
-        days=status_days,
-        asset_symbols=assets,
-    )
-    spot_status = await container.crypto_spot_service.status(
-        frequency=frequency,
-        days=status_days,
-        asset_symbols=assets,
-    )
+    if getattr(args, "skip_growth", False):
+        history_status = await _crypto_live_path_fast_history_status(
+            container,
+            assets=assets,
+            frequency=frequency,
+            status_days=status_days,
+        )
+        spot_status = await _crypto_live_path_fast_spot_status(
+            container,
+            assets=assets,
+            frequency=frequency,
+            status_days=status_days,
+        )
+    else:
+        history_status = await container.crypto_history_service.status(
+            frequency=frequency,
+            days=status_days,
+            asset_symbols=assets,
+        )
+        spot_status = await container.crypto_spot_service.status(
+            frequency=frequency,
+            days=status_days,
+            asset_symbols=assets,
+        )
     runtime_state = await _crypto_live_path_runtime_state(container, assets=assets, frequency=frequency)
     asset_reports = [
         _crypto_live_path_assess_asset(
@@ -1941,6 +2314,8 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
     iteration_results: list[dict[str, Any]] = []
     operation_errors: list[dict[str, Any]] = []
     max_iterations = max(1, int(getattr(args, "max_iterations", 1) or 1))
+    raw_replay_limit = getattr(args, "replay_limit", None)
+    replay_limit = int(raw_replay_limit) if raw_replay_limit and int(raw_replay_limit) > 0 else None
     previous_strict_counts = _crypto_status_strict_counts(pre_status)
     no_growth_streak: Counter[str] = Counter()
     for iteration in range(1, max_iterations + 1):
@@ -2043,7 +2418,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
                 replay_run = await container.crypto_replay_service.run(
                     frequency=frequency,
                     days=args.replay_days,
-                    limit=None,
+                    limit=replay_limit,
                     asset_symbols=[asset],
                 )
                 result["steps"]["replay_run"] = _crypto_live_path_step_summary(replay_run)
@@ -2109,6 +2484,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
             assets=retry_assets,
             frequency=frequency,
             replay_days=args.replay_days,
+            replay_limit=replay_limit,
         )
         if resolved_retry_assets:
             operation_errors = [
@@ -2125,6 +2501,7 @@ async def _run_crypto_live_path_command(args: argparse.Namespace, container: App
     output = {
         "schema_version": "crypto-live-path-v1",
         "status": "completed" if not operation_errors else "completed_with_errors",
+        "replay_limit": replay_limit,
         "asset_discovery": asset_discovery,
         "pre_status": {
             "status": pre_status["status"],
@@ -4863,6 +5240,7 @@ def build_parser() -> argparse.ArgumentParser:
             live_path_command.add_argument("--history-days", type=int, default=2)
             live_path_command.add_argument("--spot-days", type=int, default=2)
             live_path_command.add_argument("--replay-days", type=int, default=30)
+            live_path_command.add_argument("--replay-limit", type=int, default=None)
             live_path_command.add_argument("--until-ready", action="store_true")
             live_path_command.add_argument("--max-iterations", type=int, default=1)
             live_path_command.add_argument("--sleep-seconds", type=float, default=0.0)

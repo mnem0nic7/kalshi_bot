@@ -130,7 +130,7 @@ for env_name in "${envs[@]}"; do
   if [[ "${env_name}" == "production" && "${ENABLE_PRODUCTION_DAEMON:-true}" == "true" ]]; then
     runtime_services+=("${daemon_service}")
   fi
-  if [[ "${env_name}" == "production" && "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
+  if [[ "${env_name}" == "production" && "${ENABLE_CRYPTO_1H_DAEMON:-false}" == "true" ]]; then
     runtime_services+=("daemon_production_crypto_1h_${color}")
   fi
   docker compose -f "${compose_file}" ${compose_env_file} stop "${runtime_services[@]}" 2>/dev/null || true

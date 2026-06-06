@@ -102,7 +102,7 @@ HYPE 15m became live-order-ready and was promoted live on 2026-06-05:
 
 ## Current BTC 1h Model State
 
-BTC 1h was checked on 2026-06-05 and is not live-order-ready yet:
+BTC 1h was checked on 2026-06-06 and is not live-order-ready yet:
 
 - Kalshi discovery found 10 open BTC 1h markets.
 - BTC asset mode is already `live`, but live orders are still blocked by the
@@ -113,7 +113,9 @@ BTC 1h was checked on 2026-06-05 and is not live-order-ready yet:
   `warn`.
 - Latest BTC 1h model: `crypto-1h-model-20260605203830-018765f6af9e`,
   `trained`, still with `0` live-quality candidates.
-- Strict eligible real-quote rows: `198585`.
+- Strict eligible real-quote rows: `198585` from the latest replay artifacts;
+  the fast status command deliberately reports only bounded support probes and
+  uses artifact metrics for strict-row volume.
 - Strict settled real-quote BTC 1h evidence currently covers only one close
   day, 2026-06-05 (`1930` markets, `400282` rows). Older settled days exist
   as settled backfill, but not as strict point-in-time bid/ask quote rows, so
@@ -126,9 +128,8 @@ BTC 1h was checked on 2026-06-05 and is not live-order-ready yet:
 
 Do not start the 1h live daemon or enable 1h production trading until a fresh
 BTC 1h refresh has strict real-quote evidence across multiple close days,
-produces a passed per-asset replay gate, and
-`crypto-live-path status --frequency 1h --assets BTC --require-ready --skip-growth`
-exits `0`.
+produces a passed per-asset replay gate, and the status wrapper exits `0` with
+`ready=true`.
 
 ## Process
 
@@ -138,17 +139,24 @@ through the whole run:
 ```bash
 ASSET=BTC
 FREQ=1h
+ACTIVE_COLOR="$(docker exec infra-app_production_green-1 python -m kalshi_bot.cli status | python3 -c 'import json,sys; print(json.load(sys.stdin)["active_color"])')"
+ACTIVE_CONTAINER="infra-app_production_${ACTIVE_COLOR}-1"
+if [[ "$ACTIVE_COLOR" == "blue" ]]; then
+  INACTIVE_CONTAINER=infra-app_production_green-1
+else
+  INACTIVE_CONTAINER=infra-app_production_blue-1
+fi
 ```
 
 1. Confirm production safety posture and the intended live surface.
 
    ```bash
    docker compose --env-file .env -f infra/docker-compose.yml ps
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli status
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-asset-mode list \
+   docker exec "$ACTIVE_CONTAINER" python -m kalshi_bot.cli status
+   docker exec "$INACTIVE_CONTAINER" python -m kalshi_bot.cli crypto-asset-mode list \
      --kalshi-env production \
      --frequency "$FREQ"
-   docker exec infra-app_production_green-1 sh -lc 'printf "AUTO=%s\n1H_DAEMON=%s\n1H_AUTONOMY=%s\n1H_PROD_AUTONOMY=%s\n1H_TRADING=%s\n1H_TOUCH_CONTAINER=%s\n1H_TOUCH_RULES=%s\n1H_TOUCH_TRADING=%s\n15M_TOUCH_CONTAINER=%s\n" "$CRYPTO_AUTO_FREQUENCIES" "$ENABLE_CRYPTO_1H_DAEMON" "$PRODUCTION_CRYPTO_1H_AUTONOMY_ENABLED" "$PRODUCTION_CRYPTO_1H_PRODUCTION_AUTONOMY_ENABLED" "$PRODUCTION_CRYPTO_1H_TRADING_ENABLED" "$ENABLE_CRYPTO_1H_TOUCH20_CONTAINER" "$PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED" "$PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED" "$ENABLE_BTC15M_TOUCH20_CONTAINER"'
+   docker exec "$INACTIVE_CONTAINER" sh -lc 'printf "AUTO=%s\n1H_DAEMON=%s\n1H_AUTONOMY=%s\n1H_PROD_AUTONOMY=%s\n1H_TRADING=%s\n1H_TOUCH_CONTAINER=%s\n1H_TOUCH_RULES=%s\n1H_TOUCH_TRADING=%s\n15M_TOUCH_CONTAINER=%s\n" "$CRYPTO_AUTO_FREQUENCIES" "$ENABLE_CRYPTO_1H_DAEMON" "$PRODUCTION_CRYPTO_1H_AUTONOMY_ENABLED" "$PRODUCTION_CRYPTO_1H_PRODUCTION_AUTONOMY_ENABLED" "$PRODUCTION_CRYPTO_1H_TRADING_ENABLED" "$ENABLE_CRYPTO_1H_TOUCH20_CONTAINER" "$PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED" "$PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED" "$ENABLE_BTC15M_TOUCH20_CONTAINER"'
    ```
 
    For a 15m-only promotion, `CRYPTO_AUTO_FREQUENCIES` must include `15m` and
@@ -161,17 +169,25 @@ FREQ=1h
    (`CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=20` and
    `CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=true`) so collected quote
    evidence becomes replay-eligible as markets settle.
+   `ENABLE_CRYPTO_1H_DAEMON` defaults to `false`; keep it false until this
+   runbook's readiness step passes.
 
 2. Check the target asset before changing anything.
 
    ```bash
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-live-path status \
+   scripts/crypto_live_path_status.sh \
      --kalshi-env production \
      --frequency "$FREQ" \
-     --assets "$ASSET" \
-     --skip-growth \
-     --json
+     --asset "$ASSET" \
+     --docker-container "$INACTIVE_CONTAINER"
    ```
+
+   The wrapper stores the full JSON under
+   `reports/crypto_live_path/status/` and prints the readiness fields that
+   matter: strict quote days, strict rows, replay gate, live-quality candidate
+   count, P/L, active/app color, warnings, and blockers. It always uses
+   `crypto-live-path status --skip-growth`, whose fast path uses bounded SQL
+   probes and a local statement timeout for operator status checks.
 
 3. Refresh evidence and artifacts for exactly one asset.
 
@@ -184,7 +200,9 @@ FREQ=1h
      --spot-days 2 \
      --replay-days 30 \
      --assets "$ASSET" \
-     --docker-container infra-app_production_green-1
+     --docker-env CRYPTO_COLLECT_SETTLED_CANDLES_ENABLED=false \
+     --docker-env CRYPTO_HISTORY_CANDLE_CONCURRENCY=1 \
+     --docker-container "$INACTIVE_CONTAINER"
    ```
 
    The underlying `crypto-live-path refresh` command collects open/settled
@@ -192,11 +210,14 @@ FREQ=1h
    per-asset model, runs replay, and gates the asset. If refresh creates enough
    strict rows after an initial preflight block, it performs one post-refresh
    train/replay/gate retry before returning.
+   For 1h, keep settled candle capture disabled during the refresh because the
+   following history bootstrap captures candles; also keep candle concurrency at
+   `1` unless the Kalshi candlestick endpoint is clearly tolerating more.
    For 1h assets that have been collecting live quotes, a manual label catch-up
    can be run before refresh without changing trading state:
 
    ```bash
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-history collect-settled \
+   docker exec "$INACTIVE_CONTAINER" python -m kalshi_bot.cli crypto-history collect-settled \
      --kalshi-env production \
      --frequency "$FREQ" \
      --assets "$ASSET" \
@@ -209,19 +230,27 @@ FREQ=1h
 4. Verify readiness. This must exit `0`.
 
    ```bash
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-live-path status \
+   scripts/crypto_live_path_status.sh \
      --kalshi-env production \
      --frequency "$FREQ" \
-     --assets "$ASSET" \
+     --asset "$ASSET" \
      --require-ready \
-     --skip-growth \
-     --json
+     --docker-container "$INACTIVE_CONTAINER"
    ```
+
+   A successful `--require-ready` exit proves the asset/model gate for the
+   requested asset and frequency: strict rows, multiple strict quote close days
+   when OOS is not otherwise usable, current-model live-quality candidate
+   count, passed replay gate, positive P/L that beats market-mid, spot coverage,
+   non-proxy spot, trained model, and replay artifact. It does not by itself
+   prove the inactive container can place live orders. The JSON field
+   `live_order_ready_assets` becomes non-empty only from the active color with
+   live order switches and credentials also clear.
 
 5. Promote only after readiness passes.
 
    ```bash
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli crypto-asset-mode set \
+   docker exec "$INACTIVE_CONTAINER" python -m kalshi_bot.cli crypto-asset-mode set \
      --kalshi-env production \
      "$ASSET" live
    ```
@@ -236,7 +265,6 @@ FREQ=1h
    readiness passes.
 
    ```bash
-   ACTIVE_COLOR=green
    ENABLE_CRYPTO_1H_DAEMON=true \
    PRODUCTION_CRYPTO_1H_AUTONOMY_ENABLED=true \
    PRODUCTION_CRYPTO_1H_PRODUCTION_AUTONOMY_ENABLED=true \
@@ -248,9 +276,15 @@ FREQ=1h
 7. Recheck runtime.
 
    ```bash
-   docker exec infra-app_production_green-1 python -m kalshi_bot.cli status
+   docker exec "$ACTIVE_CONTAINER" python -m kalshi_bot.cli status
    docker ps --filter 'name=daemon_production_crypto_1h' --format 'table {{.Names}}\t{{.Status}}'
    docker ps --filter 'name=touch20' --format 'table {{.Names}}\t{{.Status}}'
+   scripts/crypto_live_path_status.sh \
+     --kalshi-env production \
+     --frequency "$FREQ" \
+     --asset "$ASSET" \
+     --require-ready \
+     --docker-container "$ACTIVE_CONTAINER"
    ```
 
 ## Future Assets

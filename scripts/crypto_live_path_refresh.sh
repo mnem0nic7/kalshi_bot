@@ -7,8 +7,10 @@ history_days="2"
 settled_days="2"
 spot_days="2"
 replay_days="30"
+replay_limit=""
 out_dir="reports/crypto_live_path"
 docker_container="${DOCKER_CONTAINER:-}"
+docker_env=()
 static_assets=(BTC ETH SOL XRP BNB DOGE HYPE)
 assets=()
 discover_assets=true
@@ -24,9 +26,11 @@ Options:
   --history-days <days>                Kalshi history bootstrap window. Default: 2.
   --spot-days <days>                   Spot backfill window. Default: 2.
   --replay-days <days>                 Replay window. Default: 30.
+  --replay-limit <rows>                Limit replay to the most recent rows. Default: unbounded.
   --assets <ASSET...>                  Assets to refresh. Omit or use "all" to discover current assets.
   --out-dir <path>                     Report output directory. Default: reports/crypto_live_path.
   --docker-container <name>            Run the CLI inside this Docker container.
+  --docker-env <KEY=VALUE>             Add an environment variable to docker exec. Repeatable.
   -h, --help                           Show this help.
 
 Set CLI="..." to override the local command when --docker-container is not used.
@@ -59,12 +63,20 @@ while [[ $# -gt 0 ]]; do
       replay_days="${2:?missing value for --replay-days}"
       shift 2
       ;;
+    --replay-limit)
+      replay_limit="${2:?missing value for --replay-limit}"
+      shift 2
+      ;;
     --out-dir)
       out_dir="${2:?missing value for --out-dir}"
       shift 2
       ;;
     --docker-container)
       docker_container="${2:?missing value for --docker-container}"
+      shift 2
+      ;;
+    --docker-env)
+      docker_env+=("${2:?missing value for --docker-env}")
       shift 2
       ;;
     --assets)
@@ -103,7 +115,11 @@ done
 mkdir -p "${out_dir}"
 
 if [[ -n "${docker_container}" ]]; then
-  cli=(docker exec -i "${docker_container}" python -m kalshi_bot.cli)
+  docker_exec_env=()
+  for env_pair in "${docker_env[@]}"; do
+    docker_exec_env+=(-e "${env_pair}")
+  done
+  cli=(docker exec -i "${docker_exec_env[@]}" "${docker_container}" python -m kalshi_bot.cli)
 else
   read -r -a cli <<< "${CLI:-kalshi-bot-cli}"
 fi
@@ -155,6 +171,10 @@ for asset in "${assets[@]}"; do
   report="${out_dir}/${kalshi_env}_${frequency}_${asset}_refresh_${ts}.json"
   log="${out_dir}/${kalshi_env}_${frequency}_${asset}_refresh_${ts}.log"
   echo "refreshing ${asset}; report=${report} log=${log}" >&2
+  replay_args=()
+  if [[ -n "${replay_limit}" ]]; then
+    replay_args+=(--replay-limit "${replay_limit}")
+  fi
   if "${cli[@]}" crypto-live-path refresh \
     --kalshi-env "${kalshi_env}" \
     --frequency "${frequency}" \
@@ -162,6 +182,7 @@ for asset in "${assets[@]}"; do
     --history-days "${history_days}" \
     --spot-days "${spot_days}" \
     --replay-days "${replay_days}" \
+    "${replay_args[@]}" \
     --assets "${asset}" \
     --skip-growth \
     --json >"${report}" 2>"${log}"; then
