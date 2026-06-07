@@ -185,6 +185,8 @@ def test_compose_declares_opt_in_crypto_1h_refresh_container() -> None:
     assert "COPY scripts/crypto_live_path_status.sh ./scripts/crypto_live_path_status.sh" in dockerfile_text
     assert "--skip-growth" in status_script
     assert "--require-ready" in status_script
+    assert "oos_folds=" in status_script
+    assert "replay_gate_reasons:" in status_script
     assert "--docker-env" in refresh_script
     assert "--replay-limit" in refresh_script
     assert 'replay_args+=(--replay-limit "${replay_limit}")' in refresh_script

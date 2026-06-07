@@ -4524,6 +4524,7 @@ class CryptoReplayService:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
         cutoff = datetime.now(UTC) - timedelta(days=days) if days and days > 0 else None
+        replay_source_limit = max(int(limit or 0), 200_000)
         async with self.session_factory() as session:
             repo = PlatformRepository(session)
             feature_decision_rows = (
@@ -4533,7 +4534,7 @@ class CryptoReplayService:
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbols=requested_assets or None,
                     since=cutoff,
-                    limit=limit or 200_000,
+                    limit=replay_source_limit,
                 )
                 if self.settings.crypto_training_feature_store_enabled
                 else []
@@ -4600,7 +4601,7 @@ class CryptoReplayService:
             rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
         if limit and limit > 0:
-            rows = rows[-limit:]
+            rows = _crypto_limit_replay_rows_for_oos(rows, limit=limit)
         mode_assets = requested_assets or sorted(
             {normalize_asset_symbol(str(row.get("asset_symbol") or "")) for row in rows if row.get("asset_symbol")}
         )
@@ -11894,6 +11895,43 @@ def _crypto_walk_forward_folds(
             }
         )
     return folds
+
+
+def _crypto_limit_replay_rows_for_oos(rows: list[dict[str, Any]], *, limit: int | None) -> list[dict[str, Any]]:
+    if limit is None or limit <= 0 or len(rows) <= limit:
+        return list(rows)
+    ordered = sorted(rows, key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    no_day_rows: list[dict[str, Any]] = []
+    for row in ordered:
+        day = str(row.get("market_day") or "").strip()
+        if day:
+            by_day[day].append(row)
+        else:
+            no_day_rows.append(row)
+    days = sorted(by_day)
+    if len(days) < 2:
+        return ordered[-limit:]
+
+    latest_day = days[-1]
+    prior_rows = [row for day in days[:-1] for row in by_day[day]]
+    latest_rows = by_day[latest_day]
+    if not prior_rows:
+        return ordered[-limit:]
+
+    prior_quota = min(len(prior_rows), max(1, limit // 2))
+    latest_quota = min(len(latest_rows), max(0, limit - prior_quota))
+    remaining = limit - prior_quota - latest_quota
+    if remaining > 0:
+        extra_prior = min(len(prior_rows) - prior_quota, remaining)
+        prior_quota += extra_prior
+        remaining -= extra_prior
+    if remaining > 0:
+        latest_quota += min(len(latest_rows) - latest_quota, remaining)
+    selected = [*prior_rows[-prior_quota:], *latest_rows[-latest_quota:]]
+    if len(selected) < limit and no_day_rows:
+        selected = [*no_day_rows[-(limit - len(selected)):], *selected]
+    return sorted(selected[-limit:], key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
 
 
 def _crypto_entry_policy_for_row(

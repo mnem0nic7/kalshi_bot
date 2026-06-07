@@ -1,6 +1,6 @@
 # Crypto Live Asset Promotion
 
-Last updated: 2026-06-05
+Last updated: 2026-06-07
 
 This runbook promotes one model-trained crypto asset/frequency at a time. It is
 for the `CRYPTO_15M` and `CRYPTO_1H` model path, not the non-model Touch20 path.
@@ -102,34 +102,41 @@ HYPE 15m became live-order-ready and was promoted live on 2026-06-05:
 
 ## Current BTC 1h Model State
 
-BTC 1h was checked on 2026-06-06 and is not live-order-ready yet:
+BTC 1h passed the model-path replay gate and was started live on the active
+blue production runtime on 2026-06-07:
 
 - Kalshi discovery found 10 open BTC 1h markets.
-- BTC asset mode is already `live`, but live orders are still blocked by the
-  per-asset replay gate.
-- Latest BTC 1h replay gate: `crypto-1h-gate-20260605185128-eea5982844bb`,
-  `blocked`.
-- Latest BTC 1h backtest: `crypto-1h-backtest-20260605184905-63fb5a780683`,
-  `warn`.
-- Latest BTC 1h model: `crypto-1h-model-20260605203830-018765f6af9e`,
-  `trained`, still with `0` live-quality candidates.
-- Strict eligible real-quote rows: `198585` from the latest replay artifacts;
-  the fast status command deliberately reports only bounded support probes and
-  uses artifact metrics for strict-row volume.
-- Strict settled real-quote BTC 1h evidence currently covers only one close
-  day, 2026-06-05 (`1930` markets, `400282` rows). Older settled days exist
-  as settled backfill, but not as strict point-in-time bid/ask quote rows, so
-  the walk-forward OOS gate cannot honestly pass yet.
-- Spot feature coverage: `99.5847%`.
-- Current-model live-quality candidates: `0`.
-- Replay net simulated P/L: `$0.00`.
-- Gate reasons: OOS replay unavailable, live-quality candidates below 50, and
-  net simulated P/L not positive.
-
-Do not start the 1h live daemon or enable 1h production trading until a fresh
-BTC 1h refresh has strict real-quote evidence across multiple close days,
-produces a passed per-asset replay gate, and the status wrapper exits `0` with
-`ready=true`.
+- BTC asset mode is `live`.
+- Refresh report:
+  `reports/crypto_live_path/production_1h_BTC_refresh_20260606T174203Z.json`.
+- Status report:
+  `reports/crypto_live_path/status/production_1h_BTC_status_20260607T154744Z.json`.
+- Latest BTC 1h model: `crypto-1h-model-20260606175714-4dbbe1629820`,
+  `trained`, `50000` samples, `143` current-model live-quality candidates.
+- Final BTC 1h replay proof:
+  `reports/crypto_live_path/production_1h_BTC_replay_featurestore50k_20260606T190016Z.json`.
+- Latest BTC 1h backtest: `crypto-1h-backtest-20260606190559-169e307c2419`,
+  `pass`, `50000` feature-store samples.
+- Latest BTC 1h replay gate: `crypto-1h-gate-20260606190628-b0ed8233c062`,
+  `passed`.
+- Fast status support: `3` strict quote close days and `45985` strict eligible
+  real-quote rows from the latest artifact metrics.
+- Training preflight materialized `66439` BTC 1h rows, including `54592` strict
+  trade-eligible rows, with `100%` spot coverage.
+- Final replay quality: `75` live-quality candidates, `57` OOS trade
+  candidates, `1` OOS fold, `100%` spot feature coverage, and `$12.84` net
+  simulated P/L.
+- Runtime proof: `daemon_heartbeat:production:blue:crypto_1h` updated at
+  `2026-06-07T15:53:41Z`, and the active blue `crypto_1h` daemon log showed
+  successful Kalshi HTTPS market discovery after startup warmup.
+- Compose left `infra-daemon_production_crypto_1h_blue-1` stuck in `Created`
+  during the 2026-06-07 turn-up. The live 1h loop is currently the equivalent
+  `python -m kalshi_bot.cli daemon --crypto-only --heartbeat-role crypto_1h`
+  process started inside `infra-daemon_production_blue-1` with
+  `CRYPTO_AUTO_FREQUENCIES=1h`, `CRYPTO_AUTONOMY_ENABLED=true`,
+  `CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true`, and `CRYPTO_TRADING_ENABLED=true`.
+  Clean up the stuck created compose container before the next redeploy so the
+  dedicated service can be managed normally.
 
 ## Process
 
@@ -139,6 +146,8 @@ through the whole run:
 ```bash
 ASSET=BTC
 FREQ=1h
+TRAIN_MAX_SNAPSHOTS=50000
+REPLAY_LIMIT=50000
 ACTIVE_COLOR="$(docker exec infra-app_production_green-1 python -m kalshi_bot.cli status | python3 -c 'import json,sys; print(json.load(sys.stdin)["active_color"])')"
 ACTIVE_CONTAINER="infra-app_production_${ACTIVE_COLOR}-1"
 if [[ "$ACTIVE_COLOR" == "blue" ]]; then
@@ -199,9 +208,11 @@ fi
      --history-days 2 \
      --spot-days 2 \
      --replay-days 30 \
+     --replay-limit "$REPLAY_LIMIT" \
      --assets "$ASSET" \
      --docker-env CRYPTO_COLLECT_SETTLED_CANDLES_ENABLED=false \
      --docker-env CRYPTO_HISTORY_CANDLE_CONCURRENCY=1 \
+     --docker-env CRYPTO_TRAIN_MAX_SNAPSHOTS="$TRAIN_MAX_SNAPSHOTS" \
      --docker-container "$INACTIVE_CONTAINER"
    ```
 
@@ -213,6 +224,37 @@ fi
    For 1h, keep settled candle capture disabled during the refresh because the
    following history bootstrap captures candles; also keep candle concurrency at
    `1` unless the Kalshi candlestick endpoint is clearly tolerating more.
+   Start 1h promotions with `TRAIN_MAX_SNAPSHOTS=50000` and
+   `REPLAY_LIMIT=50000`; the full uncapped fit can run for a long time and does
+   not add value until the bounded pass has live-quality candidates and a
+   plausible replay gate. Increase those caps or omit them only when a broader
+   proof is needed after the bounded pass is promising.
+   If the refresh/replay path uses rebuilt snapshots and fails OOS candidate
+   support, run the final proof against persisted feature rows before deciding
+   the asset is blocked:
+
+   ```bash
+   docker exec -e CRYPTO_TRAINING_FEATURE_STORE_ENABLED=true "$INACTIVE_CONTAINER" \
+     python -m kalshi_bot.cli crypto-replay run \
+       --kalshi-env production \
+       --frequency "$FREQ" \
+       --days 30 \
+       --limit "$REPLAY_LIMIT" \
+       --assets "$ASSET" \
+       --json
+
+   docker exec -e CRYPTO_TRAINING_FEATURE_STORE_ENABLED=true "$INACTIVE_CONTAINER" \
+     python -m kalshi_bot.cli crypto-replay gate \
+       --kalshi-env production \
+       --frequency "$FREQ" \
+       --assets "$ASSET"
+   ```
+
+   For BTC 1h on 2026-06-06, `REPLAY_LIMIT=75000` found enough OOS candidates
+   but failed spot coverage because the older slice included missing spot rows.
+   `REPLAY_LIMIT=50000` preserved the prior/latest strict decision-day split
+   while keeping spot coverage at `100%`; use the smaller cap first for new 1h
+   assets unless their feature-store coverage distribution says otherwise.
    For 1h assets that have been collecting live quotes, a manual label catch-up
    can be run before refresh without changing trading state:
 

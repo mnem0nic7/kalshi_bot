@@ -51,6 +51,7 @@ from kalshi_bot.crypto.services import (
     _crypto_last_minute_passive_price_ladder,
     _crypto_last_minute_passive_price_matrix,
     _crypto_lightweight_settled_data_quality,
+    _crypto_limit_replay_rows_for_oos,
     _crypto_entry_policy_for_row,
     _crypto_live_pnl_gate_blocks,
     _crypto_live_pnl_gate_payload,
@@ -72,6 +73,7 @@ from kalshi_bot.crypto.services import (
     _crypto_touch_replay_first_touch,
     _crypto_touch_replay_gate_reasons,
     _crypto_trade_candidates,
+    _crypto_walk_forward_folds,
     _evaluate_crypto_touch20_replay,
     _fit_crypto_calibration,
     _predict_crypto_probability,
@@ -5913,6 +5915,29 @@ def test_crypto_replay_sparse_rows_keep_candidate_diagnostics_but_block_oos(tmp_
     assert report["candidate_quality"]["live_quality_policy"]["selected_count"] == 2
     assert gate["passed"] is False
     assert any("Out-of-sample replay is unavailable" in reason for reason in gate["reasons"])
+
+
+def test_crypto_replay_limit_preserves_prior_market_day_for_oos() -> None:
+    rows: list[dict[str, object]] = []
+    for day, count in (("2026-06-05", 35), ("2026-06-06", 60)):
+        base = datetime.fromisoformat(f"{day}T00:00:00+00:00")
+        rows.extend(
+            {
+                "market_day": day,
+                "decision_ts": base + timedelta(minutes=index),
+                "market_ticker": f"KXBTC1H-{day}-{index:03d}",
+            }
+            for index in range(count)
+        )
+
+    limited = _crypto_limit_replay_rows_for_oos(rows, limit=50)  # type: ignore[arg-type]
+    counts = Counter(str(row.get("market_day")) for row in limited)
+    folds = _crypto_walk_forward_folds(limited, min_train_rows=20)  # type: ignore[arg-type]
+
+    assert len(limited) == 50
+    assert counts == {"2026-06-05": 25, "2026-06-06": 25}
+    assert len(folds) == 1
+    assert folds[0]["train_cutoff_market_day"] == "2026-06-06"
 
 
 def test_crypto_replay_candidate_selection_does_not_require_empirical_bucket_maturity(tmp_path) -> None:

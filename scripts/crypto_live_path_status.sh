@@ -143,10 +143,16 @@ print(
     f"{replay.get('current_model_live_quality_candidate_count')} "
     "oos_candidates="
     f"{replay.get('oos_trade_candidate_count')} "
+    "oos_folds="
+    f"{replay.get('oos_fold_count')} "
     "net_pl="
     f"{replay.get('net_simulated_pl_dollars')}"
 )
 print(f"active_color={deployment.get('active_color')} app_color={deployment.get('app_color')}")
+if replay.get("gate_reasons"):
+    print("replay_gate_reasons:")
+    for item in replay.get("gate_reasons") or []:
+        print(f"- {item}")
 if deployment.get("live_order_blockers"):
     print("live_order_blockers:")
     for item in deployment.get("live_order_blockers") or []:

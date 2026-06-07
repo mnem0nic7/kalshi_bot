@@ -764,7 +764,7 @@ class AgentPackService:
                 min_contract_price,
                 0.99,
             ),
-            min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, 0, 10000),
+            min_remaining_payout_bps=self._clamp_int(entry.min_remaining_payout_bps, CRYPTO_MIN_REMAINING_PAYOUT_BPS, 10000),
             max_credible_edge_bps=self._clamp_int(entry.max_credible_edge_bps, 2500, 10000),
             target_position_pct=self._clamp_float(entry.target_position_pct, 0.0, max_target_position_pct),
         )
