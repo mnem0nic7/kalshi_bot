@@ -7,6 +7,19 @@ for the `CRYPTO_15M` and `CRYPTO_1H` model path, not the non-model Touch20 path.
 Keep Touch20 containers and fuses disabled unless an operator explicitly chooses
 that separate strategy.
 
+For the remaining model-based 1h market rollout after BTC, use the batch driver
+once production Postgres is healthy:
+
+```bash
+scripts/crypto_live_path_promote_1h_models.sh \
+  --docker-container "$INACTIVE_CONTAINER"
+```
+
+By default it promotes `XRP BNB SOL ETH DOGE HYPE` one asset at a time with
+`TRAIN_MAX_SNAPSHOTS=50000` and `REPLAY_LIMIT=50000`, re-runs the persisted
+feature-store replay/gate proof, requires readiness, sets the asset mode live,
+and verifies readiness again before moving to the next asset.
+
 ## Current 15m Live Model State
 
 BTC 15m was recovered to live-order-ready on 2026-06-05:

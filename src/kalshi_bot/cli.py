@@ -1850,7 +1850,10 @@ async def _crypto_live_path_fast_history_status(
                 asset_symbols=normalized_assets,
             )
         await _crypto_live_path_apply_fast_status_query_guards(session)
-        duration_filter = _crypto_live_path_duration_filter_sql(frequency)
+        # The fast status path is an operator support probe. Keep it limited to
+        # indexed predicates; the replay/gate artifacts enforce the stricter
+        # frequency-duration quality checks before an asset can become ready.
+        duration_filter = ""
         probe_stmt = sa_text(
             f"""
             SELECT
@@ -1894,27 +1897,7 @@ async def _crypto_live_path_fast_history_status(
               ) AS settled_label_joined
             """
         )
-        day_stmt = sa_text(
-            f"""
-            SELECT EXISTS (
-              SELECT 1
-              FROM crypto_market_snapshots
-              WHERE kalshi_env = :kalshi_env
-                AND frequency = :frequency
-                AND asset_symbol = :asset
-                AND close_time >= :day_start
-                AND close_time < :day_end
-                AND source_kind != 'settled_backfill'
-                AND settlement_result IN ('yes', 'no')
-                AND yes_bid_dollars IS NOT NULL
-                AND yes_ask_dollars IS NOT NULL
-                {duration_filter}
-              LIMIT 1
-            ) AS has_strict_day
-            """
-        )
         rows: list[dict[str, Any]] = []
-        day_windows = _crypto_status_day_windows(cutoff, status_days)
         for asset in normalized_assets:
             params = {
                 "kalshi_env": container.settings.kalshi_env,
@@ -1923,29 +1906,16 @@ async def _crypto_live_path_fast_history_status(
                 "cutoff": cutoff,
             }
             probe = (await session.execute(probe_stmt, params)).mappings().one()
-            days: list[str] = []
-            for day_label, day_start, day_end in day_windows:
-                day_probe = (
-                    await session.execute(
-                        day_stmt,
-                        {**params, "day_start": day_start, "day_end": day_end},
-                    )
-                ).mappings().one()
-                if day_probe.get("has_strict_day"):
-                    days.append(day_label)
-                    if len(days) >= 3:
-                        break
-            days.sort()
             rows.append(
                 {
                     "asset_symbol": asset,
                     "snapshot_present": 1 if probe.get("snapshot_present") else 0,
                     "real_bid_ask_present": 1 if probe.get("real_bid_ask_present") else 0,
                     "strict_trade_eligible": 1 if probe.get("settled_label_joined") else 0,
-                    "strict_market_day_count": len(days),
-                    "strict_market_days": days,
-                    "strict_settlement_day_count": len(days),
-                    "strict_settlement_days": days,
+                    "strict_market_day_count": 0,
+                    "strict_market_days": [],
+                    "strict_settlement_day_count": 0,
+                    "strict_settlement_days": [],
                 }
             )
         await session.commit()
@@ -2055,24 +2025,33 @@ async def _crypto_live_path_fast_spot_status(
         await _crypto_live_path_apply_fast_status_query_guards(session)
         stmt = sa_text(
             """
-            SELECT asset_symbol, provider, source_kind, COUNT(*) AS row_count, MAX(end_ts) AS latest_end_ts
+            SELECT asset_symbol, provider, source_kind, end_ts AS latest_end_ts
             FROM crypto_spot_ohlc
             WHERE kalshi_env = :kalshi_env
               AND frequency = :frequency
-              AND asset_symbol IN :assets
+              AND asset_symbol = :asset
               AND end_ts >= :cutoff
-            GROUP BY asset_symbol, provider, source_kind
+            ORDER BY end_ts DESC
+            LIMIT 1
             """
-        ).bindparams(bindparam("assets", expanding=True))
-        rows = (await session.execute(
-            stmt,
-            {
-                "kalshi_env": container.settings.kalshi_env,
-                "frequency": frequency,
-                "assets": normalized_assets,
-                "cutoff": cutoff,
-            },
-        )).mappings().all()
+        )
+        rows = []
+        for asset in normalized_assets:
+            rows.extend(
+                (
+                    await session.execute(
+                        stmt,
+                        {
+                            "kalshi_env": container.settings.kalshi_env,
+                            "frequency": frequency,
+                            "asset": asset,
+                            "cutoff": cutoff,
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
         await session.commit()
 
     by_asset: dict[str, dict[str, Any]] = {}
@@ -2087,7 +2066,7 @@ async def _crypto_live_path_fast_spot_status(
         latest_provider = None
         latest_source = None
         for row in asset_rows:
-            count = _int_or_zero(row.get("row_count"))
+            count = 1
             provider = str(row.get("provider") or "unknown")
             source = str(row.get("source_kind") or "unknown")
             row_latest = _utc_datetime(row.get("latest_end_ts"))
