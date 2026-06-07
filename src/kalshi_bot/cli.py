@@ -2031,7 +2031,7 @@ async def _crypto_live_path_fast_spot_status(
               AND frequency = :frequency
               AND asset_symbol = :asset
               AND end_ts >= :cutoff
-            ORDER BY end_ts DESC
+            ORDER BY CASE WHEN source_kind = 'spot_ohlc' THEN 0 ELSE 1 END, end_ts DESC
             LIMIT 1
             """
         )

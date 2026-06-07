@@ -1573,18 +1573,6 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             where_parts.append("observed_at >= :since")
             params["since"] = since
         duration_bounds = _crypto_frequency_duration_bounds(frequency)
-        if duration_bounds is not None:
-            where_parts.append(
-                """
-                (
-                    open_time IS NULL
-                    OR close_time IS NULL
-                    OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN :duration_min AND :duration_max
-                )
-                """
-            )
-            params["duration_min"] = duration_bounds[0]
-            params["duration_max"] = duration_bounds[1]
 
         bind = self.session.get_bind()
         if bind is not None and bind.dialect.name != "postgresql":
@@ -1649,7 +1637,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         )
         if defer_payload:
             stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
-        return list((await self.session.execute(stmt)).scalars())
+        records = list((await self.session.execute(stmt)).scalars())
+        if duration_bounds is not None:
+            records = [
+                record for record in records if _crypto_snapshot_matches_frequency_duration(record, frequency)
+            ]
+        return records
 
     async def list_crypto_settled_live_quote_path_snapshots(
         self,

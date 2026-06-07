@@ -117,6 +117,13 @@ class CryptoMarketSnapshotRecord(Base, IdMixin, TimestampMixin):
         UniqueConstraint("kalshi_env", "market_ticker", "observed_at", name="uq_crypto_market_snapshot_observed"),
         Index("ix_crypto_market_snapshots_frequency_status", "frequency", "status"),
         Index("ix_crypto_market_snapshots_market_observed", "market_ticker", "observed_at"),
+        Index(
+            "ix_crypto_market_snapshots_env_freq_asset_observed",
+            "kalshi_env",
+            "frequency",
+            "asset_symbol",
+            "observed_at",
+        ),
     )
 
     kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)
@@ -187,6 +194,13 @@ class CryptoSpotOHLCRecord(Base, IdMixin, TimestampMixin):
         ),
         Index("ix_crypto_spot_ohlc_asset_period", "asset_symbol", "end_ts"),
         Index("ix_crypto_spot_ohlc_provider_asset", "provider", "asset_symbol"),
+        Index(
+            "ix_crypto_spot_ohlc_env_freq_asset_end",
+            "kalshi_env",
+            "frequency",
+            "asset_symbol",
+            "end_ts",
+        ),
     )
 
     kalshi_env: Mapped[str] = mapped_column(String(16), nullable=False, default="demo", index=True)

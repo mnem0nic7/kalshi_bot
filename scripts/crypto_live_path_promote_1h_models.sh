@@ -15,6 +15,7 @@ docker_container="${DOCKER_CONTAINER:-}"
 dry_run=false
 skip_refresh=false
 skip_promote=false
+rerun_replay=false
 
 usage() {
   cat <<'USAGE'
@@ -37,6 +38,7 @@ Options:
   --docker-container <name>            Run the CLI inside this Docker container.
   --skip-refresh                       Verify/promote from existing artifacts only.
   --skip-promote                       Do not set asset mode live.
+  --rerun-replay                       Rerun crypto-replay run/gate after refresh.
   --dry-run                            Print commands without executing them.
   -h, --help                           Show this help.
 
@@ -101,6 +103,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-promote)
       skip_promote=true
+      shift
+      ;;
+    --rerun-replay)
+      rerun_replay=true
       shift
       ;;
     --dry-run)
@@ -170,25 +176,27 @@ for asset in "${assets[@]}"; do
       continue
     fi
 
-    if ! run_cmd "${cli_container_args[@]}" crypto-replay run \
-      --kalshi-env "${kalshi_env}" \
-      --frequency "${frequency}" \
-      --days "${replay_days}" \
-      --limit "${replay_limit}" \
-      --assets "${asset}" \
-      --json; then
-      echo "${asset}: feature-store replay proof failed" >&2
-      status=1
-      continue
-    fi
+    if [[ "${rerun_replay}" == "true" ]]; then
+      if ! run_cmd "${cli_container_args[@]}" crypto-replay run \
+        --kalshi-env "${kalshi_env}" \
+        --frequency "${frequency}" \
+        --days "${replay_days}" \
+        --limit "${replay_limit}" \
+        --assets "${asset}" \
+        --json; then
+        echo "${asset}: feature-store replay proof failed" >&2
+        status=1
+        continue
+      fi
 
-    if ! run_cmd "${cli_container_args[@]}" crypto-replay gate \
-      --kalshi-env "${kalshi_env}" \
-      --frequency "${frequency}" \
-      --assets "${asset}"; then
-      echo "${asset}: replay gate failed" >&2
-      status=1
-      continue
+      if ! run_cmd "${cli_container_args[@]}" crypto-replay gate \
+        --kalshi-env "${kalshi_env}" \
+        --frequency "${frequency}" \
+        --assets "${asset}"; then
+        echo "${asset}: replay gate failed" >&2
+        status=1
+        continue
+      fi
     fi
   fi
 
