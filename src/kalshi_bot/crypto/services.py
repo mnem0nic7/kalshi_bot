@@ -7800,6 +7800,16 @@ def _crypto_feature_row_data_quality(
             "latest_decision_ts": latest_decision.isoformat() if latest_decision else None,
             "latest_settlement_ts": latest_settlement.isoformat() if latest_settlement else None,
         }
+    candle_feature_count = sum(
+        1
+        for row in rows
+        if "candlestick" in str(row.get("source_kind") or "")
+        or str(row.get("spot_source_kind") or "") == "spot_ohlc"
+        or int(row.get("candle_count") or 0) > 0
+        or row.get("candle_momentum_dollars") is not None
+        or row.get("candle_momentum") is not None
+        or row.get("market_mid_change_1") is not None
+    )
     return {
         "status": "ready" if len(rows) >= min_training_samples else "needs_data",
         "source": "crypto_training_feature_rows",
@@ -7809,7 +7819,7 @@ def _crypto_feature_row_data_quality(
         "snapshot_count": 0,
         "settled_snapshot_count": len(rows),
         "unresolved_snapshot_count": 0,
-        "candle_count": sum(1 for row in rows if "candlestick" in str(row.get("source_kind") or "")),
+        "candle_count": candle_feature_count,
         "asset_count": len(assets),
         "assets": by_asset,
         "source_kind_counts": dict(Counter(str(row.get("source_kind") or "") for row in rows)),

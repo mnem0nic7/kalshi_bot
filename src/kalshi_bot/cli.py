@@ -2031,12 +2031,40 @@ async def _crypto_live_path_fast_spot_status(
               AND frequency = :frequency
               AND asset_symbol = :asset
               AND end_ts >= :cutoff
-            ORDER BY CASE WHEN source_kind = 'spot_ohlc' THEN 0 ELSE 1 END, end_ts DESC
+            ORDER BY end_ts DESC
+            LIMIT 1
+            """
+        )
+        ohlc_stmt = sa_text(
+            """
+            SELECT asset_symbol, provider, source_kind, end_ts AS latest_end_ts
+            FROM crypto_spot_ohlc
+            WHERE kalshi_env = :kalshi_env
+              AND frequency = :frequency
+              AND asset_symbol = :asset
+              AND source_kind = 'spot_ohlc'
+              AND end_ts >= :cutoff
+            ORDER BY end_ts DESC
             LIMIT 1
             """
         )
         rows = []
         for asset in normalized_assets:
+            rows.extend(
+                (
+                    await session.execute(
+                        ohlc_stmt,
+                        {
+                            "kalshi_env": container.settings.kalshi_env,
+                            "frequency": frequency,
+                            "asset": asset,
+                            "cutoff": cutoff,
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
             rows.extend(
                 (
                     await session.execute(
@@ -2059,7 +2087,7 @@ async def _crypto_live_path_fast_spot_status(
     source_kind_counts: Counter[str] = Counter()
     for asset in normalized_assets:
         asset_rows = [row for row in rows if normalize_asset_symbol(str(row.get("asset_symbol") or "")) == asset]
-        row_count = sum(_int_or_zero(row.get("row_count")) for row in asset_rows)
+        row_count = len(asset_rows)
         asset_providers: Counter[str] = Counter()
         asset_sources: Counter[str] = Counter()
         latest: datetime | None = None

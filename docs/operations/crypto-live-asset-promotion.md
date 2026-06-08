@@ -16,9 +16,11 @@ scripts/crypto_live_path_promote_1h_models.sh \
 ```
 
 By default it promotes `XRP BNB SOL ETH DOGE HYPE` one asset at a time with
-`TRAIN_MAX_SNAPSHOTS=50000` and `REPLAY_LIMIT=50000`, re-runs the persisted
-feature-store replay/gate proof, requires readiness, sets the asset mode live,
-and verifies readiness again before moving to the next asset.
+`TRAIN_MAX_SNAPSHOTS=50000` and `REPLAY_LIMIT=50000`. The refresh step already
+trains, replays, gates, and writes a status report for the asset. Use
+`--rerun-replay` only when an extra replay/gate proof is needed after a code or
+metric fix. The driver continues asset-by-asset, records each report under
+`reports/crypto_live_path/`, and returns non-zero if any asset fails readiness.
 
 ## Current 15m Live Model State
 
@@ -122,8 +124,8 @@ blue production runtime on 2026-06-07:
 - BTC asset mode is `live`.
 - Refresh report:
   `reports/crypto_live_path/production_1h_BTC_refresh_20260606T174203Z.json`.
-- Status report:
-  `reports/crypto_live_path/status/production_1h_BTC_status_20260607T154744Z.json`.
+- Latest status report:
+  `reports/crypto_live_path/status/production_1h_BTC_status_20260607T212533Z.json`.
 - Latest BTC 1h model: `crypto-1h-model-20260606175714-4dbbe1629820`,
   `trained`, `50000` samples, `143` current-model live-quality candidates.
 - Final BTC 1h replay proof:
@@ -140,16 +142,43 @@ blue production runtime on 2026-06-07:
   candidates, `1` OOS fold, `100%` spot feature coverage, and `$12.84` net
   simulated P/L.
 - Runtime proof: `daemon_heartbeat:production:blue:crypto_1h` updated at
-  `2026-06-07T15:53:41Z`, and the active blue `crypto_1h` daemon log showed
-  successful Kalshi HTTPS market discovery after startup warmup.
-- Compose left `infra-daemon_production_crypto_1h_blue-1` stuck in `Created`
-  during the 2026-06-07 turn-up. The live 1h loop is currently the equivalent
+  `2026-06-07T21:26:13Z`, and the active blue `crypto_1h` daemon log showed
+  successful Kalshi HTTPS market and Coinbase spot discovery after startup
+  warmup.
+- The live 1h loop is currently the equivalent
   `python -m kalshi_bot.cli daemon --crypto-only --heartbeat-role crypto_1h`
-  process started inside `infra-daemon_production_blue-1` with
+  host process with
   `CRYPTO_AUTO_FREQUENCIES=1h`, `CRYPTO_AUTONOMY_ENABLED=true`,
   `CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true`, and `CRYPTO_TRADING_ENABLED=true`.
-  Clean up the stuck created compose container before the next redeploy so the
-  dedicated service can be managed normally.
+
+## Current ETH 1h Model State
+
+ETH 1h passed the model-path replay gate and was verified ready on the active
+blue production runtime on 2026-06-07:
+
+- ETH asset mode is `live`.
+- Latest status report:
+  `reports/crypto_live_path/status/production_1h_ETH_status_20260607T210822Z.json`.
+- Latest ETH 1h replay gate: `crypto-1h-gate-20260607210719-def3423b0b54`,
+  `passed`.
+- Latest ETH 1h backtest: `crypto-1h-backtest-20260607210654-7ecbb16984a2`,
+  `pass`, `50000` feature-store samples.
+- Final replay quality: `64` live-quality candidates, `61` OOS trade
+  candidates, `2` OOS folds, `100%` spot feature coverage, `49250`
+  OHLC-backed feature rows, and `$8.95` net simulated P/L.
+
+## Current Remaining 1h Model State
+
+The remaining 1h assets have live asset modes but are blocked by replay-quality
+gates as of 2026-06-07:
+
+- `XRP`, `BNB`, `DOGE`, and `HYPE`: `0` live-quality candidates, `0` OOS trade
+  candidates, and `$0.00` net simulated P/L.
+- `SOL`: `0` live-quality candidates, `2` OOS trade candidates, and `$0.92`
+  net simulated P/L.
+- HYPE was rerun cleanly after Postgres recovery; gate
+  `crypto-1h-gate-20260607212411-7a9fc884f096` remains blocked by candidate
+  count and positive-P/L requirements.
 
 ## Process
 
