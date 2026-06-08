@@ -206,6 +206,7 @@ async def _service(tmp_path, *, modeling_builder=_passing_modeling):
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/autonomous-gates.db",
         autonomous_gate_tuning_canary_min_settled_rows=1,
+        risk_min_edge_bps=750,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
