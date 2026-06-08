@@ -7,6 +7,7 @@ import pytest
 
 from kalshi_bot.crypto.services import (
     _fit_crypto_spot_distance_contrarian_model,
+    _fit_crypto_spot_distance_contrarian_gated_model,
     _fit_crypto_spot_distance_residual_model,
     _predict_crypto_probability,
 )
@@ -107,6 +108,56 @@ def test_spot_distance_contrarian_falls_back_when_distance_missing() -> None:
     row = _make_row("SOL", 0, 0.42)
 
     assert _predict_crypto_probability(row, model) == Decimal("0.4200")
+
+
+def _clean_quote_row(*, distance: Decimal = Decimal("1.25"), no_ask: Decimal = Decimal("0.4000")) -> dict:
+    row = _make_row("SOL", 0, 0.50)
+    row.update(
+        {
+            "spot_target_distance_volatility": distance,
+            "quote_source": "snapshot_quotes",
+            "strict_trade_eligible": True,
+            "spot_feature_status": "available",
+            "spot_provider": "coinbase",
+            "spot_source_kind": "spot_tick",
+            "yes_bid_dollars": Decimal("0.5900"),
+            "yes_ask_dollars": Decimal("0.6000"),
+            "no_bid_dollars": Decimal("0.3900"),
+            "no_ask_dollars": no_ask,
+            "spread_bps": 100,
+        }
+    )
+    return row
+
+
+def test_spot_distance_contrarian_gated_activates_on_clean_quote_row() -> None:
+    rows = _make_rows_with_both_labels(4)
+    model = _fit_crypto_spot_distance_contrarian_gated_model(rows, fallback=_make_fallback())
+
+    above = _clean_quote_row(distance=Decimal("1.25"))
+    below = _clean_quote_row(distance=Decimal("-1.25"))
+    below["yes_ask_dollars"] = Decimal("0.4000")
+
+    assert _predict_crypto_probability(above, model) == Decimal("0.1000")
+    assert _predict_crypto_probability(below, model) == Decimal("0.9000")
+
+
+def test_spot_distance_contrarian_gated_falls_back_when_quote_context_not_live_quality() -> None:
+    rows = _make_rows_with_both_labels(4)
+    model = _fit_crypto_spot_distance_contrarian_gated_model(rows, fallback=_make_fallback())
+
+    proxy = _clean_quote_row()
+    proxy["quote_source"] = "candlestick_close_proxy"
+    wide = _clean_quote_row()
+    wide["spread_bps"] = 1501
+    too_cheap = _clean_quote_row(no_ask=Decimal("0.3400"))
+    missing_spot = _clean_quote_row()
+    missing_spot.pop("spot_feature_status")
+
+    assert _predict_crypto_probability(proxy, model) == Decimal("0.5000")
+    assert _predict_crypto_probability(wide, model) == Decimal("0.5000")
+    assert _predict_crypto_probability(too_cheap, model) == Decimal("0.5000")
+    assert _predict_crypto_probability(missing_spot, model) == Decimal("0.5000")
 
 
 def test_calibrated_ece_not_worse_than_raw_on_biased_data() -> None:

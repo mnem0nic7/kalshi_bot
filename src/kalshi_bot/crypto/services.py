@@ -110,6 +110,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "sklearn_logistic",
     "spot_distance_residual",
     "spot_distance_contrarian",
+    "spot_distance_contrarian_gated",
     "asset_time_calibration",
     "xgboost_classifier",
     "lightgbm_classifier",
@@ -9892,6 +9893,12 @@ def _fit_crypto_model_candidates(
             "model": _fit_crypto_spot_distance_contrarian_model(rows, fallback=fallback),
             "dependency_version": None,
         },
+        "spot_distance_contrarian_gated": {
+            "name": "spot_distance_contrarian_gated",
+            "status": "available",
+            "model": _fit_crypto_spot_distance_contrarian_gated_model(rows, fallback=fallback),
+            "dependency_version": None,
+        },
         "asset_time_calibration": {
             "name": "asset_time_calibration",
             "status": "available",
@@ -9960,6 +9967,23 @@ def _fit_crypto_spot_distance_contrarian_model(rows: list[dict[str, Any]], *, fa
         "training_cutoff": _crypto_training_cutoff(rows),
         "positive_distance_yes_probability": "0.0100",
         "negative_distance_yes_probability": "0.9900",
+    }
+
+
+def _fit_crypto_spot_distance_contrarian_gated_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model_type": "spot_distance_contrarian_gated",
+        "fallback_model": fallback,
+        "training_cutoff": _crypto_training_cutoff(rows),
+        "positive_distance_yes_probability": "0.1000",
+        "negative_distance_yes_probability": "0.9000",
+        "activation_max_spread_bps": 1500,
+        "activation_min_contract_price_dollars": "0.3500",
+        "activation_max_entry_price_dollars": "0.7500",
+        "activation_min_remaining_payout_bps": 300,
+        "activation_requires_strict_trade_eligible": True,
+        "activation_requires_snapshot_quotes": True,
+        "activation_requires_spot_features": True,
     }
 
 
@@ -10220,6 +10244,44 @@ def _apply_probability_calibration(probability: Decimal, calibration: dict[str, 
     return _clamp_price(probability)
 
 
+def _crypto_spot_distance_contrarian_gate_active(
+    row: dict[str, Any],
+    model: dict[str, Any],
+    *,
+    distance: Decimal,
+) -> bool:
+    if bool(model.get("activation_requires_strict_trade_eligible", True)) and row.get("strict_trade_eligible") is False:
+        return False
+    if bool(model.get("activation_requires_snapshot_quotes", True)):
+        quote_source = str(row.get("quote_source") or "").strip().lower()
+        if quote_source and quote_source != "snapshot_quotes":
+            return False
+    if bool(model.get("activation_requires_spot_features", True)):
+        spot_status = str(row.get("spot_feature_status") or "").strip().lower()
+        if spot_status != "available":
+            return False
+        if bool(row.get("spot_proxy_only")) or _crypto_spot_is_proxy(row.get("spot_provider"), row.get("spot_source_kind")):
+            return False
+    spread_bps = _optional_int(row.get("spread_bps"))
+    max_spread_bps = _optional_int(model.get("activation_max_spread_bps")) or 0
+    if spread_bps is None or (max_spread_bps > 0 and spread_bps > max_spread_bps):
+        return False
+    side = "no" if distance >= Decimal("0") else "yes"
+    cost = _crypto_side_ask(row, side)
+    if cost is None:
+        return False
+    min_contract_price = _decimal(model.get("activation_min_contract_price_dollars") or Decimal("0"))
+    max_entry_price = _decimal(model.get("activation_max_entry_price_dollars") or Decimal("0"))
+    min_remaining_payout = Decimal(_optional_int(model.get("activation_min_remaining_payout_bps")) or 0) / Decimal("10000")
+    if min_contract_price > 0 and cost < min_contract_price:
+        return False
+    if max_entry_price > 0 and cost > max_entry_price:
+        return False
+    if min_remaining_payout > 0 and Decimal("1.0000") - cost < min_remaining_payout:
+        return False
+    return True
+
+
 def _predict_crypto_probability(
     row: dict[str, Any],
     model: dict[str, Any] | None,
@@ -10244,6 +10306,13 @@ def _predict_crypto_probability(
         if distance >= Decimal("0"):
             return _clamp_price(_decimal(model.get("positive_distance_yes_probability") or Decimal("0.0100")))
         return _clamp_price(_decimal(model.get("negative_distance_yes_probability") or Decimal("0.9900")))
+    if model_type == "spot_distance_contrarian_gated":
+        distance = _crypto_spot_distance_signal_value(row)
+        if distance is None or not _crypto_spot_distance_contrarian_gate_active(row, model, distance=distance):
+            return _predict_crypto_probability(row, model.get("fallback_model"))
+        if distance >= Decimal("0"):
+            return _clamp_price(_decimal(model.get("positive_distance_yes_probability") or Decimal("0.1000")))
+        return _clamp_price(_decimal(model.get("negative_distance_yes_probability") or Decimal("0.9000")))
     if model_type == "asset_time_calibration":
         bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
         key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
@@ -10730,7 +10799,8 @@ def _crypto_ensemble_weights_from_metrics(candidates: list[dict[str, Any]]) -> d
     eligible = [
         candidate
         for candidate in candidates
-        if candidate.get("name") not in {"market_mid_baseline", "calibrated_weighted_ensemble"}
+        if candidate.get("name")
+        not in {"market_mid_baseline", "calibrated_weighted_ensemble", "spot_distance_contrarian_gated"}
         and candidate.get("status") == "available"
         and isinstance(candidate.get("metrics"), dict)
         and (candidate.get("metrics") or {}).get("brier") is not None

@@ -55,6 +55,7 @@ from kalshi_bot.crypto.services import (
     _crypto_entry_policy_for_row,
     _crypto_live_pnl_gate_blocks,
     _crypto_live_pnl_gate_payload,
+    _crypto_ensemble_weights_from_metrics,
     _eligible_market_per_asset,
     _crypto_model_candidate_report,
     _crypto_optimize_asset_entry_policy,
@@ -3726,6 +3727,7 @@ def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> Non
     assert report["champion_name"] in names
     assert names["market_mid_baseline"]["metrics"]["brier"] is not None
     assert names["sklearn_logistic"]["status"] in {"available", "guardrail_failed"}
+    assert names["spot_distance_contrarian_gated"]["status"] in {"available", "guardrail_failed"}
     assert names["xgboost_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
     assert names["lightgbm_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
 
@@ -3796,6 +3798,19 @@ def test_crypto_candidate_registry_reports_static_spot_distance_contrarian_profi
     assert policy["selected_count"] == 2
     assert Decimal(policy["net_pnl"]) > Decimal("0")
     assert Decimal(policy["pnl_advantage_vs_market_mid_dollars"]) > Decimal("0")
+
+
+def test_crypto_gated_contrarian_is_excluded_from_probability_ensemble() -> None:
+    weights = _crypto_ensemble_weights_from_metrics(
+        [
+            {"name": "spot_distance_contrarian_gated", "status": "available", "metrics": {"brier": 0.0100}},
+            {"name": "sklearn_logistic", "status": "available", "metrics": {"brier": 0.0102}},
+            {"name": "spot_distance_residual", "status": "available", "metrics": {"brier": 0.0103}},
+        ]
+    )
+
+    assert "spot_distance_contrarian_gated" not in weights
+    assert set(weights) == {"sklearn_logistic", "spot_distance_residual"}
 
 
 def test_crypto_model_selection_does_not_promote_guardrail_failed_candidate() -> None:
@@ -6508,6 +6523,7 @@ async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> Non
         "sklearn_logistic",
         "spot_distance_residual",
         "spot_distance_contrarian",
+        "spot_distance_contrarian_gated",
         "xgboost_classifier",
         "lightgbm_classifier",
         "calibrated_weighted_ensemble",
