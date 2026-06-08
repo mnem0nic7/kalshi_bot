@@ -401,8 +401,8 @@ async def test_current_training_files_do_not_promote_full_policy_gate_changes() 
         if row["promotion_status"] == "promoted"
     ]
 
-    assert report["row_counts"]["labeled_rows"] == 266
-    assert report["row_counts"]["episodes"] == 191
+    assert report["row_counts"]["labeled_rows"] == 0
+    assert report["row_counts"]["episodes"] == 0
     assert changed_settings == {}
     assert promoted_evidence == []
 

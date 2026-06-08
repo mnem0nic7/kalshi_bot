@@ -176,6 +176,10 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
             "1h",
             "--min-price",
             "0.40",
+            "--min-remaining-payout-bps",
+            "100",
+            "--max-credible-edge-bps",
+            "5000",
         ]
     )
     live_path_status_args = parser.parse_args(
@@ -287,6 +291,8 @@ def test_python_module_cli_exposes_crypto_history_status_and_autonomy_run_once()
     assert policy_optimize_args.assets == ["BTC", "ETH"]
     assert policy_override_args.crypto_policy_command == "set-asset-override"
     assert policy_override_args.frequency == "1h"
+    assert policy_override_args.min_remaining_payout_bps == 100
+    assert policy_override_args.max_credible_edge_bps == 5000
     assert live_path_status_args.command == "crypto-live-path"
     assert live_path_status_args.crypto_live_path_command == "status"
     assert live_path_status_args.assets == ["BTC", "ETH"]
@@ -648,6 +654,75 @@ async def test_crypto_live_path_skip_growth_uses_fast_status_helpers(monkeypatch
     btc_report = result["asset_reports"][0]
     assert btc_report["quote_evidence"]["strict_quote_market_day_count"] == 1
     assert "strict_quote_market_day_count 1 < 2 for OOS replay" in btc_report["blockers"]
+
+
+@pytest.mark.asyncio
+async def test_crypto_live_path_fast_spot_status_counts_latest_tick_rows() -> None:
+    latest = datetime.now(UTC)
+
+    class Result:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> "Result":
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return self._rows
+
+    class Session:
+        def get_bind(self) -> object:
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        async def execute(self, stmt: object, params: dict[str, object] | None = None) -> Result:
+            sql = str(stmt)
+            if "SET LOCAL statement_timeout" in sql:
+                return Result([])
+            if "source_kind = 'spot_ohlc'" in sql:
+                return Result([])
+            return Result(
+                [
+                    {
+                        "asset_symbol": (params or {})["asset"],
+                        "provider": "coinbase",
+                        "source_kind": "spot_tick",
+                        "latest_end_ts": latest,
+                    }
+                ]
+            )
+
+        async def commit(self) -> None:
+            return None
+
+    class SessionContext:
+        async def __aenter__(self) -> Session:
+            return Session()
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    container = SimpleNamespace(
+        settings=SimpleNamespace(
+            kalshi_env="production",
+            crypto_spot_coinbase_max_stale_seconds=180,
+            crypto_spot_coingecko_max_stale_seconds=90,
+        ),
+        session_factory=lambda: SessionContext(),
+    )
+
+    result = await cli_module._crypto_live_path_fast_spot_status(
+        container,  # type: ignore[arg-type]
+        assets=["BTC"],
+        frequency="15m",
+        status_days=1,
+    )
+
+    spot_quality = result["spot_quality"]
+    assert spot_quality["coverage_pct"] == 1.0
+    assert spot_quality["missing_assets"] == []
+    assert spot_quality["stale_assets"] == []
+    assert spot_quality["assets"]["BTC"]["row_count"] == 1
+    assert spot_quality["assets"]["BTC"]["source_kind_counts"] == {"spot_tick": 1}
 
 
 def test_crypto_live_path_surfaces_candidate_rejection_counts() -> None:
@@ -1119,6 +1194,84 @@ async def test_crypto_policy_optimize_command_outputs_json(capsys) -> None:
 
     assert exit_code == 0
     assert output["schema_version"] == "crypto-entry-policy-optimizer-v1"
+
+
+@pytest.mark.asyncio
+async def test_crypto_policy_set_asset_override_persists_min_remaining_payout(monkeypatch, capsys) -> None:
+    import kalshi_bot.services.agent_packs as agent_packs_module
+    from kalshi_bot.services.agent_packs import AgentPackService as RealAgentPackService
+
+    settings = Settings(kalshi_env="production")
+    base_pack = RealAgentPackService(settings).default_pack()
+    captured: dict[str, object] = {}
+
+    class FakeRepository:
+        def __init__(self, session: object, *, kalshi_env: str) -> None:
+            assert kalshi_env == "production"
+
+        async def get_deployment_control(self, *, kalshi_env: str) -> SimpleNamespace:
+            assert kalshi_env == "production"
+            return SimpleNamespace(active_color="blue")
+
+        async def get_agent_pack(self, version: str) -> None:
+            return None
+
+        async def update_agent_pack(self, pack: object) -> None:
+            captured["pack"] = pack
+            return None
+
+    class FakeAgentPackService:
+        def __init__(self, settings: Settings) -> None:
+            self.settings = settings
+
+        async def get_active_pack(self, repo: FakeRepository) -> object:
+            return base_pack
+
+        async def assign_pack_to_color(self, repo: FakeRepository, *, color: str, version: str) -> dict[str, object]:
+            captured["assigned_color"] = color
+            captured["assigned_version"] = version
+            return {}
+
+    class Session:
+        async def commit(self) -> None:
+            captured["committed"] = True
+
+    class SessionContext:
+        async def __aenter__(self) -> Session:
+            return Session()
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "PlatformRepository", FakeRepository)
+    monkeypatch.setattr(agent_packs_module, "AgentPackService", FakeAgentPackService)
+
+    args = SimpleNamespace(
+        crypto_policy_command="set-asset-override",
+        asset="sol",
+        frequency="1h",
+        min_edge_bps=None,
+        min_price=None,
+        max_spread_bps=None,
+        min_remaining_payout_bps=0,
+        max_credible_edge_bps=5000,
+        target_position_pct=None,
+    )
+    container = SimpleNamespace(settings=settings, session_factory=lambda: SessionContext())
+
+    exit_code = await cli_module._run_crypto_policy_command(args, container)
+    output = json.loads(capsys.readouterr().out)
+
+    updated_pack = captured["pack"]
+    updated_override = updated_pack.crypto_policy.asset_entry_overrides["SOL:1h"]
+    assert exit_code == 0
+    assert output["override_key"] == "SOL:1h"
+    assert output["override"]["min_remaining_payout_bps"] == 0
+    assert output["override"]["max_credible_edge_bps"] == 5000
+    assert updated_override.min_remaining_payout_bps == 0
+    assert updated_override.max_credible_edge_bps == 5000
+    assert captured["assigned_color"] == "blue"
+    assert captured["committed"] is True
 
 
 @pytest.mark.asyncio

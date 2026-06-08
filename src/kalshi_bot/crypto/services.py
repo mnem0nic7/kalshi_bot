@@ -109,6 +109,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "current_heuristic",
     "sklearn_logistic",
     "spot_distance_residual",
+    "spot_distance_contrarian",
     "asset_time_calibration",
     "xgboost_classifier",
     "lightgbm_classifier",
@@ -7403,6 +7404,8 @@ def _crypto_recommendation(
         None,
     )
     if selected is None:
+        selected = _crypto_preferred_candidate_for_statuses(candidates, {CRYPTO_LIVE_QUALITY})
+    if selected is None:
         selected = next((candidate for candidate in candidates if candidate.get("side") == prediction_side), None)
     if selected is None:
         edge_bps = max([int(candidate["edge_bps"]) for candidate in candidates if candidate["edge_bps"] is not None] or [0])
@@ -9074,14 +9077,24 @@ def _crypto_time_to_close_bucket(seconds: float) -> str:
     return "15m_plus"
 
 
-def _crypto_spot_distance_band(row: dict[str, Any]) -> str:
+def _crypto_spot_distance_signal_value(row: dict[str, Any]) -> Decimal | None:
     value = row.get("spot_target_distance_volatility")
     if value is None:
         pct = row.get("spot_moneyness_pct")
         if pct is None:
-            return "missing"
+            return None
         value = Decimal(str(pct)) * Decimal("20")
-    score = float(_decimal(value))
+    try:
+        return _decimal(value)
+    except Exception:
+        return None
+
+
+def _crypto_spot_distance_band(row: dict[str, Any]) -> str:
+    value = _crypto_spot_distance_signal_value(row)
+    if value is None:
+        return "missing"
+    score = float(value)
     if score <= -2.0:
         return "far_below"
     if score < -0.5:
@@ -9697,13 +9710,10 @@ def _crypto_time_to_close_bucket(seconds: float, frequency: str | None = None) -
 
 
 def _crypto_spot_distance_band(row: dict[str, Any]) -> str:
-    value = row.get("spot_target_distance_volatility")
+    value = _crypto_spot_distance_signal_value(row)
     if value is None:
-        pct = row.get("spot_moneyness_pct")
-        if pct is None:
-            return "missing"
-        value = Decimal(str(pct)) * Decimal("20")
-    score = float(_decimal(value))
+        return "missing"
+    score = float(value)
     if score <= -2.0:
         return "far_below"
     if score < -0.5:
@@ -9876,6 +9886,12 @@ def _fit_crypto_model_candidates(
             "model": _fit_crypto_spot_distance_residual_model(rows, fallback=fallback),
             "dependency_version": None,
         },
+        "spot_distance_contrarian": {
+            "name": "spot_distance_contrarian",
+            "status": "available",
+            "model": _fit_crypto_spot_distance_contrarian_model(rows, fallback=fallback),
+            "dependency_version": None,
+        },
         "asset_time_calibration": {
             "name": "asset_time_calibration",
             "status": "available",
@@ -9935,6 +9951,16 @@ def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fall
         [int(row["label_yes"]) for row in rows],
     )
     return model
+
+
+def _fit_crypto_spot_distance_contrarian_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model_type": "spot_distance_contrarian",
+        "fallback_model": fallback,
+        "training_cutoff": _crypto_training_cutoff(rows),
+        "positive_distance_yes_probability": "0.0100",
+        "negative_distance_yes_probability": "0.9900",
+    }
 
 
 def _fit_crypto_asset_time_calibration_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -10211,6 +10237,13 @@ def _predict_crypto_probability(
         adjustment = Decimal(int((model.get("bucket_adjustments_bps") or {}).get(key, 0))) / Decimal("10000")
         probability = _clamp_price(_predict_crypto_probability(row, model.get("fallback_model")) + adjustment)
         return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
+    if model_type == "spot_distance_contrarian":
+        distance = _crypto_spot_distance_signal_value(row)
+        if distance is None:
+            return _predict_crypto_probability(row, model.get("fallback_model"))
+        if distance >= Decimal("0"):
+            return _clamp_price(_decimal(model.get("positive_distance_yes_probability") or Decimal("0.0100")))
+        return _clamp_price(_decimal(model.get("negative_distance_yes_probability") or Decimal("0.9900")))
     if model_type == "asset_time_calibration":
         bucket = _crypto_time_to_close_bucket(float(row.get("time_to_close_seconds") or 0))
         key = "|".join([str(row.get("asset_symbol") or "unknown"), bucket])
@@ -11793,7 +11826,9 @@ def _evaluate_crypto_walk_forward(
         "current_heuristic": _probability_metrics_decimal(heuristic_predictions),
         "calibrated": _probability_metrics_decimal(calibrated_predictions),
     }
-    bucket_matrix = _crypto_bucket_matrix(calibrated_trades, settings=settings)
+    _winning_policy_name = selected_model_policy.get("policy_name")
+    _bucket_trades = model_candidate_trades_by_name.get(_winning_policy_name or "") or calibrated_trades
+    bucket_matrix = _crypto_bucket_matrix(_bucket_trades, settings=settings)
     bucket_diagnostics = _crypto_bucket_diagnostics(selection_trades)
     oos_by_asset: dict[str, int] = {}
     for _trade in selection_trades:
@@ -13486,6 +13521,28 @@ def _crypto_shadow_ranked_fallback(candidates: list[dict[str, Any]], *, settings
     return None
 
 
+def _crypto_preferred_candidate_for_statuses(
+    candidates: list[dict[str, Any]],
+    allowed_statuses: set[str],
+) -> dict[str, Any] | None:
+    if not candidates or not allowed_statuses:
+        return None
+    for candidate in candidates:
+        if (
+            candidate.get("last_minute_passive_market_confidence") is True
+            and candidate.get("candidate_status") in allowed_statuses
+        ):
+            return candidate
+    if CRYPTO_LIVE_QUALITY in allowed_statuses:
+        for candidate in candidates:
+            if candidate.get("candidate_status") == CRYPTO_LIVE_QUALITY:
+                return candidate
+    for candidate in candidates:
+        if candidate.get("candidate_status") in allowed_statuses:
+            return candidate
+    return None
+
+
 def _simulate_crypto_trade(
     row: dict[str, Any],
     predicted_yes: Decimal,
@@ -13514,7 +13571,7 @@ def _simulate_crypto_trade(
     allowed_statuses = {CRYPTO_LIVE_QUALITY}
     if policy == CRYPTO_EXPLORATORY_SHADOW:
         allowed_statuses = {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}
-    selected = candidates[0] if candidates else {}
+    selected = _crypto_preferred_candidate_for_statuses(candidates, allowed_statuses) or (candidates[0] if candidates else {})
     if selected and selected.get("candidate_status") not in allowed_statuses and policy == CRYPTO_EXPLORATORY_SHADOW:
         fallback = _crypto_shadow_ranked_fallback(candidates[:1], settings=settings)
         if fallback is not None:

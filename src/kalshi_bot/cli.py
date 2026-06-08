@@ -2583,6 +2583,10 @@ async def _run_crypto_policy_command(args: argparse.Namespace, container: AppCon
                     CRYPTO_MIN_SPREAD_BPS,
                     min(CRYPTO_MAX_SPREAD_BPS, int(args.max_spread_bps)),
                 )
+            if args.min_remaining_payout_bps is not None:
+                updates["min_remaining_payout_bps"] = int(args.min_remaining_payout_bps)
+            if args.max_credible_edge_bps is not None:
+                updates["max_credible_edge_bps"] = int(args.max_credible_edge_bps)
             if args.target_position_pct is not None:
                 updates["target_position_pct"] = float(args.target_position_pct)
             updated_override = existing_override.model_copy(update=updates)
@@ -5214,6 +5218,18 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_policy_override.add_argument("--min-edge-bps", type=int, default=None, dest="min_edge_bps")
     crypto_policy_override.add_argument("--min-price", type=float, default=None, dest="min_price")
     crypto_policy_override.add_argument("--max-spread-bps", type=int, default=None, dest="max_spread_bps")
+    crypto_policy_override.add_argument(
+        "--min-remaining-payout-bps",
+        type=int,
+        default=None,
+        dest="min_remaining_payout_bps",
+    )
+    crypto_policy_override.add_argument(
+        "--max-credible-edge-bps",
+        type=int,
+        default=None,
+        dest="max_credible_edge_bps",
+    )
     crypto_policy_override.add_argument("--target-position-pct", type=float, default=None, dest="target_position_pct")
 
     crypto_live_path = subparsers.add_parser("crypto-live-path")

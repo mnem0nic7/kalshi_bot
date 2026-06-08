@@ -912,7 +912,9 @@ class AutonomousGateTuningService:
         now: datetime,
     ) -> dict[str, Any]:
         """Persist strict replay-equivalent bundle rows as bootstrap historical evidence."""
-        gate_service = self.gate_learning_service_factory(self.settings)
+        gate_service = self.gate_learning_service_factory(
+            _settings_with_thresholds(self.settings, self.agent_pack_service.runtime_thresholds(current_pack))
+        )
         rows = [
             row
             for row in gate_service.load_bundle_rows(source=source)

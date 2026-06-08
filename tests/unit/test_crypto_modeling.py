@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from kalshi_bot.crypto.services import (
+    _fit_crypto_spot_distance_contrarian_model,
     _fit_crypto_spot_distance_residual_model,
     _predict_crypto_probability,
 )
@@ -85,6 +86,27 @@ def test_predict_residual_no_infinite_recursion_during_calibration_fitting() -> 
     rows = _make_rows_with_both_labels(20)
     model = _fit_crypto_spot_distance_residual_model(rows, fallback=_make_fallback())
     assert "probability_calibration" in model
+
+
+def test_spot_distance_contrarian_predicts_against_current_distance() -> None:
+    rows = _make_rows_with_both_labels(4)
+    model = _fit_crypto_spot_distance_contrarian_model(rows, fallback=_make_fallback())
+
+    above = _make_row("SOL", 0, 0.50)
+    above["spot_target_distance_volatility"] = Decimal("1.25")
+    below = _make_row("SOL", 1, 0.50)
+    below["spot_target_distance_volatility"] = Decimal("-1.25")
+
+    assert _predict_crypto_probability(above, model) == Decimal("0.0100")
+    assert _predict_crypto_probability(below, model) == Decimal("0.9900")
+
+
+def test_spot_distance_contrarian_falls_back_when_distance_missing() -> None:
+    rows = _make_rows_with_both_labels(4)
+    model = _fit_crypto_spot_distance_contrarian_model(rows, fallback=_make_fallback())
+    row = _make_row("SOL", 0, 0.42)
+
+    assert _predict_crypto_probability(row, model) == Decimal("0.4200")
 
 
 def test_calibrated_ece_not_worse_than_raw_on_biased_data() -> None:

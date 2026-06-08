@@ -75,6 +75,7 @@ from kalshi_bot.crypto.services import (
     _crypto_trade_candidates,
     _crypto_walk_forward_folds,
     _evaluate_crypto_touch20_replay,
+    _simulate_crypto_trade,
     _fit_crypto_calibration,
     _predict_crypto_probability,
     crypto_autonomy_min_seconds_to_close_for_frequency,
@@ -3729,6 +3730,74 @@ def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> Non
     assert names["lightgbm_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
 
 
+def test_crypto_candidate_registry_reports_static_spot_distance_contrarian_profit(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=2,
+        crypto_replay_min_trade_candidates=2,
+        crypto_replay_require_calibration_better_than_mid=False,
+        crypto_market_price_anchor_enabled=False,
+    )
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    rows = [
+        _replay_row(
+            market_ticker="KXSOL-TRAIN-YES",
+            asset_symbol="SOL",
+            market_day="2026-05-01",
+            decision_ts=base,
+            settlement_ts=base + timedelta(minutes=15),
+            label_yes=1,
+            spot_target_distance_volatility=Decimal("-1.0000"),
+        ),
+        _replay_row(
+            market_ticker="KXSOL-TRAIN-NO",
+            asset_symbol="SOL",
+            market_day="2026-05-01",
+            decision_ts=base + timedelta(minutes=1),
+            settlement_ts=base + timedelta(minutes=16),
+            label_yes=0,
+            spot_target_distance_volatility=Decimal("1.0000"),
+        ),
+        _replay_row(
+            market_ticker="KXSOL-OOS-NO-1",
+            asset_symbol="SOL",
+            market_day="2026-05-02",
+            decision_ts=base + timedelta(days=1),
+            settlement_ts=base + timedelta(days=1, minutes=15),
+            label_yes=0,
+            mid_yes_dollars=Decimal("0.5000"),
+            yes_bid_dollars=Decimal("0.4900"),
+            yes_ask_dollars=Decimal("0.5000"),
+            no_bid_dollars=Decimal("0.4900"),
+            no_ask_dollars=Decimal("0.5000"),
+            spot_target_distance_volatility=Decimal("1.0000"),
+        ),
+        _replay_row(
+            market_ticker="KXSOL-OOS-NO-2",
+            asset_symbol="SOL",
+            market_day="2026-05-02",
+            decision_ts=base + timedelta(days=1, minutes=1),
+            settlement_ts=base + timedelta(days=1, minutes=16),
+            label_yes=0,
+            mid_yes_dollars=Decimal("0.5000"),
+            yes_bid_dollars=Decimal("0.4900"),
+            yes_ask_dollars=Decimal("0.5000"),
+            no_bid_dollars=Decimal("0.4900"),
+            no_ask_dollars=Decimal("0.5000"),
+            spot_target_distance_volatility=Decimal("1.0000"),
+        ),
+    ]
+
+    report = _crypto_model_candidate_report(rows, settings=settings)
+    names = {candidate["name"]: candidate for candidate in report["candidates"]}
+    policy = names["spot_distance_contrarian"]["policy_metrics"]
+
+    assert names["spot_distance_contrarian"]["status"] in {"available", "guardrail_failed"}
+    assert policy["selected_count"] == 2
+    assert Decimal(policy["net_pnl"]) > Decimal("0")
+    assert Decimal(policy["pnl_advantage_vs_market_mid_dollars"]) > Decimal("0")
+
+
 def test_crypto_model_selection_does_not_promote_guardrail_failed_candidate() -> None:
     champion = _crypto_select_champion(
         [
@@ -5540,6 +5609,77 @@ def test_crypto_candidate_quality_allows_high_cost_down_when_net_edge_positive(t
     assert candidates[0]["runtime_thresholds"]["min_remaining_payout_bps"] == 300
 
 
+def test_crypto_simulation_selects_live_quality_alternate_side_when_winner_blocked(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=0,
+        risk_min_contract_price_dollars=0.001,
+    )
+    row = _replay_row(
+        market_ticker="KXBTC15M-ALT-SIDE",
+        mid_yes_dollars=Decimal("0.9800"),
+        yes_bid_dollars=Decimal("0.9790"),
+        yes_ask_dollars=Decimal("0.9800"),
+        no_ask_dollars=Decimal("0.0050"),
+        spread_bps=10,
+        label_yes=0,
+    )
+
+    trade = _simulate_crypto_trade(row, Decimal("0.9800"), settings=settings)
+
+    assert trade["status"] == "fillable"
+    assert trade["side"] == "no"
+    assert trade["candidate_status"] == CRYPTO_LIVE_QUALITY
+    assert trade["reason"] == "positive_fee_adjusted_live_quality_edge"
+    assert trade["candidates"][0]["side"] == "yes"
+    assert trade["candidates"][0]["reason"] == "remaining_payout_below_crypto_min"
+
+
+def test_crypto_recommendation_selects_live_quality_alternate_side_when_winner_blocked(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=0,
+        risk_min_contract_price_dollars=0.001,
+    )
+    market = _market(
+        market_ticker="KXBTC15M-ALT-SIDE-LIVE",
+        yes_bid_dollars=Decimal("0.9790"),
+        yes_ask_dollars=Decimal("0.9800"),
+        no_ask_dollars=Decimal("0.0050"),
+        last_price_dollars=Decimal("0.9800"),
+    )
+    row = {
+        "market_ticker": market.market_ticker,
+        "asset_symbol": "BTC",
+        "mid_yes_dollars": Decimal("0.9800"),
+        "yes_bid_dollars": Decimal("0.9790"),
+        "yes_ask_dollars": Decimal("0.9800"),
+        "no_ask_dollars": Decimal("0.0050"),
+        "spread_bps": 10,
+        "spot_feature_status": "available",
+        "spot_provider": "coinbase",
+        "spot_source_kind": "spot_tick",
+        "time_to_close_seconds": 600,
+        "market_age_seconds": 300,
+    }
+
+    action, side, target_yes, edge_bps, trace = _crypto_recommendation(
+        market=market,
+        fair_yes=Decimal("0.9800"),
+        settings=settings,
+        row=row,
+    )
+
+    assert action == TradeAction.BUY
+    assert side == ContractSide.NO
+    assert target_yes == Decimal("0.9900")
+    assert edge_bps > 0
+    assert trace["outcome"] == "candidate_selected"
+    assert trace["predicted_winner_side"] == "yes"
+    assert trace["selected_side"] == "no"
+    assert trace["selection_reason"] == "positive_fee_adjusted_live_quality_edge"
+
+
 def test_crypto_dashboard_signal_metrics_follow_current_quote(tmp_path) -> None:
     settings = _settings(tmp_path, risk_min_edge_bps=500)
     market = CryptoMarket(
@@ -6367,6 +6507,7 @@ async def test_crypto_train_stores_model_with_fee_aware_metrics(tmp_path) -> Non
         "market_mid_baseline",
         "sklearn_logistic",
         "spot_distance_residual",
+        "spot_distance_contrarian",
         "xgboost_classifier",
         "lightgbm_classifier",
         "calibrated_weighted_ensemble",
