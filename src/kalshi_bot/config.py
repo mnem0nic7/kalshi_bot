@@ -460,6 +460,8 @@ class Settings(BaseSettings):
     stop_loss_momentum_min_hold_minutes_by_strategy: dict[str, int] = Field(default_factory=dict)
     stop_loss_rapid_adverse_enabled: bool = True
     stop_loss_rapid_adverse_dollars: float = 0.07
+    stop_loss_min_hard_stop_hold_seconds: int = 0
+    stop_loss_min_hard_stop_hold_seconds_by_strategy: dict[str, int] = Field(default_factory=dict)
     momentum_weight_scale_cents_per_min: float = 1.0
     momentum_slope_veto_cents_per_min: float | None = None
     momentum_weight_floor: float = 0.3

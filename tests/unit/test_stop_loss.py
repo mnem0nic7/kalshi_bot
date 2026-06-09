@@ -426,3 +426,160 @@ def test_momentum_slope_ignores_none_mid_dollars():
     slope = _momentum_slope(rows)
     assert slope is not None
     assert slope < 0
+
+
+# ── minimum hard-stop hold window ────────────────────────────────────────────
+
+
+def _pos_with_created(side: str, count: str, avg: str, created_at: datetime) -> MagicMock:
+    pos = _pos(side, count, avg)
+    pos.id = 99
+    pos.market_ticker = "KXETH15M-26JUN091200-00"
+    pos.created_at = created_at
+    return pos
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_blocked_within_hold_window(monkeypatch):
+    """Hard stop must not fire when position age < min_hard_stop_hold_seconds."""
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_min_hard_stop_hold_seconds=90,
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "_submit", submit)
+
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    # Position is only 60 seconds old — within the 90s hold window.
+    position = _pos_with_created("yes", "1.00", "0.4600", now - timedelta(seconds=60))
+    # Mid has crashed 35% below entry — would normally trigger hard stop.
+    ms = _ms("0.2800", "0.3400")
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.3100"), [], now)
+
+    assert result is None
+    submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_fires_after_hold_window(monkeypatch):
+    """Hard stop fires once position age >= min_hard_stop_hold_seconds."""
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_min_hard_stop_hold_seconds=90,
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock(return_value={"submitted": True})
+    monkeypatch.setattr(service, "_submit", submit)
+
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    # Position is 91 seconds old — just past the 90s hold window.
+    position = _pos_with_created("yes", "1.00", "0.4600", now - timedelta(seconds=91))
+    ms = _ms("0.2800", "0.3400")
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.3100"), [], now)
+
+    assert result == {"submitted": True}
+    submit.assert_called_once()
+    assert submit.call_args.kwargs["trigger"] == "hard_stop"
+
+
+@pytest.mark.asyncio
+async def test_trailing_stop_blocked_within_hold_window(monkeypatch):
+    """Trailing stop must not fire when position age < min_hard_stop_hold_seconds."""
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_min_hard_stop_hold_seconds=90,
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "_submit", submit)
+
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    # Position is 60s old — within hold window.
+    position = _pos_with_created("yes", "1.00", "0.3000", now - timedelta(seconds=60))
+    ms = _ms("0.2300", "0.3700")
+    # Price history shows a peak at 0.60 followed by a drop to 0.30 — 50% trailing drop.
+    prices = [
+        _ph("0.6000", now - timedelta(seconds=55)),
+        _ph("0.3000", now - timedelta(seconds=5)),
+    ]
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.3000"), prices, now)
+
+    assert result is None
+    submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rapid_adverse_fires_within_hold_window(monkeypatch):
+    """Rapid adverse bypasses the hold gate — it is the crash circuit-breaker."""
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_rapid_adverse_enabled=True,
+        stop_loss_rapid_adverse_dollars=0.07,
+        stop_loss_min_hard_stop_hold_seconds=90,
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock(return_value={"submitted": True})
+    monkeypatch.setattr(service, "_submit", submit)
+
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    # Position is only 65 seconds old — inside the 90s hold window.
+    position = _pos_with_created("yes", "1.00", "0.4600", now - timedelta(seconds=65))
+    # Sell price is valid and hard stop has NOT triggered (mid still close to entry).
+    ms = _ms("0.3900", "0.4500")
+    # Two consecutive 7¢ drops recorded in prev_mids.
+    prev_mids = [
+        (Decimal("0.5300"), now - timedelta(seconds=60)),
+        (Decimal("0.4600"), now - timedelta(seconds=30)),
+    ]
+    # Current mid is 0.39 — drop2 = 0.46 - 0.39 = 0.07, drop1 = 0.53 - 0.46 = 0.07.
+
+    result = await service._evaluate_and_submit(
+        position, ms, Decimal("0.3900"), [], now, prev_mids=prev_mids
+    )
+
+    assert result == {"submitted": True}
+    submit.assert_called_once()
+    assert submit.call_args.kwargs["trigger"] == "rapid_adverse_move"
+
+
+@pytest.mark.asyncio
+async def test_per_strategy_hold_override_crypto_15m(monkeypatch):
+    """Per-strategy hold takes precedence over the global default."""
+    monkeypatch.setattr("kalshi_bot.services.stop_loss.PlatformRepository", _FakeStopLossRepo)
+    settings = Settings(
+        app_color="blue",
+        kalshi_taker_fee_rate=0,
+        stop_loss_threshold_pct=0.30,
+        stop_loss_min_hard_stop_hold_seconds=0,           # global: no hold
+        stop_loss_min_hard_stop_hold_seconds_by_strategy={"CRYPTO_15M": 90},  # 15m override
+    )
+    service = StopLossService(settings, lambda: _FakeStopLossSession(), MagicMock())
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "_submit", submit)
+
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    # 60s old CRYPTO_15M position — global hold=0 would allow stop, but 15m override=90 blocks it.
+    position = _pos_with_created("yes", "1.00", "0.4600", now - timedelta(seconds=60))
+    position.market_ticker = "KXBTC15M-26JUN091200-00"
+    ms = _ms("0.2800", "0.3400")
+
+    result = await service._evaluate_and_submit(position, ms, Decimal("0.3100"), [], now)
+
+    assert result is None
+    submit.assert_not_called()

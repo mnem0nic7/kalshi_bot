@@ -326,6 +326,19 @@ class StopLossService:
             hard_stop_disabled = (inferred_strategy or "") in _strategy_csv(
                 self.settings.stop_loss_hard_stop_disabled_strategies
             )
+            # Minimum hold before hard stop and trailing stop may fire.
+            # Rapid adverse bypasses this gate intentionally — it is the crash
+            # circuit-breaker and already carries an implicit ~60-90s delay
+            # from requiring two consecutive prev_mids readings.
+            min_hard_hold_s = (
+                self.settings.stop_loss_min_hard_stop_hold_seconds_by_strategy.get(inferred_strategy)
+                if inferred_strategy else None
+            ) or self.settings.stop_loss_min_hard_stop_hold_seconds
+            pos_created = _as_utc(position.created_at)
+            hard_stop_hold_ready = (
+                pos_created is None
+                or (now - pos_created).total_seconds() >= min_hard_hold_s
+            )
             sell_px = _sell_price(ms, position.side)
             net_return_ratio = (
                 _round_trip_net_return_ratio(
@@ -336,7 +349,7 @@ class StopLossService:
                 if sell_px is not None
                 else None
             )
-            if not hard_stop_disabled and net_return_ratio is not None and net_return_ratio <= -effective_threshold:
+            if hard_stop_hold_ready and not hard_stop_disabled and net_return_ratio is not None and net_return_ratio <= -effective_threshold:
                 result = await self._submit(
                     repo, position, sell_px, mid, abs(net_return_ratio), now,
                     kill_switch_enabled=kill_switch_enabled,
@@ -361,7 +374,7 @@ class StopLossService:
             trailing_ratio: float | None = None
             if peak is not None:
                 trailing_ratio = _trailing_loss_ratio(peak, mid)
-                if not hard_stop_disabled and trailing_ratio >= effective_threshold:
+                if hard_stop_hold_ready and not hard_stop_disabled and trailing_ratio >= effective_threshold:
                     if sell_px is not None and sell_px > 0:
                         result = await self._submit(
                             repo, position, sell_px, mid, trailing_ratio, now,
