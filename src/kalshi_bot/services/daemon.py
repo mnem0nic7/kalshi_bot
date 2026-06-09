@@ -21,6 +21,7 @@ from kalshi_bot.crypto.services import (
     CryptoReplayService,
     CryptoSpotService,
     CryptoTrainingBackfillService,
+    crypto_autonomy_15m_assets,
     crypto_entry_override_key,
     crypto_pnl_sizing_target_pct,
     enabled_crypto_frequencies,
@@ -387,8 +388,13 @@ class DaemonService:
                 "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
                 "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
                 "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
-                "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
+                "crypto_autonomy_1h": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
             }
+            if "15m" in enabled_crypto_frequencies(self.settings):
+                for _asset in crypto_autonomy_15m_assets(self.settings):
+                    periodic_tasks[f"crypto_autonomy_15m_{_asset}"] = asyncio.create_task(
+                        self._periodic_crypto_autonomy_asset_loop(_asset)
+                    )
             if self.settings.crypto_model_nightly_auto_enabled:
                 periodic_tasks["crypto_model_nightly"] = asyncio.create_task(
                     self._periodic_crypto_model_nightly_loop()
@@ -465,15 +471,19 @@ class DaemonService:
                 await asyncio.sleep(startup_delay)
 
             await self.heartbeat_once(run_follow_up=False)
-            tasks.update(
-                {
-                    "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
-                    "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
-                    "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
-                    "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
-                    "crypto_autonomy": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
-                }
-            )
+            _restart_tasks: dict[str, asyncio.Task[Any]] = {
+                "crypto_quote_evidence": asyncio.create_task(self._periodic_crypto_quote_evidence_loop()),
+                "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
+                "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
+                "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
+                "crypto_autonomy_1h": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
+            }
+            if "15m" in enabled_crypto_frequencies(self.settings):
+                for _asset in crypto_autonomy_15m_assets(self.settings):
+                    _restart_tasks[f"crypto_autonomy_15m_{_asset}"] = asyncio.create_task(
+                        self._periodic_crypto_autonomy_asset_loop(_asset)
+                    )
+            tasks.update(_restart_tasks)
             if self.settings.crypto_winrate_guard_enabled:
                 tasks["crypto_winrate_guard"] = asyncio.create_task(
                     self._periodic_crypto_winrate_guard_loop()
@@ -909,6 +919,23 @@ class DaemonService:
                 logger.warning("monotonicity_arb sweep error", exc_info=True)
 
     async def _periodic_crypto_autonomy_loop(self) -> None:
+        """1h autonomy loop — runs all 1h assets together in a single pass."""
+        idle_interval = max(1, int(self.settings.crypto_autonomy_idle_interval_seconds))
+        while True:
+            if self.crypto_autonomy_service is None or "1h" not in enabled_crypto_frequencies(self.settings):
+                await asyncio.sleep(idle_interval)
+                continue
+            if not await self._is_active_color():
+                await asyncio.sleep(idle_interval)
+                continue
+            try:
+                await self.crypto_autonomy_service.run_once(frequency="1h")
+            except Exception:
+                logger.warning("crypto autonomy 1h loop error", exc_info=True)
+            await asyncio.sleep(0)
+
+    async def _periodic_crypto_autonomy_asset_loop(self, asset_symbol: str) -> None:
+        """Per-asset 15m autonomy loop — each asset runs independently so no asset blocks another."""
         idle_interval = max(1, int(self.settings.crypto_autonomy_idle_interval_seconds))
         while True:
             if self.crypto_autonomy_service is None:
@@ -918,10 +945,9 @@ class DaemonService:
                 await asyncio.sleep(idle_interval)
                 continue
             try:
-                for frequency in enabled_crypto_frequencies(self.settings):
-                    await self.crypto_autonomy_service.run_once(frequency=frequency)
+                await self.crypto_autonomy_service.run_once(frequency="15m", asset_symbols=[asset_symbol])
             except Exception:
-                logger.warning("crypto autonomy loop error", exc_info=True)
+                logger.warning("crypto autonomy 15m loop error asset=%s", asset_symbol, exc_info=True)
             await asyncio.sleep(0)
 
     async def _periodic_crypto_history_loop(self) -> None:

@@ -253,6 +253,12 @@ def enabled_crypto_frequencies(settings: Settings) -> list[str]:
     return frequencies or (["15m"] if crypto_frequency_enabled(settings, "15m") else [])
 
 
+def crypto_autonomy_15m_assets(settings: Settings) -> list[str]:
+    """Sorted asset list for per-asset 15m autonomy loops, sourced from crypto_model_nightly_assets."""
+    assets = sorted(_normalize_asset_csv(settings.crypto_model_nightly_assets))
+    return assets or ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"]
+
+
 def _normalize_asset_csv(value: str | None) -> set[str]:
     symbols: set[str] = set()
     for raw in str(value or "").replace(";", ",").split(","):
