@@ -484,6 +484,10 @@ class Settings(BaseSettings):
     crypto_model_nightly_min_new_strict_rows: int = 60
     crypto_model_nightly_max_age_hours: int = 336
     crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
+    # Frequencies included in the nightly rotation. Both 15m and 1h produce the
+    # full 14-slot rotation (7 assets × 2 frequencies = one model per night over
+    # two weeks). Independent of CRYPTO_AUTO_FREQUENCIES (live trading).
+    crypto_model_nightly_frequencies: str = "15m,1h"
     # Upper bound on the per-frequency status() precondition the nightly runs
     # before deciding what to refresh. status() is an analytics-grade scan of the
     # large crypto_market_snapshots table; bounding it keeps a slow/hung query

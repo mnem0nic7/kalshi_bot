@@ -1656,25 +1656,37 @@ class DaemonService:
         configured_assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
         max_age_td = timedelta(hours=self.settings.crypto_model_nightly_max_age_hours)
         now = self._utc_now()
-        frequencies = enabled_crypto_frequencies(self.settings) or ["15m"]
 
-        # Train exactly one asset per night, rotating by local calendar day so
-        # each configured asset retrains on a fixed weekly cadence. Bounds the
-        # nightly job (and the trading-loop pause it causes) to a single asset's
-        # train/replay/gate across all frequencies, instead of all assets at once.
+        # Build training frequencies from crypto_model_nightly_frequencies (independent
+        # of CRYPTO_AUTO_FREQUENCIES which controls live trading, not training).
+        from kalshi_bot.crypto.services import normalize_frequency as _nf
+        training_freqs = [_nf(f.strip()) for f in self.settings.crypto_model_nightly_frequencies.replace(";", ",").split(",") if f.strip()]
+        training_freqs = [f for f in training_freqs if f]
+        if not training_freqs:
+            training_freqs = ["15m"]
+
+        # Train exactly one (asset, frequency) pair per night using a 14-slot rotation
+        # (7 assets × 2 frequencies). The rotation is stateless: date ordinal % 14
+        # determines tonight's slot. 15m pairs come first (slots 0-6), 1h pairs
+        # second (slots 7-13), so each frequency block refreshes on a weekly sub-cycle.
         if configured_assets:
+            rotation_pairs = [(a, f) for f in training_freqs for a in configured_assets]
             local_date = now.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone)).date()
-            rotation_index = local_date.toordinal() % len(configured_assets)
-            assets = [configured_assets[rotation_index]]
+            rotation_index = local_date.toordinal() % len(rotation_pairs)
+            selected_asset, selected_freq = rotation_pairs[rotation_index]
+            assets = [selected_asset]
+            frequencies = [selected_freq]
             logger.info(
-                "crypto_model_nightly rotation selected asset=%s (index=%d of %d) for local_date=%s",
-                assets[0],
-                rotation_index,
-                len(configured_assets),
+                "crypto_model_nightly rotation selected asset=%s freq=%s (slot %d of %d) for local_date=%s",
+                selected_asset,
+                selected_freq,
+                rotation_index + 1,
+                len(rotation_pairs),
                 local_date.isoformat(),
             )
         else:
             assets = []
+            frequencies = []
 
         asset_decisions: dict[str, dict[str, str]] = {}
         sizing_policy_results: dict[str, Any] = {}
