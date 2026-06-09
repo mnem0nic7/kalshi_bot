@@ -12,7 +12,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.services.stop_loss import (
     StopLossService, _midpoint, _momentum_slope, _peak_price_from_history,
     _position_opened_at_from_fills, _round_trip_net_return_ratio, _sell_price,
-    _strategy_for_market_ticker, _trailing_loss_ratio,
+    _strategy_for_market_ticker, _trailing_loss_ratio, exit_retry_delay_seconds,
 )
 
 
@@ -583,3 +583,107 @@ async def test_per_strategy_hold_override_crypto_15m(monkeypatch):
 
     assert result is None
     submit.assert_not_called()
+
+
+# ── exit retry delay ─────────────────────────────────────────────────────────
+
+
+def test_exit_retry_delay_uses_strategy_override():
+    settings = Settings(
+        stop_loss_retry_seconds=1800,
+        stop_loss_retry_seconds_by_strategy={"CRYPTO_15M": 60},
+    )
+    assert exit_retry_delay_seconds(settings, "KXETH15M-26JUN091200-00") == 60
+
+
+def test_exit_retry_delay_falls_back_to_base_for_unlisted_strategy():
+    settings = Settings(
+        stop_loss_retry_seconds=1800,
+        stop_loss_retry_seconds_by_strategy={"CRYPTO_15M": 60},
+    )
+    # KXBTCD is the hourly series → CRYPTO_1H, not in the override dict.
+    assert exit_retry_delay_seconds(settings, "KXBTCD-26JUN0917-T106000") == 1800
+
+
+def test_exit_retry_delay_floors_at_10_seconds():
+    settings = Settings(
+        stop_loss_retry_seconds=0,
+        stop_loss_retry_seconds_by_strategy={"CRYPTO_15M": 1},
+    )
+    assert exit_retry_delay_seconds(settings, "KXETH15M-26JUN091200-00") == 10
+    assert exit_retry_delay_seconds(settings, "KXBTCD-26JUN0917-T106000") == 10
+
+
+# ── stale market state refresh ───────────────────────────────────────────────
+
+
+def _exec_with_market(payload):
+    exec_svc = MagicMock()
+    exec_svc.kalshi.get_market = AsyncMock(return_value=payload)
+    return exec_svc
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_builds_state_from_live_quote():
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market({"market": {"status": "active", "yes_bid": 41, "yes_ask": 45}}),
+    )
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+
+    ms = await service._refresh_stale_market_state("KXETH15M-26JUN091200-00", now)
+
+    assert ms is not None
+    assert ms.yes_bid_dollars == Decimal("0.41")
+    assert ms.yes_ask_dollars == Decimal("0.45")
+    assert ms.observed_at == now
+    assert ms.source == "stop_loss_stale_refresh"
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_returns_none_for_closed_market():
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market({"market": {"status": "settled", "yes_bid": 41, "yes_ask": 45}}),
+    )
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+
+    assert await service._refresh_stale_market_state("KXETH15M-26JUN091200-00", now) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_returns_none_for_broken_book():
+    # Missing ask = market maker withdrew; same skip semantics as _midpoint.
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market({"market": {"status": "active", "yes_bid": 41, "yes_ask": None}}),
+    )
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+
+    assert await service._refresh_stale_market_state("KXETH15M-26JUN091200-00", now) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_returns_none_for_boundary_prices():
+    # yes_bid=0 / yes_ask=100 cents is a degenerate book, not an exitable quote.
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market({"market": {"status": "active", "yes_bid": 0, "yes_ask": 100}}),
+    )
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+
+    assert await service._refresh_stale_market_state("KXETH15M-26JUN091200-00", now) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_returns_none_on_api_error():
+    exec_svc = MagicMock()
+    exec_svc.kalshi.get_market = AsyncMock(side_effect=RuntimeError("api down"))
+    service = StopLossService(Settings(app_color="blue"), MagicMock(), exec_svc)
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+
+    assert await service._refresh_stale_market_state("KXETH15M-26JUN091200-00", now) is None

@@ -15,6 +15,7 @@ from kalshi_bot.db.models import CryptoMarketSnapshotRecord, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
+from kalshi_bot.services.stop_loss import exit_retry_delay_seconds
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
     STOP_LOSS_OUTCOME_FILLED_EXIT,
@@ -352,13 +353,17 @@ class CryptoTakeProfitService:
                 }
             )
             if terminal_unfilled:
-                submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
+                submit_payload["next_retry_at"] = (
+                    now + timedelta(seconds=exit_retry_delay_seconds(self.settings, market_ticker))
+                ).isoformat()
             event_payload["order_response"] = receipt_details
         else:
             event_payload["submit_error"] = submit_error
             submit_payload["submit_error"] = submit_error
             submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
-            submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
+            submit_payload["next_retry_at"] = (
+                now + timedelta(seconds=exit_retry_delay_seconds(self.settings, market_ticker))
+            ).isoformat()
 
         async with self.session_factory() as session:
             repo = PlatformRepository(session)

@@ -171,6 +171,20 @@ def _strategy_for_market_ticker(market_ticker: str) -> str | None:
     return None
 
 
+def exit_retry_delay_seconds(settings: Settings, market_ticker: str) -> int:
+    """Retry delay for failed/unfilled exit orders, per strategy.
+
+    15m markets live ~900s, so the retry must be much shorter than the old
+    fixed 30 minutes or the market expires before the retry ever runs.
+    Shared by StopLossService and CryptoTakeProfitService.
+    """
+    strategy = _strategy_for_market_ticker(market_ticker)
+    by_strategy = settings.stop_loss_retry_seconds_by_strategy
+    if strategy and strategy in by_strategy:
+        return max(10, int(by_strategy[strategy]))
+    return max(10, int(settings.stop_loss_retry_seconds))
+
+
 def _strategy_csv(value: str | None) -> set[str]:
     return {
         raw.strip().upper()
@@ -207,6 +221,47 @@ class StopLossService:
         self.execution_service = execution_service
         # Keyed by position id → last 2 (mid, observed_at) readings for rapid-drop detection
         self._prev_mids: dict[int, list[tuple[Decimal, datetime]]] = {}
+
+    async def _refresh_stale_market_state(self, market_ticker: str, now: datetime) -> MarketState | None:
+        """Fetch a live quote from Kalshi when the stored market state is stale.
+
+        Near settlement the streamed book often goes quiet, which previously left
+        open positions without stop coverage for the rest of the market's life.
+        Returns a transient (never persisted) MarketState, or None if the market
+        is closed or the live book is one-sided.
+        """
+        try:
+            payload = await self.execution_service.kalshi.get_market(market_ticker)
+        except Exception as exc:
+            logger.warning("stop_loss stale refresh failed for %s: %s", market_ticker, exc)
+            return None
+        market = dict(payload.get("market") or {})
+        status = str(market.get("status") or "").strip().lower()
+        if status and status not in {"active", "open"}:
+            return None
+
+        def _cents_to_dollars(key: str) -> Decimal | None:
+            raw = market.get(key)
+            if raw is None:
+                return None
+            value = Decimal(str(raw)) / Decimal("100")
+            if value <= Decimal("0") or value >= Decimal("1"):
+                return None
+            return value
+
+        yes_bid = _cents_to_dollars("yes_bid")
+        yes_ask = _cents_to_dollars("yes_ask")
+        if yes_bid is None or yes_ask is None:
+            return None
+        return MarketState(
+            kalshi_env=self.settings.kalshi_env,
+            market_ticker=market_ticker,
+            source="stop_loss_stale_refresh",
+            yes_bid_dollars=yes_bid,
+            yes_ask_dollars=yes_ask,
+            snapshot={},
+            observed_at=now,
+        )
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
@@ -254,12 +309,19 @@ class StopLossService:
 
             observed_at = _as_utc(ms.observed_at)
             if observed_at is None or (now - observed_at) > stale_cutoff:
-                logger.warning(
-                    "stop_loss skipping %s: market state stale (observed_at=%s)",
-                    position.market_ticker,
-                    observed_at,
+                refreshed = (
+                    await self._refresh_stale_market_state(position.market_ticker, now)
+                    if self.settings.stop_loss_stale_refresh_enabled
+                    else None
                 )
-                continue
+                if refreshed is None:
+                    logger.warning(
+                        "stop_loss skipping %s: market state stale (observed_at=%s)",
+                        position.market_ticker,
+                        observed_at,
+                    )
+                    continue
+                ms = refreshed
 
             mid = _midpoint(ms, position.side)
             if mid is None:
@@ -585,14 +647,18 @@ class StopLossService:
                 }
             )
             if terminal_unfilled:
-                submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
+                submit_payload["next_retry_at"] = (
+                    now + timedelta(seconds=exit_retry_delay_seconds(self.settings, market_ticker))
+                ).isoformat()
             event_payload["order_response"] = receipt_details
         else:
             event_payload["submit_error"] = submit_error
             submit_payload["submit_error"] = submit_error
             submit_payload["outcome_status"] = STOP_LOSS_OUTCOME_SUBMIT_FAILED
             # Back off on outright submit errors to avoid spamming an illiquid book.
-            submit_payload["next_retry_at"] = (now + timedelta(minutes=30)).isoformat()
+            submit_payload["next_retry_at"] = (
+                now + timedelta(seconds=exit_retry_delay_seconds(self.settings, market_ticker))
+            ).isoformat()
 
         if not shadow and receipt_status != "inactive_color_skipped":
             await repo.save_order(
