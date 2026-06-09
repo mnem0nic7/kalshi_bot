@@ -192,6 +192,16 @@ def normalize_asset_mode(mode: str) -> str:
     return normalized
 
 
+def _normalize_asset_mode_key(raw_key: str) -> str:
+    """Normalize a mode dict key, preserving 'SYMBOL:FREQ' compound format."""
+    parts = str(raw_key).split(":", 1)
+    symbol = normalize_asset_symbol(parts[0])
+    if len(parts) == 2:
+        freq = normalize_frequency(parts[1]) or parts[1].strip().lower()
+        return f"{symbol}:{freq}"
+    return symbol
+
+
 def normalize_asset_symbols(asset_symbols: list[str] | None) -> list[str]:
     return sorted({normalize_asset_symbol(symbol) for symbol in (asset_symbols or []) if str(symbol or "").strip()})
 
@@ -582,18 +592,22 @@ class CryptoAssetControlService:
         if not isinstance(raw_modes, dict):
             return {}
         modes: dict[str, str] = {}
-        for raw_symbol, raw_mode in raw_modes.items():
+        for raw_key, raw_mode in raw_modes.items():
             try:
-                symbol = normalize_asset_symbol(str(raw_symbol))
+                key = _normalize_asset_mode_key(str(raw_key))
                 mode = normalize_asset_mode(str(raw_mode))
             except ValueError:
                 continue
-            modes[symbol] = mode
+            modes[key] = mode
         return modes
 
-    def explicit_mode_for_control(self, control: Any, asset_symbol: str) -> str:
+    def explicit_mode_for_control(self, control: Any, asset_symbol: str, *, frequency: str | None = None) -> str:
         symbol = normalize_asset_symbol(asset_symbol)
-        return self.modes_from_notes(getattr(control, "notes", None)).get(symbol, CRYPTO_ASSET_MODE_SHADOW)
+        modes = self.modes_from_notes(getattr(control, "notes", None))
+        freq = normalize_frequency(frequency) if frequency else None
+        if freq and f"{symbol}:{freq}" in modes:
+            return modes[f"{symbol}:{freq}"]
+        return modes.get(symbol, CRYPTO_ASSET_MODE_SHADOW)
 
     def mode_for_control(
         self,
@@ -601,14 +615,20 @@ class CryptoAssetControlService:
         asset_symbol: str,
         *,
         crypto_policy: RuntimeCryptoPolicy | None = None,
+        frequency: str | None = None,
     ) -> str:
         symbol = normalize_asset_symbol(asset_symbol)
-        note_mode = self.modes_from_notes(getattr(control, "notes", None)).get(symbol)
+        modes = self.modes_from_notes(getattr(control, "notes", None))
+        freq = normalize_frequency(frequency) if frequency else None
+        freq_key = f"{symbol}:{freq}" if freq else None
+        # Frequency-specific key takes precedence; fall back to plain symbol key
+        note_mode = (modes.get(freq_key) if freq_key else None) or modes.get(symbol)
         if note_mode == CRYPTO_ASSET_MODE_OFF:
             return CRYPTO_ASSET_MODE_OFF
         if str(self.settings.kalshi_env or "").strip().lower() != "demo" and note_mode in CRYPTO_ASSET_MODES:
             return note_mode
-        policy_mode = (crypto_policy.asset_modes if crypto_policy is not None else {}).get(symbol)
+        asset_modes = crypto_policy.asset_modes if crypto_policy is not None else {}
+        policy_mode = (asset_modes.get(freq_key) if freq_key else None) or asset_modes.get(symbol)
         if policy_mode in CRYPTO_ASSET_MODES:
             return policy_mode
         return note_mode or CRYPTO_ASSET_MODE_SHADOW
@@ -670,8 +690,8 @@ class CryptoAssetControlService:
         has_write_credentials: bool,
         crypto_policy: RuntimeCryptoPolicy | None = None,
     ) -> dict[str, Any]:
-        mode = self.mode_for_control(control, market.asset_symbol, crypto_policy=crypto_policy)
-        explicit_mode = self.explicit_mode_for_control(control, market.asset_symbol)
+        mode = self.mode_for_control(control, market.asset_symbol, crypto_policy=crypto_policy, frequency=market.frequency)
+        explicit_mode = self.explicit_mode_for_control(control, market.asset_symbol, frequency=market.frequency)
         global_blockers = self.global_live_blockers(
             control=control,
             replay_gate=replay_gate,
@@ -714,10 +734,13 @@ class CryptoAssetControlService:
         asset_symbol: str,
         mode: str,
         *,
+        frequency: str | None = None,
         kalshi_env: str | None = None,
         actor: str = "operator",
     ) -> dict[str, Any]:
         symbol = normalize_asset_symbol(asset_symbol)
+        freq = normalize_frequency(frequency) if frequency else None
+        mode_key = f"{symbol}:{freq}" if freq else symbol
         normalized_mode = normalize_asset_mode(mode)
         env = kalshi_env or self.settings.kalshi_env
         async with self.session_factory() as session:
@@ -727,8 +750,8 @@ class CryptoAssetControlService:
             def update_modes(previous_value: Any) -> dict[str, str]:
                 nonlocal previous_mode
                 modes = self.modes_from_notes({CRYPTO_ASSET_MODES_KEY: previous_value})
-                previous_mode = modes.get(symbol, CRYPTO_ASSET_MODE_SHADOW)
-                modes[symbol] = normalized_mode
+                previous_mode = modes.get(mode_key, CRYPTO_ASSET_MODE_SHADOW)
+                modes[mode_key] = normalized_mode
                 return modes
 
             control, _ = await repo.update_deployment_note_key(
@@ -738,10 +761,12 @@ class CryptoAssetControlService:
             )
             await repo.log_ops_event(
                 severity="info",
-                summary=f"Crypto asset mode set: {symbol} {normalized_mode}",
+                summary=f"Crypto asset mode set: {mode_key} {normalized_mode}",
                 source="crypto_asset_control",
                 payload={
                     "asset_symbol": symbol,
+                    "frequency": freq,
+                    "mode_key": mode_key,
                     "mode": normalized_mode,
                     "previous_mode": previous_mode,
                     "actor": actor,
@@ -753,6 +778,8 @@ class CryptoAssetControlService:
         return {
             "status": "ok",
             "asset_symbol": symbol,
+            "frequency": freq,
+            "mode_key": mode_key,
             "mode": normalized_mode,
             "previous_mode": previous_mode,
             "asset_modes": self.modes_from_notes(control.notes),
@@ -4769,11 +4796,13 @@ class CryptoExecutionService:
             explicit_asset_mode = self.asset_control_service.explicit_mode_for_control(
                 fresh_control,
                 market.asset_symbol,
+                frequency=market.frequency,
             )
             asset_mode = self.asset_control_service.mode_for_control(
                 fresh_control,
                 market.asset_symbol,
                 crypto_policy=crypto_policy,
+                frequency=market.frequency,
             )
             gate = await _latest_crypto_artifact_for_asset(
                 repo,

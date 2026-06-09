@@ -981,6 +981,7 @@ async def _run_crypto_asset_mode_command(args: argparse.Namespace, container: Ap
         result = await container.crypto_asset_control_service.set_asset_mode(
             args.symbol,
             args.mode,
+            frequency=getattr(args, "frequency", None) or None,
             actor="cli",
         )
     else:
@@ -5200,6 +5201,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_kalshi_env_argument(crypto_asset_mode_set)
     crypto_asset_mode_set.add_argument("symbol")
     crypto_asset_mode_set.add_argument("mode", choices=["off", "shadow", "live"])
+    crypto_asset_mode_set.add_argument("--frequency", default=None, help="Optional frequency (15m or 1h) to set mode for a specific frequency only")
 
     crypto_policy = subparsers.add_parser("crypto-policy")
     crypto_policy_subparsers = crypto_policy.add_subparsers(dest="crypto_policy_command", required=True)
