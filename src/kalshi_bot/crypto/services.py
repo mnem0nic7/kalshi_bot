@@ -10117,7 +10117,11 @@ def _fit_crypto_xgboost_model(
     except Exception as exc:
         return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_unavailable:{exc}", "dependency_version": None}
     try:
-        _xgb_device = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cpu").lower()
+        _xgb_requested = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cpu").lower()
+        _xgb_gpu_min_rows = int(os.environ.get("CRYPTO_GPU_MIN_ROWS", "20000") or 20000)
+        _xgb_device, _xgb_downgrade = _resolve_tree_device(_xgb_requested, len(labels), gpu_min_rows=_xgb_gpu_min_rows)
+        if _xgb_downgrade:
+            logger.debug("crypto_xgboost_device_downgraded: %s", _xgb_downgrade)
         _xgb_kwargs: dict[str, Any] = {"tree_method": "hist"}
         if _xgb_device not in ("", "cpu"):
             _xgb_kwargs["device"] = _xgb_device
@@ -10159,6 +10163,7 @@ def _fit_crypto_xgboost_model(
                 "estimator": "XGBClassifier",
                 "random_state": 17,
                 "tree_method": "hist",
+                "device": _xgb_device,
             },
             "feature_defaults": defaults,
             "fallback_model": fallback,
@@ -10190,6 +10195,9 @@ def _fit_crypto_lightgbm_model(
         return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_unavailable:{exc}", "dependency_version": None}
     try:
         _lgb_n_jobs = int(os.environ.get("CRYPTO_LIGHTGBM_N_JOBS", "-1"))
+        _lgb_requested = os.environ.get("CRYPTO_LIGHTGBM_DEVICE", "cpu")
+        # gpu_min_rows=0: no size gate for LightGBM — honor operator request as-is.
+        _lgb_device, _ = _resolve_tree_device(_lgb_requested, len(labels), gpu_min_rows=0)
         _lgb_min_child = 20 if len(raw_matrix) > 20000 else 10 if len(raw_matrix) > 5000 else 5
         classifier = lgb.LGBMClassifier(
             n_estimators=100,
@@ -10202,6 +10210,7 @@ def _fit_crypto_lightgbm_model(
             reg_lambda=1.5,
             random_state=17,
             n_jobs=_lgb_n_jobs,
+            device=_lgb_device,
             verbosity=-1,
         )
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
@@ -10220,6 +10229,7 @@ def _fit_crypto_lightgbm_model(
                 "version": getattr(lgb, "__version__", None),
                 "estimator": "LGBMClassifier",
                 "random_state": 17,
+                "device": _lgb_device,
             },
             "feature_defaults": defaults,
             "fallback_model": fallback,
