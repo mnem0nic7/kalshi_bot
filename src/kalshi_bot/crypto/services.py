@@ -10065,6 +10065,44 @@ def _fit_crypto_logistic_model(
         return {"name": "sklearn_logistic", "status": "unavailable", "reason": f"sklearn_fit_failed:{exc}", "dependency_version": _package_version("scikit-learn")}
 
 
+_GPU_TREE_DEVICES: frozenset[str] = frozenset({"cuda", "gpu"})
+
+
+def _crypto_bootstrap_observed_at(market: "CryptoMarket", *, now: datetime | None = None) -> datetime:
+    current = now or datetime.now(UTC)
+    close_time = market.close_time
+    if close_time is None:
+        return current
+    return min(close_time, current)
+
+
+def _resolve_tree_device(
+    requested: str, n_rows: int, *, gpu_min_rows: int
+) -> tuple[str, str | None]:
+    requested = (requested or "").strip().lower() or "cpu"
+    if requested in _GPU_TREE_DEVICES and gpu_min_rows > 0 and n_rows < gpu_min_rows:
+        return "cpu", f"rows={n_rows} below gpu_min_rows={gpu_min_rows}"
+    return requested, None
+
+
+def _fit_tree_with_device_fallback(
+    build_and_fit: "Callable[[str], Any]", device: str, *, model_label: str
+) -> tuple["Any", str]:
+    """Run build_and_fit(device); on a GPU failure, retry once on CPU."""
+    try:
+        return build_and_fit(device), device
+    except Exception as exc:
+        if device not in _GPU_TREE_DEVICES:
+            raise
+        logger.warning(
+            "crypto_%s_gpu_fit_failed device=%s falling back to cpu: %s",
+            model_label,
+            device,
+            exc,
+        )
+        return build_and_fit("cpu"), "cpu"
+
+
 def _fit_crypto_xgboost_model(
     rows: list[dict[str, Any]],
     raw_matrix: list[list[float]],

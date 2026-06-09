@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from kalshi_bot.config import Settings
@@ -20,7 +20,17 @@ def create_engine(settings: Settings) -> AsyncEngine:
         if is_postgres
         else {}
     )
-    return create_async_engine(settings.database_url, pool_pre_ping=True, connect_args=connect_args)
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True, connect_args=connect_args)
+    if not is_postgres:
+        # SQLite fsync on this host is very slow (container volume or encrypted FS).
+        # synchronous=OFF skips fdatasync() on each DDL commit — safe for test databases
+        # since we only use SQLite in tests; Postgres is used in production.
+        @event.listens_for(engine.sync_engine, "connect")
+        def _set_sqlite_synchronous_off(dbapi_conn, _conn_record) -> None:
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA synchronous = OFF")
+            cursor.close()
+    return engine
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

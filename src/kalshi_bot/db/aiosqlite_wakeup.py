@@ -31,11 +31,15 @@ def install_aiosqlite_wakeup_patch() -> None:
         return
 
     async def await_with_periodic_wakeup(future: asyncio.Future):
-        while True:
-            try:
-                return await asyncio.wait_for(asyncio.shield(future), timeout=_WAKEUP_POLL_SECONDS)
-            except TimeoutError:
-                continue
+        # Poll by sleeping rather than shielding: asyncio.shield(future) in a loop
+        # registers a new callback on `future` every iteration, so a slow operation
+        # (e.g. CREATE INDEX) accumulates thousands of callbacks that all fire at once
+        # when the future completes — O(n²) event-loop overhead.  asyncio.sleep achieves
+        # the same "periodically wake the event loop to drain call_soon_threadsafe
+        # callbacks" goal without accumulating any callbacks on the future itself.
+        while not future.done():
+            await asyncio.sleep(_WAKEUP_POLL_SECONDS)
+        return future.result()
 
     def wake_loop(loop: asyncio.AbstractEventLoop) -> None:
         writer = getattr(loop, "_write_to_self", None)
