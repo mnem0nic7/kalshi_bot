@@ -28,3 +28,16 @@ htmlcov/
 reports/
 docs/production-trade-mechanics-audit-*.md
 infra/docker-compose.train.yml
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.orig
+
+# Local runtime / generated
+*.coverage.xml
+junit*.xml
+.hypothesis/
+infra/data/
