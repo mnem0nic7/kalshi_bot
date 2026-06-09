@@ -7603,7 +7603,7 @@ def _floor_count_fp(value: Decimal) -> Decimal:
 
 def crypto_pnl_sizing_target_pct(metrics: dict[str, Any], *, settings: Settings) -> dict[str, Any]:
     """Convert nightly replay P&L into a per-market target position percent."""
-    hard_max_pct = Decimal("0.15")
+    hard_max_pct = Decimal("0.20")
     configured_max_pct = Decimal(str(settings.crypto_dynamic_order_max_position_pct))
     max_pct = min(hard_max_pct, max(Decimal("0"), configured_max_pct))
     min_pct = min(

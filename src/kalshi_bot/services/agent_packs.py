@@ -477,7 +477,7 @@ class AgentPackService:
         )
 
         overrides: dict[str, dict[str, Any]] = {}
-        max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.15)
+        max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.20)
         for raw_symbol, raw_entry in (policy.asset_entry_overrides or {}).items():
             override = {
                 "min_fee_adjusted_edge_bps": raw_entry.min_fee_adjusted_edge_bps,
@@ -637,7 +637,7 @@ class AgentPackService:
             risk_max_position_notional_dollars=self.settings.risk_max_position_notional_dollars,
             risk_position_pct=min(
                 max(float(entry.get("target_position_pct") or self.settings.crypto_dynamic_order_target_position_pct), 0.0),
-                min(float(self.settings.crypto_dynamic_order_max_position_pct), 0.15),
+                min(float(self.settings.crypto_dynamic_order_max_position_pct), 0.20),
             ),
             risk_safe_capital_reserve_ratio=self.settings.risk_safe_capital_reserve_ratio,
             risk_risky_capital_max_ratio=self.settings.risk_risky_capital_max_ratio,
@@ -749,7 +749,7 @@ class AgentPackService:
         *,
         contract_price_floor: float | None = None,
     ) -> AgentPackCryptoEntryPolicy:
-        max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.15)
+        max_target_position_pct = min(max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0), 0.20)
         min_contract_price = (
             float(self.settings.risk_min_contract_price_dollars)
             if contract_price_floor is None

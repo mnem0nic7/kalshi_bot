@@ -1968,7 +1968,7 @@ class DaemonService:
                 optimizer_entry = dict(plan.get("optimizer_entry_policy") or {})
                 target_pct = min(
                     max(float(plan["raw_target_position_pct"]) * allocation_scale, 0.0),
-                    min(float(self.settings.crypto_dynamic_order_max_position_pct), 0.15),
+                    min(float(self.settings.crypto_dynamic_order_max_position_pct), 0.20),
                 )
                 entry_update: dict[str, Any] = {
                     "target_position_pct": target_pct,

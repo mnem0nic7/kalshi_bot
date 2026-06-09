@@ -226,7 +226,7 @@ class Settings(BaseSettings):
     crypto_dynamic_order_sizing_scope: str = "live_quality"
     crypto_dynamic_order_target_position_pct: float = 0.10
     crypto_dynamic_order_min_position_pct: float = 0.05
-    crypto_dynamic_order_max_position_pct: float = 0.15
+    crypto_dynamic_order_max_position_pct: float = 0.20
     crypto_dynamic_order_pnl_scale_per_candidate_dollars: float = 0.20
     crypto_pnl_sizing_auto_enabled: bool = True
     crypto_model_candidate_max_walk_forward_folds: int = 24
