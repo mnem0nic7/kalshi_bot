@@ -257,6 +257,12 @@ class Settings(BaseSettings):
     crypto_spot_coingecko_max_stale_seconds: int = 90
     crypto_spot_current_auto_enabled: bool = True
     crypto_spot_current_interval_seconds: int = 15
+    # Periodic OKX funding-rate collection so funding_rate_current /
+    # funding_rate_delta features stay fresh in live rows instead of relying on
+    # on-demand collection. OKX settles funding every 8h; a 30-minute poll keeps
+    # the latest settlement visible without hammering the API.
+    crypto_funding_collect_enabled: bool = True
+    crypto_funding_collect_interval_seconds: int = 1800
     crypto_spot_history_auto_enabled: bool = True
     crypto_spot_history_auto_lookback_days: int = 2
     crypto_replay_min_spot_coverage_pct: float = 0.95
@@ -493,6 +499,14 @@ class Settings(BaseSettings):
     # full 14-slot rotation (7 assets × 2 frequencies = one model per night over
     # two weeks). Independent of CRYPTO_AUTO_FREQUENCIES (live trading).
     crypto_model_nightly_frequencies: str = "15m,1h"
+    # When true, the nightly rotation collapses to one slot per frequency and
+    # trains a single pooled (all-asset) model per night instead of rotating
+    # through per-asset artifacts. Per-asset models are noise at the current
+    # data scale (dense spot history only exists since ~2026-06-05). Artifact
+    # resolution then prefers the generic pooled "model" artifact when one is
+    # trained and falls back to per-asset artifacts, so live assets trained
+    # before the first pooled run keep working.
+    crypto_model_nightly_pooled_only: bool = True
     # Upper bound on the per-frequency status() precondition the nightly runs
     # before deciding what to refresh. status() is an analytics-grade scan of the
     # large crypto_market_snapshots table; bounding it keeps a slow/hung query

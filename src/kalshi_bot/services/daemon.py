@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -388,6 +388,7 @@ class DaemonService:
                 "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
                 "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
                 "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
+                "crypto_funding_rates": asyncio.create_task(self._periodic_crypto_funding_rate_loop()),
                 "crypto_autonomy_1h": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
             }
             if "15m" in enabled_crypto_frequencies(self.settings):
@@ -476,6 +477,7 @@ class DaemonService:
                 "crypto_history": asyncio.create_task(self._periodic_crypto_history_loop()),
                 "crypto_spot_current": asyncio.create_task(self._periodic_crypto_spot_current_loop()),
                 "crypto_spot_history": asyncio.create_task(self._periodic_crypto_spot_history_loop()),
+                "crypto_funding_rates": asyncio.create_task(self._periodic_crypto_funding_rate_loop()),
                 "crypto_autonomy_1h": asyncio.create_task(self._periodic_crypto_autonomy_loop()),
             }
             if "15m" in enabled_crypto_frequencies(self.settings):
@@ -1016,6 +1018,64 @@ class DaemonService:
                     )
             except Exception:
                 logger.warning("crypto spot history loop error", exc_info=True)
+
+    # Ops-event escalation cadence for the funding loop: warn-log every failure,
+    # but only write an ops event on every Nth consecutive failure so transient
+    # OKX hiccups (one missed 30-minute poll is harmless) don't spam the feed.
+    _CRYPTO_FUNDING_FAILURE_OPS_EVENT_EVERY = 3
+
+    @staticmethod
+    def _crypto_funding_failure_should_log_ops_event(consecutive_failures: int) -> bool:
+        return (
+            consecutive_failures > 0
+            and consecutive_failures % DaemonService._CRYPTO_FUNDING_FAILURE_OPS_EVENT_EVERY == 0
+        )
+
+    async def _run_crypto_funding_rate_cycle(self) -> dict[str, Any] | None:
+        """One funding-rate collection pass; returns the collect summary, or None when skipped."""
+        if self.crypto_spot_service is None or not self.settings.crypto_funding_collect_enabled:
+            return None
+        if not await self._is_active_color():
+            return None
+        assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
+        result = await self.crypto_spot_service.collect_funding_rates(asset_symbols=assets or None)
+        errors = result.get("errors") or []
+        if errors and not result.get("stored"):
+            # collect_funding_rates swallows per-asset errors; an all-asset wipeout
+            # should count as a loop failure so repeated outages reach ops events.
+            raise RuntimeError(f"crypto funding rate collection failed for all assets: {errors}")
+        return result
+
+    async def _periodic_crypto_funding_rate_loop(self) -> None:
+        interval = max(60, int(self.settings.crypto_funding_collect_interval_seconds))
+        consecutive_failures = 0
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                result = await self._run_crypto_funding_rate_cycle()
+            except Exception as exc:
+                consecutive_failures += 1
+                logger.warning("crypto funding rate loop error", exc_info=True)
+                if self._crypto_funding_failure_should_log_ops_event(consecutive_failures):
+                    try:
+                        async with self.session_factory() as session:
+                            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                            await repo.log_ops_event(
+                                severity="warning",
+                                summary="Crypto funding rate collection failing repeatedly",
+                                source="daemon",
+                                payload={
+                                    "app_color": self.settings.app_color,
+                                    "consecutive_failures": consecutive_failures,
+                                    "error": str(exc),
+                                },
+                            )
+                            await session.commit()
+                    except Exception:
+                        logger.warning("crypto funding rate ops-event log failed", exc_info=True)
+            else:
+                if result is not None:
+                    consecutive_failures = 0
 
     async def _run_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
         if (
@@ -1678,6 +1738,33 @@ class DaemonService:
             return "new_data" if has_new_data else None
         return "new_data" if has_new_data else None
 
+    @staticmethod
+    def _crypto_model_nightly_rotation(
+        *,
+        local_date: date,
+        configured_assets: list[str],
+        training_freqs: list[str],
+        pooled_only: bool,
+    ) -> tuple[list[str], list[str], dict[str, int]]:
+        """Pick tonight's training scope from a stateless date-ordinal rotation.
+
+        Per-asset mode: ``slot = ordinal % (assets × frequencies)`` selects one
+        (asset, frequency) pair. Pooled mode: ``slot = ordinal % frequencies``
+        selects tonight's frequency only and the full configured asset list is
+        trained as a single pooled model.
+        """
+        if pooled_only:
+            if not training_freqs:
+                return [], [], {"slot": 0, "slot_count": 0}
+            slot = local_date.toordinal() % len(training_freqs)
+            return list(configured_assets), [training_freqs[slot]], {"slot": slot, "slot_count": len(training_freqs)}
+        if not configured_assets or not training_freqs:
+            return [], [], {"slot": 0, "slot_count": 0}
+        rotation_pairs = [(a, f) for f in training_freqs for a in configured_assets]
+        slot = local_date.toordinal() % len(rotation_pairs)
+        selected_asset, selected_freq = rotation_pairs[slot]
+        return [selected_asset], [selected_freq], {"slot": slot, "slot_count": len(rotation_pairs)}
+
     async def _run_crypto_model_nightly_for_env(self, checkpoint_name: str) -> dict[str, Any]:
         configured_assets = [a.strip().upper() for a in self.settings.crypto_model_nightly_assets.split(",") if a.strip()]
         max_age_td = timedelta(hours=self.settings.crypto_model_nightly_max_age_hours)
@@ -1691,28 +1778,29 @@ class DaemonService:
         if not training_freqs:
             training_freqs = ["15m"]
 
-        # Train exactly one (asset, frequency) pair per night using a 14-slot rotation
-        # (7 assets × 2 frequencies). The rotation is stateless: date ordinal % 14
-        # determines tonight's slot. 15m pairs come first (slots 0-6), 1h pairs
-        # second (slots 7-13), so each frequency block refreshes on a weekly sub-cycle.
-        if configured_assets:
-            rotation_pairs = [(a, f) for f in training_freqs for a in configured_assets]
-            local_date = now.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone)).date()
-            rotation_index = local_date.toordinal() % len(rotation_pairs)
-            selected_asset, selected_freq = rotation_pairs[rotation_index]
-            assets = [selected_asset]
-            frequencies = [selected_freq]
+        # Stateless date-ordinal rotation. Per-asset mode trains exactly one
+        # (asset, frequency) pair per night over a 14-slot rotation (7 assets ×
+        # 2 frequencies; 15m pairs occupy slots 0-6, 1h pairs slots 7-13).
+        # Pooled mode collapses the rotation to one slot per frequency and
+        # trains a single pooled (all-asset) model per night.
+        pooled_only = self.settings.crypto_model_nightly_pooled_only
+        local_date = now.astimezone(ZoneInfo(self.settings.crypto_model_nightly_timezone)).date()
+        assets, frequencies, rotation = self._crypto_model_nightly_rotation(
+            local_date=local_date,
+            configured_assets=configured_assets,
+            training_freqs=training_freqs,
+            pooled_only=pooled_only,
+        )
+        if frequencies:
             logger.info(
-                "crypto_model_nightly rotation selected asset=%s freq=%s (slot %d of %d) for local_date=%s",
-                selected_asset,
-                selected_freq,
-                rotation_index + 1,
-                len(rotation_pairs),
+                "crypto_model_nightly rotation selected assets=%s freq=%s mode=%s (slot %d of %d) for local_date=%s",
+                ",".join(assets) or "ALL",
+                frequencies[0],
+                "pooled" if pooled_only else "per_asset",
+                rotation["slot"] + 1,
+                rotation["slot_count"],
                 local_date.isoformat(),
             )
-        else:
-            assets = []
-            frequencies = []
 
         asset_decisions: dict[str, dict[str, str]] = {}
         sizing_policy_results: dict[str, Any] = {}
@@ -1741,6 +1829,28 @@ class DaemonService:
 
             freq_decisions: dict[str, str] = {}
             refreshed_assets: list[str] = []
+
+            if pooled_only:
+                freq_decisions = await self._run_crypto_model_nightly_pooled_frequency(
+                    frequency=frequency,
+                    assets=assets,
+                    by_asset_rows=by_asset_rows,
+                    now=now,
+                    max_age=max_age_td,
+                )
+                if freq_decisions.get("pooled") == "refreshed":
+                    total_refreshed += 1
+                asset_decisions[frequency] = freq_decisions
+                try:
+                    sizing_policy_results[frequency] = await self._update_crypto_pnl_sizing_policy(
+                        frequency=frequency,
+                        assets=assets,
+                        evaluated_at=now,
+                    )
+                except Exception:
+                    sizing_policy_results[frequency] = {"status": "error"}
+                    logger.warning("crypto_model_nightly sizing policy update error freq=%s", frequency, exc_info=True)
+                continue
 
             for asset in assets:
                 refresh_reason: str | None = None
@@ -1858,6 +1968,113 @@ class DaemonService:
             await repo.set_checkpoint(checkpoint_name, None, result)
             await session.commit()
         return result
+
+    async def _run_crypto_model_nightly_pooled_frequency(
+        self,
+        *,
+        frequency: str,
+        assets: list[str],
+        by_asset_rows: dict[str, int],
+        now: datetime,
+        max_age: timedelta,
+    ) -> dict[str, str]:
+        """Train one pooled (all-asset) model for ``frequency`` if it needs a refresh.
+
+        Multi-asset training records the generic pooled ``model`` artifact
+        (``_crypto_artifact_type`` only suffixes single-asset runs). The pooled
+        replay run records the pooled backtest plus per-asset backtests, and the
+        per-asset gate calls preserve per-asset go/no-go visibility.
+        """
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            artifact = await repo.get_latest_crypto_model_artifact(
+                frequency=frequency,
+                artifact_type="model",
+                kalshi_env=self.settings.kalshi_env,
+            )
+            await session.commit()
+
+        pooled_new_rows = sum(by_asset_rows.get(asset, 0) for asset in assets) if assets else sum(by_asset_rows.values())
+        refresh_reason = self._crypto_model_refresh_reason(
+            artifact_status=(artifact.status if artifact is not None else None),
+            trained_at=(artifact.trained_at if artifact is not None else None),
+            now=now,
+            max_age=max_age,
+            new_rows=pooled_new_rows,
+            min_new_rows=self.settings.crypto_model_nightly_min_new_strict_rows,
+        )
+        if refresh_reason is None:
+            logger.info(
+                "crypto_model_nightly skip pooled freq=%s strict_rows_24h=%d",
+                frequency,
+                pooled_new_rows,
+            )
+            return {"pooled": "skipped_fresh"}
+
+        try:
+            preflight: dict[str, Any] | None = None
+            if self.settings.crypto_training_preflight_enabled and self.crypto_training_backfill_service is not None:
+                preflight = await self.crypto_training_backfill_service.prepare(
+                    frequency=frequency,
+                    asset_symbols=assets or None,
+                    run_source_backfill=True,
+                )
+                if preflight.get("status") != "ok":
+                    logger.warning(
+                        "crypto_model_nightly preflight blocked pooled freq=%s blockers=%s",
+                        frequency,
+                        preflight.get("blockers"),
+                    )
+                    return {"pooled": "skipped_preflight_blocked"}
+            else:
+                await self.crypto_history_service.collect_settled(frequency=frequency, asset_symbols=assets or None)
+                await self.crypto_history_service.bootstrap(frequency=frequency, asset_symbols=assets or None)
+                if self.crypto_spot_service is not None:
+                    try:
+                        await self.crypto_spot_service.collect_current(frequency=frequency, asset_symbols=assets or None)
+                    except Exception:
+                        logger.warning(
+                            "crypto_model_nightly spot collect failed pooled freq=%s",
+                            frequency,
+                            exc_info=True,
+                        )
+            await self.crypto_forecast_service.train(
+                frequency=frequency,
+                asset_symbols=assets or None,
+                use_feature_store=bool(preflight),
+                feature_store_only=bool(preflight),
+            )
+            await self.crypto_replay_service.run(frequency=frequency, asset_symbols=assets or None)
+        except Exception:
+            logger.warning("crypto_model_nightly pooled refresh error freq=%s", frequency, exc_info=True)
+            return {"pooled": "error"}
+
+        decisions: dict[str, str] = {"pooled": "refreshed"}
+        # Per-asset gates keep per-asset go/no-go visibility on top of the
+        # pooled model (the pooled replay run records per-asset backtests).
+        for asset in assets:
+            try:
+                await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=[asset])
+                decisions[asset] = "gated"
+            except Exception:
+                decisions[asset] = "gate_error"
+                logger.warning(
+                    "crypto_model_nightly per-asset gate error asset=%s freq=%s",
+                    asset,
+                    frequency,
+                    exc_info=True,
+                )
+        try:
+            await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=assets or None)
+        except Exception:
+            logger.warning("crypto_model_nightly pooled gate error freq=%s", frequency, exc_info=True)
+        logger.info(
+            "crypto_model_nightly refreshed pooled freq=%s reason=%s assets=%s",
+            frequency,
+            refresh_reason,
+            ",".join(assets) or "ALL",
+        )
+        return decisions
 
     async def _update_crypto_pnl_sizing_policy(
         self,

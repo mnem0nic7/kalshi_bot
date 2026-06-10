@@ -530,7 +530,29 @@ async def _latest_crypto_artifact_for_asset(
     kalshi_env: str,
     asset_symbol: str | None = None,
     allow_generic_fallback: bool = True,
+    prefer_generic: bool = False,
 ) -> Any | None:
+    if prefer_generic and allow_generic_fallback:
+        # Pooled-model mode (crypto_model_nightly_pooled_only): a *trained*
+        # generic pooled artifact wins over the per-asset one. Per-asset
+        # artifacts stay as the fallback so assets trained before the first
+        # pooled run keep working until a pooled artifact exists.
+        generic = await repo.get_latest_crypto_model_artifact(
+            frequency=frequency,
+            artifact_type=artifact_type,
+            kalshi_env=kalshi_env,
+        )
+        if generic is not None and str(getattr(generic, "status", "") or "") == "trained":
+            return generic
+        if asset_symbol:
+            artifact = await repo.get_latest_crypto_model_artifact(
+                frequency=frequency,
+                artifact_type=_crypto_artifact_type(artifact_type, [asset_symbol]),
+                kalshi_env=kalshi_env,
+            )
+            if artifact is not None:
+                return artifact
+        return generic
     if asset_symbol:
         artifact = await repo.get_latest_crypto_model_artifact(
             frequency=frequency,
@@ -1352,6 +1374,7 @@ class CryptoMarketService:
                     artifact_type="model",
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbol=requested_assets[0],
+                    prefer_generic=self.settings.crypto_model_nightly_pooled_only,
                 )
                 gate = await _latest_crypto_artifact_for_asset(
                     repo,
@@ -3537,6 +3560,7 @@ class CryptoForecastService:
                 artifact_type="model",
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbol=market.asset_symbol,
+                prefer_generic=self.settings.crypto_model_nightly_pooled_only,
             )
             _now = datetime.now(UTC)
             spot_rows = await repo.list_crypto_spot_ohlc(
