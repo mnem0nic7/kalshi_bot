@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import os
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -87,7 +87,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v6"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v7"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -4281,6 +4281,27 @@ class CryptoReplayService:
             "calibration_ece",
             "market_mid_ece",
         )
+        # Market-grouped keys: only aggregated when every asset artifact carries
+        # them, so mixed old/new artifacts keep row-count gate behavior.
+        market_count_keys = (
+            "resolved_market_count",
+            "strict_trade_eligible_market_count",
+            "trade_candidate_market_count",
+            "current_model_live_quality_market_count",
+            "oos_trade_candidate_market_count",
+        )
+        market_weighted_keys = (
+            "calibration_brier_market_weighted",
+            "market_mid_brier_market_weighted",
+            "calibration_log_loss_market_weighted",
+            "market_mid_log_loss_market_weighted",
+            "calibration_ece_market_weighted",
+            "market_mid_ece_market_weighted",
+        )
+        market_count_totals: dict[str, int] = dict.fromkeys(market_count_keys, 0)
+        market_count_missing: set[str] = set()
+        market_weighted_totals: dict[str, float] = dict.fromkeys(market_weighted_keys, 0.0)
+        market_weighted_counts: dict[str, int] = dict.fromkeys(market_weighted_keys, 0)
         weighted_totals: dict[str, float] = {key: 0.0 for key in weighted_keys}
         weighted_counts: dict[str, int] = {key: 0 for key in weighted_keys}
         aggregate_reasons: list[str] = []
@@ -4357,11 +4378,29 @@ class CryptoReplayService:
                     continue
                 weighted_totals[key] += float(value) * weight
                 weighted_counts[key] += weight
+            for key in market_count_keys:
+                if metrics.get(key) is None:
+                    market_count_missing.add(key)
+                else:
+                    market_count_totals[key] += int(metrics.get(key) or 0)
+            market_weight = int(metrics.get("resolved_market_count") or 0)
+            for key in market_weighted_keys:
+                value = metrics.get(key)
+                if value is None or market_weight <= 0:
+                    continue
+                market_weighted_totals[key] += float(value) * market_weight
+                market_weighted_counts[key] += market_weight
             oos_statuses.add(str(metrics.get("oos_evaluation_status") or "").strip().lower())
 
         for key in weighted_keys:
             if weighted_counts[key] > 0:
                 aggregate_metrics[key] = weighted_totals[key] / weighted_counts[key]
+        for key in market_count_keys:
+            if key not in market_count_missing:
+                aggregate_metrics[key] = market_count_totals[key]
+        for key in market_weighted_keys:
+            if market_weighted_counts[key] > 0:
+                aggregate_metrics[key] = market_weighted_totals[key] / market_weighted_counts[key]
         aggregate_metrics["missing_model_assets"] = missing_model_assets
         aggregate_metrics["missing_backtest_assets"] = missing_backtest_assets
         aggregate_metrics["model_missing"] = bool(missing_model_assets)
@@ -6889,12 +6928,26 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
     bucket_gate_applied = bool(metrics.get("empirical_bucket_gate_applied_to_metrics")) or str(
         metrics.get("metrics_source") or ""
     ) == "empirical_bucket_gated"
-    resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
-    current_model_candidates = int(
-        metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count")) or 0
-    )
-    raw_oos_candidates = metrics.get("oos_trade_candidate_count")
-    oos_candidates = int(raw_oos_candidates or 0)
+    # Market-count keys (new artifacts) replace row counts for candidate-count
+    # checks; absent keys (old artifacts) keep row-count behavior unchanged.
+    resolved_market_count = metrics.get("resolved_market_count")
+    if resolved_market_count is not None:
+        resolved = int(resolved_market_count or 0)
+    else:
+        resolved = int(metrics.get("resolved_sample_count") or metrics.get("sample_count") or 0)
+    current_model_market_count = metrics.get("current_model_live_quality_market_count")
+    if current_model_market_count is not None:
+        current_model_candidates = int(current_model_market_count or 0)
+    else:
+        current_model_candidates = int(
+            metrics.get("current_model_live_quality_candidate_count", metrics.get("trade_candidate_count")) or 0
+        )
+    oos_market_candidates = metrics.get("oos_trade_candidate_market_count")
+    if oos_market_candidates is not None:
+        oos_candidates = int(oos_market_candidates or 0)
+    else:
+        raw_oos_candidates = metrics.get("oos_trade_candidate_count")
+        oos_candidates = int(raw_oos_candidates or 0)
     oos_fold_count = metrics.get("oos_fold_count")
     oos_evaluation_status = str(metrics.get("oos_evaluation_status") or "").strip().lower()
     has_oos_markers = oos_fold_count is not None or bool(oos_evaluation_status)
@@ -6921,7 +6974,11 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
     candle_count = int(metrics.get("candle_count") or 0)
     leakage_rows = int(metrics.get("leakage_row_count") or 0)
     spot_coverage = float(metrics.get("spot_feature_coverage_pct") or 0.0)
-    strict_trade_rows = int(metrics.get("strict_trade_eligible_count") or 0)
+    strict_market_count = metrics.get("strict_trade_eligible_market_count")
+    if strict_market_count is not None:
+        strict_trade_rows = int(strict_market_count or 0)
+    else:
+        strict_trade_rows = int(metrics.get("strict_trade_eligible_count") or 0)
     if metrics.get("model_missing"):
         reasons.append("Crypto model artifact is missing.")
     if metrics.get("backtest_missing"):
@@ -6989,6 +7046,18 @@ def _crypto_replay_gate_reasons(metrics: dict[str, Any], *, crypto_policy: Runti
             reasons.append("Calibration log-loss does not beat the market-mid baseline.")
         if calibration_ece is None or market_mid_ece is None or float(calibration_ece) > float(market_mid_ece):
             reasons.append("Calibration ECE does not beat the market-mid baseline.")
+        market_weighted_pairs = (
+            ("calibration_brier_market_weighted", "market_mid_brier_market_weighted", "Brier"),
+            ("calibration_log_loss_market_weighted", "market_mid_log_loss_market_weighted", "log-loss"),
+            ("calibration_ece_market_weighted", "market_mid_ece_market_weighted", "ECE"),
+        )
+        for model_key, mid_key, label in market_weighted_pairs:
+            if model_key not in metrics and mid_key not in metrics:
+                continue
+            model_value = metrics.get(model_key)
+            mid_value = metrics.get(mid_key)
+            if model_value is None or mid_value is None or float(model_value) > float(mid_value):
+                reasons.append(f"Market-weighted calibration {label} does not beat the market-mid baseline.")
     if current_model_candidates >= crypto_policy.replay_min_trade_candidates:
         pnl_per_candidate = net_pl / current_model_candidates if current_model_candidates > 0 else 0.0
         if pnl_per_candidate < crypto_policy.replay_min_pnl_per_candidate_dollars:
@@ -7245,14 +7314,24 @@ def _crypto_live_market_row(
         "asset_recent_yes_rate": None,
         "asset_recent_mid_error": None,
     }
+    sorted_spot_rows = sorted(spot_rows or [], key=lambda item: item.end_ts)
     row.update(
         _spot_context_for_decision(
-            sorted(spot_rows or [], key=lambda item: item.end_ts),
+            sorted_spot_rows,
             decision_ts=now,
             target_price=market.target_price_dollars,
             mid_yes=_clamp_price(mid),
             settings=settings,
             mode=CRYPTO_SPOT_CONTEXT_LIVE,
+        )
+    )
+    row.update(
+        _settlement_window_feature_context(
+            sorted_spot_rows,
+            close_time=close_time,
+            target_price=market.target_price_dollars,
+            frequency=market.frequency,
+            as_of=now,
         )
     )
     row.update(_cross_asset_context(cross_asset_spot or {}, decision_ts=now))
@@ -8413,6 +8492,14 @@ def _crypto_decision_rows(
         market_age_seconds = _crypto_market_age_seconds(decision_ts, getattr(snapshot, "open_time", None))
         target_price = snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None)
         settlement_joined = settlement_snapshot is not None and settlement_snapshot is not snapshot
+        settlement_window_context = _settlement_window_feature_context(
+            spot_by_asset.get(snapshot.asset_symbol, []),
+            spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
+            close_time=close_time,
+            target_price=target_price,
+            frequency=snapshot.frequency,
+            as_of=decision_ts,
+        )
         rows.append(
             {
                 "row_id": f"{snapshot.market_ticker}:{decision_ts.isoformat()}",
@@ -8446,6 +8533,7 @@ def _crypto_decision_rows(
                 "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
+                **settlement_window_context,
                 **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
                 **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
             }
@@ -8479,6 +8567,14 @@ def _crypto_decision_rows(
                 settings=settings,
                 mode=CRYPTO_SPOT_CONTEXT_HISTORICAL,
             )
+            settlement_window_context = _settlement_window_feature_context(
+                spot_by_asset.get(snapshot.asset_symbol, []),
+                spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
+                close_time=close_time,
+                target_price=snapshot.target_price_dollars,
+                frequency=snapshot.frequency,
+                as_of=decision_ts,
+            )
             rows.append(
                 {
                     "row_id": f"candle_proxy:{snapshot.market_ticker}:{decision_ts.isoformat()}",
@@ -8511,6 +8607,7 @@ def _crypto_decision_rows(
                     "candle_count": len(candles_by_market.get(snapshot.market_ticker, [])),
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
+                    **settlement_window_context,
                     **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
                     **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
                 }
@@ -9265,6 +9362,91 @@ def _crypto_training_row_quality_score(row: dict[str, Any]) -> float:
     return max(0.0, min(1.0, score))
 
 
+def _crypto_row_market_ticker(row: dict[str, Any]) -> str:
+    return str(row.get("market_ticker") or "unknown")
+
+
+def _crypto_distinct_market_count(rows: list[dict[str, Any]]) -> int:
+    return len({_crypto_row_market_ticker(row) for row in rows})
+
+
+def _crypto_training_sample_weights(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings | None = None,
+) -> list[float]:
+    quality = [float(_crypto_training_row_quality_score(row)) for row in rows]
+    if settings is not None and not settings.crypto_train_market_balanced_weights:
+        return quality
+    # Down-weight markets with many snapshot rows (15s cadence yields ~60
+    # near-identical rows per 15m market) so each market contributes equally.
+    market_counts = Counter(_crypto_row_market_ticker(row) for row in rows)
+    weights = [
+        score / max(1, market_counts[_crypto_row_market_ticker(row)])
+        for score, row in zip(quality, rows, strict=True)
+    ]
+    total = sum(weights)
+    if total <= 0.0:
+        return weights
+    scale = len(weights) / total
+    return [weight * scale for weight in weights]
+
+
+def _probability_metrics_market_weighted(
+    predictions: list[tuple[Decimal, int, str]],
+) -> dict[str, Any]:
+    grouped: dict[str, list[tuple[Decimal, int]]] = defaultdict(list)
+    for probability, label, market_ticker in predictions:
+        grouped[market_ticker].append((probability, label))
+    if not grouped:
+        return {"market_count": 0, "brier": None, "log_loss": None, "ece": None}
+    per_market = [_probability_metrics_decimal(items) for items in grouped.values()]
+
+    def _mean(key: str) -> float | None:
+        values = [metrics[key] for metrics in per_market if metrics.get(key) is not None]
+        return sum(values) / len(values) if values else None
+
+    return {
+        "market_count": len(grouped),
+        "brier": _mean("brier"),
+        "log_loss": _mean("log_loss"),
+        "ece": _mean("ece"),
+    }
+
+
+def _crypto_dead_feature_report(
+    rows: list[dict[str, Any]],
+    *,
+    schema: dict[str, Any] | None = None,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not rows:
+        return {"dead_feature_names": [], "dead_feature_count": 0}
+    schema = schema or _crypto_feature_schema(rows)
+    defaults = defaults or _crypto_feature_defaults(rows)
+    feature_names = list(schema.get("feature_names") or [])
+    # Streamed zero-variance check: avoids materializing a second copy of the
+    # full training matrix.
+    first_vector: list[float] | None = None
+    varying: set[int] = set()
+    for row in rows:
+        vector = _crypto_raw_feature_vector(row, schema, defaults=defaults)
+        if first_vector is None:
+            first_vector = vector
+            continue
+        for index, value in enumerate(vector):
+            if index not in varying and value != first_vector[index]:
+                varying.add(index)
+    dead = [name for index, name in enumerate(feature_names) if index not in varying]
+    if dead:
+        logger.warning(
+            "crypto_training_dead_features count=%d names=%s",
+            len(dead),
+            ",".join(dead),
+        )
+    return {"dead_feature_names": dead, "dead_feature_count": len(dead)}
+
+
 def _crypto_training_quality_blockers(
     rows: list[dict[str, Any]],
     *,
@@ -9320,6 +9502,7 @@ def _settlement_benchmark_context(
     close_time: datetime | None,
     target_price: Decimal | None,
     frequency: str,
+    as_of: datetime | None = None,
 ) -> dict[str, Any]:
     if close_time is None:
         return {
@@ -9343,16 +9526,17 @@ def _settlement_benchmark_context(
         interval = 900
     close_utc = _as_utc_datetime(close_time)
     start = close_utc - timedelta(seconds=interval)
+    end_cap = close_utc if as_of is None else min(close_utc, _as_utc_datetime(as_of))
     if spot_end_times is not None:
         start_index = bisect_left(spot_end_times, start)
-        end_index = bisect_right(spot_end_times, close_utc)
+        end_index = bisect_right(spot_end_times, end_cap)
         window_rows = spot_rows[start_index:end_index]
         eligible = [row for row in window_rows if row.close_dollars is not None]
     else:
         eligible = [
             row
             for row in spot_rows
-            if row.close_dollars is not None and start <= _as_utc_datetime(row.end_ts) <= close_utc
+            if row.close_dollars is not None and start <= _as_utc_datetime(row.end_ts) <= end_cap
         ]
     eligible.sort(key=lambda row: row.end_ts)
     if not eligible:
@@ -9360,7 +9544,7 @@ def _settlement_benchmark_context(
             "settlement_window_status": "missing_spot_window",
             "settlement_window_sample_count": 0,
             "settlement_window_start_ts": start,
-            "settlement_window_end_ts": close_utc,
+            "settlement_window_end_ts": end_cap,
             "settlement_window_open_dollars": None,
             "settlement_window_high_dollars": None,
             "settlement_window_low_dollars": None,
@@ -9413,6 +9597,35 @@ def _settlement_benchmark_context(
         "settlement_window_return_pct": window_return,
         "settlement_window_volatility": volatility,
     }
+
+
+_CRYPTO_SETTLEMENT_WINDOW_FEATURE_KEYS = (
+    "settlement_window_status",
+    "settlement_window_sample_count",
+    "settlement_twap_target_distance_pct",
+    "settlement_window_return_pct",
+    "settlement_window_volatility",
+)
+
+
+def _settlement_window_feature_context(
+    spot_rows: list[CryptoSpotOHLCRecord],
+    *,
+    spot_end_times: list[datetime] | None = None,
+    close_time: datetime | None,
+    target_price: Decimal | None,
+    frequency: str,
+    as_of: datetime,
+) -> dict[str, Any]:
+    context = _settlement_benchmark_context(
+        spot_rows,
+        spot_end_times=spot_end_times,
+        close_time=close_time,
+        target_price=target_price,
+        frequency=frequency,
+        as_of=as_of,
+    )
+    return {key: context.get(key) for key in _CRYPTO_SETTLEMENT_WINDOW_FEATURE_KEYS}
 
 
 def _trace_value(payload: Any, *keys: str) -> Any:
@@ -9843,7 +10056,7 @@ def _fit_crypto_calibration(
 
     schema = _crypto_feature_schema(rows)
     defaults = _crypto_feature_defaults(rows)
-    candidates = _fit_crypto_model_candidates(rows, schema=schema, defaults=defaults, fallback=fallback)
+    candidates = _fit_crypto_model_candidates(rows, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
     candidate_report = (
         _crypto_model_candidate_report(
             rows,
@@ -9897,6 +10110,7 @@ def _fit_crypto_model_candidates(
     schema: dict[str, Any] | None = None,
     defaults: dict[str, Any] | None = None,
     fallback: dict[str, Any] | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, dict[str, Any]]:
     schema = schema or _crypto_feature_schema(rows)
     defaults = defaults or _crypto_feature_defaults(rows)
@@ -9947,8 +10161,8 @@ def _fit_crypto_model_candidates(
             result[name] = {"name": name, "status": "unavailable", "reason": reason, "dependency_version": None}
         return result
     result["sklearn_logistic"] = _fit_crypto_logistic_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
-    result["xgboost_classifier"] = _fit_crypto_xgboost_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
-    result["lightgbm_classifier"] = _fit_crypto_lightgbm_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
+    result["xgboost_classifier"] = _fit_crypto_xgboost_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
+    result["lightgbm_classifier"] = _fit_crypto_lightgbm_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
     return result
 
 
@@ -10146,6 +10360,7 @@ def _fit_crypto_xgboost_model(
     schema: dict[str, Any],
     defaults: dict[str, Any],
     fallback: dict[str, Any],
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     try:
         import xgboost as xgb
@@ -10177,7 +10392,7 @@ def _fit_crypto_xgboost_model(
         # Fit on full dataset; hold out most-recent 15% for isotonic calibration when
         # there's enough data — prevents in-sample calibration overfitting.
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
-        _sample_weights = [float(_crypto_training_row_quality_score(row)) for row in rows[:_cal_split_idx]]
+        _sample_weights = _crypto_training_sample_weights(rows[:_cal_split_idx], settings=settings)
         classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
         booster = classifier.get_booster()
         try:
@@ -10223,6 +10438,7 @@ def _fit_crypto_lightgbm_model(
     schema: dict[str, Any],
     defaults: dict[str, Any],
     fallback: dict[str, Any],
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     try:
         import lightgbm as lgb
@@ -10249,7 +10465,7 @@ def _fit_crypto_lightgbm_model(
             verbosity=-1,
         )
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
-        _sample_weights = [float(_crypto_training_row_quality_score(row)) for row in rows[:_cal_split_idx]]
+        _sample_weights = _crypto_training_sample_weights(rows[:_cal_split_idx], settings=settings)
         classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
         booster = classifier.booster_
         model = {
@@ -11034,7 +11250,7 @@ def _crypto_model_candidate_report(
     if not folds:
         report = _crypto_in_sample_candidate_report(
             rows,
-            full_candidate_status or _fit_crypto_model_candidates(rows),
+            full_candidate_status or _fit_crypto_model_candidates(rows, settings=settings),
             settings=settings,
             crypto_policy=crypto_policy,
         )
@@ -11053,7 +11269,7 @@ def _crypto_model_candidate_report(
         schema = _crypto_feature_schema(train_rows)
         defaults = _crypto_feature_defaults(train_rows)
         fallback = _fit_crypto_heuristic_calibration(train_rows)
-        candidate_status = _fit_crypto_model_candidates(train_rows, schema=schema, defaults=defaults, fallback=fallback)
+        candidate_status = _fit_crypto_model_candidates(train_rows, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
         available_models = {
             name: status["model"]
             for name, status in candidate_status.items()
@@ -11310,13 +11526,18 @@ def _crypto_model_metrics(
 
     baseline_predictions: list[tuple[Decimal, int]] = []
     calibrated_predictions: list[tuple[Decimal, int]] = []
+    baseline_market_predictions: list[tuple[Decimal, int, str]] = []
+    calibrated_market_predictions: list[tuple[Decimal, int, str]] = []
     baseline_simulated = []
     simulated = []
     for row, predicted in zip(rows, all_predicted):
         label = int(row["label_yes"])
         baseline = _decimal(row["mid_yes_dollars"])
+        market_ticker = _crypto_row_market_ticker(row)
         baseline_predictions.append((baseline, label))
         calibrated_predictions.append((predicted, label))
+        baseline_market_predictions.append((baseline, label, market_ticker))
+        calibrated_market_predictions.append((predicted, label, market_ticker))
         baseline_simulated.append(_simulate_crypto_trade(row, baseline, settings=settings, crypto_policy=crypto_policy))
         simulated.append(_simulate_crypto_trade(row, predicted, settings=settings, crypto_policy=crypto_policy))
     exploratory = [
@@ -11338,6 +11559,17 @@ def _crypto_model_metrics(
     hard_cap_breaches = sum(1 for item in fillable if _decimal(item["net_pnl"]) < Decimal("-1.0000"))
     baseline_metrics = _probability_metrics_decimal(baseline_predictions)
     calibrated_metrics = _probability_metrics_decimal(calibrated_predictions)
+    baseline_market_metrics = _probability_metrics_market_weighted(baseline_market_predictions)
+    calibrated_market_metrics = _probability_metrics_market_weighted(calibrated_market_predictions)
+    independent_market_count = _crypto_distinct_market_count(rows)
+    fillable_market_count = len(
+        {
+            _crypto_row_market_ticker(row)
+            for row, item in zip(rows, simulated)
+            if item["status"] == "fillable"
+        }
+    )
+    dead_features = _crypto_dead_feature_report(rows)
     metrics = {
         "sample_count": len(rows),
         "resolved_sample_count": len(rows),
@@ -11361,6 +11593,22 @@ def _crypto_model_metrics(
         "market_mid_log_loss": baseline_metrics["log_loss"],
         "calibration_ece": calibrated_metrics["ece"],
         "market_mid_ece": baseline_metrics["ece"],
+        "independent_market_count": independent_market_count,
+        "rows_per_market_mean": (len(rows) / independent_market_count) if independent_market_count else None,
+        "resolved_market_count": independent_market_count,
+        "strict_trade_eligible_market_count": _crypto_distinct_market_count(
+            [row for row in rows if row.get("strict_trade_eligible")]
+        ),
+        "trade_candidate_market_count": fillable_market_count,
+        "current_model_live_quality_market_count": fillable_market_count,
+        "calibration_brier_market_weighted": calibrated_market_metrics["brier"],
+        "market_mid_brier_market_weighted": baseline_market_metrics["brier"],
+        "calibration_log_loss_market_weighted": calibrated_market_metrics["log_loss"],
+        "market_mid_log_loss_market_weighted": baseline_market_metrics["log_loss"],
+        "calibration_ece_market_weighted": calibrated_market_metrics["ece"],
+        "market_mid_ece_market_weighted": baseline_market_metrics["ece"],
+        "dead_feature_names": dead_features["dead_feature_names"],
+        "dead_feature_count": dead_features["dead_feature_count"],
         "fee_model_version": current_fee_model_version(),
         "metrics_scope": "in_sample",
     }
@@ -11776,11 +12024,21 @@ def _evaluate_crypto_walk_forward(
     )
     if not folds:
         empty_metrics = _crypto_model_metrics([], {}, settings=settings, crypto_policy=crypto_policy)
+        no_fold_market_count = _crypto_distinct_market_count(rows)
         empty_metrics.update(
             {
                 "oos_evaluation_status": "insufficient_data",
                 "oos_fold_count": 0,
                 "oos_trade_candidate_count": 0,
+                "oos_trade_candidate_market_count": 0,
+                "independent_market_count": no_fold_market_count,
+                "rows_per_market_mean": (len(rows) / no_fold_market_count) if no_fold_market_count else None,
+                "resolved_market_count": no_fold_market_count,
+                "strict_trade_eligible_market_count": _crypto_distinct_market_count(
+                    [row for row in rows if row.get("strict_trade_eligible")]
+                ),
+                "trade_candidate_market_count": int(diagnostic_live_policy.get("selected_market_count") or 0),
+                "current_model_live_quality_market_count": int(diagnostic_live_policy.get("selected_market_count") or 0),
                 "oos_net_simulated_pl_dollars": 0.0,
                 "oos_market_mid_net_simulated_pl_dollars": 0.0,
                 "oos_pnl_advantage_vs_market_mid_dollars": 0.0,
@@ -11851,6 +12109,7 @@ def _evaluate_crypto_walk_forward(
     exploratory_trades: list[dict[str, Any]] = []
     heuristic_predictions: list[tuple[Decimal, int]] = []
     calibrated_predictions: list[tuple[Decimal, int]] = []
+    prediction_market_tickers: list[str] = []
     fold_summaries: list[dict[str, Any]] = []
     for fold in folds:
         model = _fit_crypto_calibration(
@@ -11864,7 +12123,7 @@ def _evaluate_crypto_walk_forward(
         schema = _crypto_feature_schema(fold["train_rows"])
         defaults = _crypto_feature_defaults(fold["train_rows"])
         fallback = _fit_crypto_heuristic_calibration(fold["train_rows"])
-        candidate_status = _fit_crypto_model_candidates(fold["train_rows"], schema=schema, defaults=defaults, fallback=fallback)
+        candidate_status = _fit_crypto_model_candidates(fold["train_rows"], schema=schema, defaults=defaults, fallback=fallback, settings=settings)
         available_candidate_models = {
             name: status["model"]
             for name, status in candidate_status.items()
@@ -11892,6 +12151,7 @@ def _evaluate_crypto_walk_forward(
                 baseline_predictions_by_name[name].append((prediction, int(row["label_yes"])))
             heuristic_predictions.append((heuristic, int(row["label_yes"])))
             calibrated_predictions.append((calibrated, int(row["label_yes"])))
+            prediction_market_tickers.append(_crypto_row_market_ticker(row))
             baseline_trade_by_name = {
                 name: _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
                 for name, prediction in baseline_predictions.items()
@@ -11978,6 +12238,22 @@ def _evaluate_crypto_walk_forward(
         },
         "current_heuristic": _probability_metrics_decimal(heuristic_predictions),
         "calibrated": _probability_metrics_decimal(calibrated_predictions),
+        "baseline_market_weighted": _probability_metrics_market_weighted(
+            [
+                (prediction, label, market_ticker)
+                for (prediction, label), market_ticker in zip(
+                    baseline_predictions_by_name["market_mid_baseline"], prediction_market_tickers, strict=True
+                )
+            ]
+        ),
+        "calibrated_market_weighted": _probability_metrics_market_weighted(
+            [
+                (prediction, label, market_ticker)
+                for (prediction, label), market_ticker in zip(
+                    calibrated_predictions, prediction_market_tickers, strict=True
+                )
+            ]
+        ),
     }
     _winning_policy_name = selected_model_policy.get("policy_name")
     _bucket_trades = model_candidate_trades_by_name.get(_winning_policy_name or "") or calibrated_trades
@@ -12011,18 +12287,29 @@ def _evaluate_crypto_walk_forward(
             {
                 "sample_count": len(rows),
                 "resolved_sample_count": len(rows),
+                "resolved_market_count": _crypto_distinct_market_count(rows),
+                "independent_market_count": _crypto_distinct_market_count(rows),
+                "rows_per_market_mean": (
+                    len(rows) / _crypto_distinct_market_count(rows) if rows else None
+                ),
                 "prediction_eligible_count": sum(1 for row in rows if row.get("prediction_eligible", True)),
                 "strict_trade_eligible_count": sum(1 for row in rows if row.get("strict_trade_eligible")),
+                "strict_trade_eligible_market_count": _crypto_distinct_market_count(
+                    [row for row in rows if row.get("strict_trade_eligible")]
+                ),
                 "proxy_quote_row_count": sum(1 for row in rows if row.get("quote_source") != "snapshot_quotes"),
                 "real_quote_row_count": sum(1 for row in rows if row.get("quote_source") == "snapshot_quotes"),
                 "spot_feature_coverage_pct": _spot_feature_coverage(rows),
                 "trade_candidate_count": diagnostic_live_policy["selected_count"],
+                "trade_candidate_market_count": int(diagnostic_live_policy.get("selected_market_count") or 0),
                 "current_model_live_quality_candidate_count": diagnostic_live_policy["selected_count"],
+                "current_model_live_quality_market_count": int(diagnostic_live_policy.get("selected_market_count") or 0),
                 "live_quality_candidate_count": diagnostic_live_policy["selected_count"],
                 "exploratory_shadow_candidate_count": diagnostic_quality["exploratory_shadow_count"],
                 "oos_evaluation_status": "ok",
                 "oos_fold_count": len(folds),
                 "oos_trade_candidate_count": selection_policy["selected_count"],
+                "oos_trade_candidate_market_count": int(selection_policy.get("selected_market_count") or 0),
                 "oos_net_simulated_pl_dollars": float(_decimal(selection_policy["net_pnl"])),
                 "oos_market_mid_net_simulated_pl_dollars": float(_decimal(baseline_policy["net_pnl"])),
                 "oos_pnl_advantage_vs_market_mid_dollars": float(
@@ -12043,6 +12330,12 @@ def _evaluate_crypto_walk_forward(
                 "market_mid_log_loss": probability["baseline"]["log_loss"],
                 "calibration_ece": probability["calibrated"]["ece"],
                 "market_mid_ece": probability["baseline"]["ece"],
+                "calibration_brier_market_weighted": probability["calibrated_market_weighted"]["brier"],
+                "market_mid_brier_market_weighted": probability["baseline_market_weighted"]["brier"],
+                "calibration_log_loss_market_weighted": probability["calibrated_market_weighted"]["log_loss"],
+                "market_mid_log_loss_market_weighted": probability["baseline_market_weighted"]["log_loss"],
+                "calibration_ece_market_weighted": probability["calibrated_market_weighted"]["ece"],
+                "market_mid_ece_market_weighted": probability["baseline_market_weighted"]["ece"],
                 "fee_model_version": current_fee_model_version(),
                 "candidate_status_counts": diagnostic_quality["candidate_status_counts"],
                 "candidate_reason_counts": diagnostic_quality["candidate_reason_counts"],
@@ -14047,6 +14340,7 @@ def _crypto_policy_metrics(policy_name: str, trade_rows: list[dict[str, Any]], *
             "live_review_candidate": "live_review_candidate",
         }.get(policy_name, policy_name),
         "selected_count": len(trade_rows),
+        "selected_market_count": _crypto_distinct_market_count(trade_rows),
         "fillable_count": len(trade_rows),
         "coverage": None,
         "gross_pnl": str(sum(gross, Decimal("0")).quantize(Decimal("0.0001"))),
@@ -14065,9 +14359,12 @@ def _crypto_policy_metrics(policy_name: str, trade_rows: list[dict[str, Any]], *
 
 _CRYPTO_REPLAY_GATE_METRIC_KEYS = (
     "trade_candidate_count",
+    "trade_candidate_market_count",
     "current_model_live_quality_candidate_count",
+    "current_model_live_quality_market_count",
     "live_quality_candidate_count",
     "oos_trade_candidate_count",
+    "oos_trade_candidate_market_count",
     "oos_net_simulated_pl_dollars",
     "oos_market_mid_net_simulated_pl_dollars",
     "oos_pnl_advantage_vs_market_mid_dollars",
@@ -14154,6 +14451,20 @@ def _crypto_apply_empirical_bucket_gate_to_replay_metrics(
         "fees_dollars": float(_decimal(gated_selection_policy.get("fees") or Decimal("0"))),
         "hard_cap_breaches": int(gated_selection_policy.get("hard_cap_breaches") or 0),
     }
+    # Only override market-grouped counts when the source metrics carry them, so
+    # old-style metrics keep row-count gate behavior untouched.
+    if any(
+        key in metrics_with_buckets
+        for key in ("trade_candidate_market_count", "current_model_live_quality_market_count", "oos_trade_candidate_market_count")
+    ):
+        selected_market_count = _crypto_distinct_market_count(gated_selection_trades)
+        bucket_metrics.update(
+            {
+                "trade_candidate_market_count": selected_market_count,
+                "current_model_live_quality_market_count": selected_market_count,
+                "oos_trade_candidate_market_count": selected_market_count,
+            }
+        )
     return {
         **metrics_with_buckets,
         **bucket_metrics,
