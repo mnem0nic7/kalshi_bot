@@ -40,6 +40,22 @@ COINGECKO_IDS = {
     "XRP": "ripple",
 }
 
+# Requested Kraken pair per asset. None means the asset is not listed on Kraken
+# and must be skipped (never proxied). Kraken responds keyed by its canonical
+# pair name (e.g. "XBTUSD" comes back as "XXBTZUSD"), so parsing must not rely
+# on the requested pair appearing in the result.
+KRAKEN_PAIRS: dict[str, str | None] = {
+    "ADA": "ADAUSD",
+    "BCH": "BCHUSD",
+    "BNB": None,
+    "BTC": "XBTUSD",
+    "DOGE": "DOGEUSD",
+    "ETH": "ETHUSD",
+    "HYPE": None,
+    "SOL": "SOLUSD",
+    "XRP": "XRPUSD",
+}
+
 
 @dataclass(slots=True)
 class SpotOHLC:
@@ -691,4 +707,118 @@ class CoinGeckoSpotClient:
             source_kind="spot_price_proxy",
             source_id=coin_id,
             payload={"raw": raw, "coin_id": coin_id, "proxy_ohlc": True, "current_price": True},
+        )
+
+
+def _parse_kraken_ohlc_payload(
+    payload: Any,
+    *,
+    symbol: str,
+    requested_pair: str,
+    interval_seconds: int,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[SpotOHLC]:
+    if not isinstance(payload, dict):
+        return []
+    errors = payload.get("error")
+    if isinstance(errors, list) and errors:
+        raise ValueError(f"kraken OHLC error for {requested_pair}: {errors}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return []
+    # Kraken keys the candle list by its canonical pair name (e.g. XXBTZUSD for
+    # a requested XBTUSD), so take the first non-"last" key.
+    pair_key = next((key for key in result if key != "last"), None)
+    candles = result.get(pair_key) if pair_key is not None else None
+    if not isinstance(candles, list):
+        return []
+    rows: list[SpotOHLC] = []
+    for item in candles:
+        if not isinstance(item, (list, tuple)) or len(item) < 7:
+            continue
+        try:
+            start_ts = datetime.fromtimestamp(int(float(item[0])), UTC)
+        except Exception:
+            continue
+        end_ts = start_ts + timedelta(seconds=interval_seconds)
+        if start is not None and end_ts <= _utc(start):
+            continue
+        if end is not None and end_ts > _utc(end) + timedelta(seconds=interval_seconds):
+            continue
+        close = _decimal(item[4])
+        if close is None:
+            continue
+        rows.append(
+            SpotOHLC(
+                provider="kraken",
+                asset_symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                open_dollars=_decimal(item[1]),
+                high_dollars=_decimal(item[2]),
+                low_dollars=_decimal(item[3]),
+                close_dollars=close,
+                volume=_decimal(item[6]),
+                source_kind="spot_ohlc",
+                source_id=pair_key,
+                payload={
+                    "pair": pair_key,
+                    "requested_pair": requested_pair,
+                    "vwap": str(item[5]) if len(item) > 5 and item[5] not in (None, "") else None,
+                    "trade_count": int(item[7]) if len(item) > 7 and isinstance(item[7], (int, float)) else None,
+                },
+            )
+        )
+    rows.sort(key=lambda row: row.end_ts)
+    return rows
+
+
+class KrakenSpotClient:
+    base_url = "https://api.kraken.com"
+
+    def __init__(self, *, timeout_seconds: float = 30.0) -> None:
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout_seconds,
+            headers={"Accept": "application/json", "User-Agent": "kalshi-bot/crypto-spot"},
+        )
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+    async def fetch_ohlc(
+        self,
+        asset_symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        interval_seconds: int,
+    ) -> list[SpotOHLC]:
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        pair = KRAKEN_PAIRS.get(symbol)
+        if pair is None:
+            raise KeyError(f"kraken unsupported asset: {symbol}")
+        start_utc = _utc(start)
+        end_utc = _utc(end)
+        if start_utc >= end_utc:
+            return []
+        # Kraken's OHLC endpoint returns at most the latest 720 candles; `since`
+        # only trims the front of that window, so no pagination is possible.
+        response = await self.client.get(
+            "/0/public/OHLC",
+            params={
+                "pair": pair,
+                "interval": max(1, interval_seconds // 60),
+                "since": int(start_utc.timestamp()) - 1,
+            },
+        )
+        response.raise_for_status()
+        return _parse_kraken_ohlc_payload(
+            response.json(),
+            symbol=symbol,
+            requested_pair=pair,
+            interval_seconds=interval_seconds,
+            start=start_utc,
+            end=end_utc,
         )

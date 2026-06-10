@@ -181,6 +181,9 @@ class KalshiClient:
     async def get_market(self, ticker: str) -> dict[str, Any]:
         return await self._request("GET", f"/markets/{ticker}")
 
+    async def get_market_orderbook(self, ticker: str, **params: Any) -> dict[str, Any]:
+        return await self._request("GET", f"/markets/{ticker}/orderbook", params=params)
+
     async def list_series(self, **params: Any) -> dict[str, Any]:
         return await self._request("GET", "/series", params=params)
 

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import time
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
@@ -61,8 +62,10 @@ from kalshi_bot.db.repositories import PlatformRepository, _crypto_snapshot_matc
 from kalshi_bot.integrations.crypto_spot import (
     COINGECKO_IDS,
     COINBASE_PRODUCT_IDS,
+    KRAKEN_PAIRS,
     CoinbaseSpotClient,
     CoinGeckoSpotClient,
+    KrakenSpotClient,
     SpotOHLC,
     interval_seconds_for_frequency,
     load_coinbase_cdp_credentials,
@@ -101,7 +104,17 @@ CRYPTO_LAST_MINUTE_PASSIVE_REASON = "last_minute_passive_market_confidence"
 CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER = {
     "coinbase": 5,
     "coingecko": 90,
+    # Kraken rows are completed OHLC candles (collected at 15m cadence), so a
+    # fresh row can legitimately trail "now" by up to one interval.
+    "kraken": 960,
 }
+# Preferred provider order when multiple venues report the same spot period.
+CRYPTO_SPOT_PROVIDER_PREFERENCE = {
+    "coinbase": 0,
+    "kraken": 1,
+    "coingecko": 2,
+}
+CRYPTO_ORDER_BOOK_TOP_LEVELS = 5
 CRYPTO_SPOT_CONTEXT_HISTORICAL = "historical"
 CRYPTO_SPOT_CONTEXT_LIVE = "live"
 CRYPTO_MODEL_CANDIDATE_NAMES = (
@@ -1514,6 +1527,67 @@ class CryptoMarketService:
         return snapshot is not None
 
 
+def _crypto_order_book_levels(raw: Any) -> list[tuple[Decimal, Decimal]]:
+    levels: list[tuple[Decimal, Decimal]] = []
+    if not isinstance(raw, list):
+        return levels
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            price_cents = Decimal(str(item[0]))
+            count = Decimal(str(item[1]))
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        levels.append((price_cents, count))
+    return levels
+
+
+def _crypto_order_book_depth_metrics(
+    orderbook: Any,
+    *,
+    top_levels: int = CRYPTO_ORDER_BOOK_TOP_LEVELS,
+) -> dict[str, Any]:
+    """Summarize a Kalshi order book from the YES-side perspective.
+
+    Kalshi returns resting YES bids under ``yes`` and resting NO bids under
+    ``no``; a NO bid at price ``p`` cents is a YES ask at ``100 - p`` cents.
+    Depths are contract counts summed over the top ``top_levels`` levels of
+    each side; depth_imbalance is None when both sides are empty.
+    """
+    yes_levels = _crypto_order_book_levels(orderbook.get("yes") if isinstance(orderbook, dict) else None)
+    no_levels = _crypto_order_book_levels(orderbook.get("no") if isinstance(orderbook, dict) else None)
+    yes_levels.sort(key=lambda level: level[0], reverse=True)
+    no_levels.sort(key=lambda level: level[0], reverse=True)
+    best_bid = yes_levels[0][0] / Decimal("100") if yes_levels else None
+    best_ask = (Decimal("100") - no_levels[0][0]) / Decimal("100") if no_levels else None
+    mid = (best_bid + best_ask) / Decimal("2") if best_bid is not None and best_ask is not None else None
+    spread_bps = (
+        int(((best_ask - best_bid) * Decimal("10000")).to_integral_value())
+        if best_bid is not None and best_ask is not None
+        else None
+    )
+    bid_depth = sum((count for _price, count in yes_levels[:top_levels]), Decimal("0"))
+    ask_depth = sum((count for _price, count in no_levels[:top_levels]), Decimal("0"))
+    total_depth = bid_depth + ask_depth
+    depth_imbalance = (
+        ((bid_depth - ask_depth) / total_depth).quantize(Decimal("0.00000001"))
+        if total_depth > 0
+        else None
+    )
+    return {
+        "best_bid_dollars": best_bid,
+        "best_ask_dollars": best_ask,
+        "mid_dollars": mid,
+        "spread_bps": spread_bps,
+        "bid_depth": bid_depth,
+        "ask_depth": ask_depth,
+        "depth_imbalance": depth_imbalance,
+    }
+
+
 class CryptoHistoryService:
     def __init__(
         self,
@@ -1527,6 +1601,7 @@ class CryptoHistoryService:
         self.session_factory = session_factory
         self.kalshi = kalshi
         self.market_service = market_service
+        self._order_book_last_fetch_monotonic: dict[str, float] = {}
 
     async def bootstrap(
         self,
@@ -1914,6 +1989,8 @@ class CryptoHistoryService:
         if requested_assets:
             markets = [market for market in markets if normalize_asset_symbol(market.asset_symbol) in requested_assets]
         stored = 0
+        order_books_stored = 0
+        order_book_errors: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         asset_counts: Counter[str] = Counter()
         async with self.session_factory() as session:
@@ -1937,6 +2014,22 @@ class CryptoHistoryService:
                         }
                     )
                     continue
+                order_book_status = await self._maybe_capture_order_book(
+                    repo,
+                    market,
+                    frequency=freq,
+                    observed_at=observed_at,
+                )
+                if order_book_status == "stored":
+                    order_books_stored += 1
+                elif order_book_status.startswith("error"):
+                    order_book_errors.append(
+                        {
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "error": order_book_status,
+                        }
+                    )
                 if market.yes_bid_dollars is None or market.yes_ask_dollars is None:
                     skipped.append(
                         {
@@ -1971,11 +2064,70 @@ class CryptoHistoryService:
             "observed_at": observed_at.isoformat(),
             "checked_markets": len(markets),
             "stored_real_quote_snapshots": stored,
+            "stored_order_book_snapshots": order_books_stored,
+            "order_book_errors": order_book_errors[:20],
             "skipped_count": len(skipped),
             "skipped": skipped[:20],
             "asset_counts": dict(sorted(asset_counts.items())),
             "recent_quote_evidence": _crypto_quote_evidence_summary(recent_snapshots, [], settings=self.settings),
         }
+
+    async def _maybe_capture_order_book(
+        self,
+        repo: PlatformRepository,
+        market: CryptoMarket,
+        *,
+        frequency: str,
+        observed_at: datetime,
+    ) -> str:
+        """Capture a REST order-book snapshot for an open market, throttled per market."""
+        if not self.settings.crypto_orderbook_collect_enabled:
+            return "disabled"
+        interval = max(0, int(self.settings.crypto_orderbook_collect_interval_seconds))
+        now_monotonic = time.monotonic()
+        last_fetch = self._order_book_last_fetch_monotonic.get(market.market_ticker)
+        if last_fetch is not None and now_monotonic - last_fetch < interval:
+            return "throttled"
+        self._order_book_last_fetch_monotonic[market.market_ticker] = now_monotonic
+        if len(self._order_book_last_fetch_monotonic) > 1024:
+            cutoff = now_monotonic - 3600.0
+            self._order_book_last_fetch_monotonic = {
+                ticker: fetched_at
+                for ticker, fetched_at in self._order_book_last_fetch_monotonic.items()
+                if fetched_at >= cutoff
+            }
+        try:
+            response = await self.kalshi.get_market_orderbook(market.market_ticker)
+        except Exception as exc:
+            logger.warning(
+                "crypto order book fetch failed",
+                extra={"market_ticker": market.market_ticker, "error": str(exc)},
+            )
+            return f"error: {exc}"
+        orderbook = response.get("orderbook") if isinstance(response, dict) else None
+        metrics = _crypto_order_book_depth_metrics(orderbook, top_levels=CRYPTO_ORDER_BOOK_TOP_LEVELS)
+        await repo.upsert_crypto_order_book_snapshot(
+            kalshi_env=self.settings.kalshi_env,
+            provider="kalshi",
+            asset_symbol=market.asset_symbol,
+            frequency=frequency,
+            market_ticker=market.market_ticker,
+            source_kind="rest_orderbook",
+            source_id=market.market_ticker,
+            observed_at=observed_at,
+            best_bid_dollars=metrics["best_bid_dollars"],
+            best_ask_dollars=metrics["best_ask_dollars"],
+            mid_dollars=metrics["mid_dollars"],
+            spread_bps=metrics["spread_bps"],
+            bid_depth=metrics["bid_depth"],
+            ask_depth=metrics["ask_depth"],
+            depth_imbalance=metrics["depth_imbalance"],
+            payload={
+                "orderbook": orderbook if isinstance(orderbook, dict) else {},
+                "top_levels": CRYPTO_ORDER_BOOK_TOP_LEVELS,
+            },
+        )
+        return "stored"
 
     async def status(
         self,
@@ -2299,6 +2451,39 @@ class CryptoSpotService:
             credentials=credentials,
         )
 
+    def _kraken_client(self) -> KrakenSpotClient | None:
+        if not self.settings.crypto_spot_kraken_enabled:
+            return None
+        return KrakenSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+
+    async def _collect_kraken_rows(
+        self,
+        repo: PlatformRepository,
+        kraken: KrakenSpotClient | None,
+        asset: str,
+        *,
+        frequency: str,
+        interval_seconds: int,
+        start: datetime,
+        end: datetime,
+        provider_stats: dict[str, dict[str, Any]],
+    ) -> int:
+        """Additive secondary venue; Kraken failures never affect the Coinbase path."""
+        if kraken is None or not KRAKEN_PAIRS.get(asset):
+            return 0
+        try:
+            rows = await kraken.fetch_ohlc(asset, start=start, end=end, interval_seconds=interval_seconds)
+            if not rows:
+                return 0
+            stored = await self._store_rows(repo, rows, frequency=frequency, interval_seconds=interval_seconds)
+        except Exception as exc:
+            logger.debug("kraken spot collection failed", extra={"asset_symbol": asset, "error": str(exc)})
+            provider_stats["kraken"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+            return 0
+        provider_stats["kraken"]["stored"] += stored
+        provider_stats["kraken"]["assets"].append(asset)
+        return stored
+
     async def coinbase_products(
         self,
         *,
@@ -2345,6 +2530,9 @@ class CryptoSpotService:
         coinbase = self._coinbase_client()
         proxy_fallback_enabled = bool(self.settings.crypto_spot_proxy_fallback_enabled)
         coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds) if proxy_fallback_enabled else None
+        kraken = self._kraken_client()
+        kraken_interval_seconds = interval_seconds_for_frequency(freq)
+        kraken_window_end = datetime.now(UTC)
         try:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -2363,6 +2551,16 @@ class CryptoSpotService:
                             row = await coingecko.fetch_current(asset)
                         except Exception as exc:
                             provider_stats["coingecko"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+                    stored_total += await self._collect_kraken_rows(
+                        repo,
+                        kraken,
+                        asset,
+                        frequency=freq,
+                        interval_seconds=kraken_interval_seconds,
+                        start=kraken_window_end - timedelta(seconds=kraken_interval_seconds * 3),
+                        end=kraken_window_end,
+                        provider_stats=provider_stats,
+                    )
                     if row is None:
                         provider_stats["none"]["errors"].append(
                             {
@@ -2390,6 +2588,8 @@ class CryptoSpotService:
             await coinbase.aclose()
             if coingecko is not None:
                 await coingecko.aclose()
+            if kraken is not None:
+                await kraken.aclose()
         return {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
@@ -2397,6 +2597,7 @@ class CryptoSpotService:
             "asset_symbols": assets,
             "stored": stored_total,
             "proxy_fallback_enabled": proxy_fallback_enabled,
+            "kraken_enabled": kraken is not None,
             "providers": {key: {**value, "error_count": len(value["errors"])} for key, value in provider_stats.items()},
             "spot_quality": _crypto_spot_quality(
                 spot_rows,
@@ -2424,6 +2625,7 @@ class CryptoSpotService:
         coinbase = self._coinbase_client()
         proxy_fallback_enabled = bool(self.settings.crypto_spot_proxy_fallback_enabled)
         coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds) if proxy_fallback_enabled else None
+        kraken = self._kraken_client()
         try:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -2452,6 +2654,16 @@ class CryptoSpotService:
                             )
                         except Exception as exc:
                             provider_stats["coingecko"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+                    stored_total += await self._collect_kraken_rows(
+                        repo,
+                        kraken,
+                        asset,
+                        frequency=freq,
+                        interval_seconds=interval_seconds,
+                        start=start,
+                        end=end,
+                        provider_stats=provider_stats,
+                    )
                     if not rows:
                         provider_stats["none"]["errors"].append(
                             {
@@ -2480,6 +2692,8 @@ class CryptoSpotService:
             await coinbase.aclose()
             if coingecko is not None:
                 await coingecko.aclose()
+            if kraken is not None:
+                await kraken.aclose()
         return {
             "status": "ok",
             "kalshi_env": self.settings.kalshi_env,
@@ -2488,6 +2702,7 @@ class CryptoSpotService:
             "asset_symbols": assets,
             "stored": stored_total,
             "proxy_fallback_enabled": proxy_fallback_enabled,
+            "kraken_enabled": kraken is not None,
             "providers": {key: {**value, "error_count": len(value["errors"])} for key, value in provider_stats.items()},
             "spot_quality": _crypto_spot_quality(
                 spot_rows,
@@ -8593,7 +8808,7 @@ def _crypto_spot_is_proxy(provider: str | None, source_kind: str | None) -> bool
     source_key = str(source_kind or "").strip().lower()
     if not provider_key and not source_key:
         return False
-    if provider_key == "coinbase" and source_key in {"spot_ohlc", "spot_tick"}:
+    if provider_key in {"coinbase", "kraken"} and source_key in {"spot_ohlc", "spot_tick"}:
         return False
     return source_key not in {"spot_ohlc", "spot_tick"} or provider_key == "coingecko"
 
@@ -8604,6 +8819,37 @@ def _crypto_expected_spot_assets(settings: Settings, *, observed_assets: set[str
     if settings.crypto_spot_proxy_fallback_enabled:
         assets.update(COINGECKO_IDS)
     return sorted(assets)
+
+
+def _dedup_spot_rows_by_provider_preference(rows: list[CryptoSpotOHLCRecord]) -> list[CryptoSpotOHLCRecord]:
+    """Collapse same-period rows from multiple venues to a single preferred row.
+
+    Momentum/return features treat consecutive rows as distinct periods, so
+    interleaved duplicate timestamps from a second provider would corrupt them.
+    Rows sharing (end_ts rounded to the second, interval_seconds) keep the
+    preferred provider: coinbase > kraken > coingecko. Input ordering is
+    preserved (first occurrence position wins).
+    """
+    if len(rows) < 2:
+        return list(rows)
+    default_rank = len(CRYPTO_SPOT_PROVIDER_PREFERENCE)
+    best_by_key: dict[tuple[int, Any], tuple[int, CryptoSpotOHLCRecord]] = {}
+    keys_in_order: list[tuple[int, Any]] = []
+    for row in rows:
+        key = (
+            int(_as_utc_datetime(row.end_ts).timestamp()),
+            getattr(row, "interval_seconds", None),
+        )
+        rank = CRYPTO_SPOT_PROVIDER_PREFERENCE.get(str(row.provider or "").strip().lower(), default_rank)
+        existing = best_by_key.get(key)
+        if existing is None:
+            keys_in_order.append(key)
+            best_by_key[key] = (rank, row)
+        elif rank < existing[0]:
+            best_by_key[key] = (rank, row)
+    if len(keys_in_order) == len(rows):
+        return list(rows)
+    return [best_by_key[key][1] for key in keys_in_order]
 
 
 def _spot_context_for_decision(
@@ -8625,6 +8871,7 @@ def _spot_context_for_decision(
             for row in spot_rows
             if _as_utc_datetime(row.end_ts) <= decision_utc and row.close_dollars is not None
         ]
+    eligible = _dedup_spot_rows_by_provider_preference(eligible)
     if not eligible:
         return {
             "spot_feature_status": "missing",
