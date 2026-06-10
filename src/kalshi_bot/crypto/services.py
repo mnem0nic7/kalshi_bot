@@ -34,6 +34,7 @@ from kalshi_bot.core.enums import (
 )
 from kalshi_bot.core.fixed_point import make_client_order_id, quantize_count, quantize_price
 from kalshi_bot.core.schemas import ExecReceiptPayload, RoomCreate, RoomMessageCreate, TradeEligibilityVerdict, TradeTicket
+from kalshi_bot.crypto.edge_shrinkage import EDGE_SHRINKAGE_STATUS_OK, fit_edge_shrinkage
 from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 from kalshi_bot.crypto.parsing import (
     normalize_candlestick,
@@ -98,6 +99,7 @@ CRYPTO_SETTLEMENT_PROXY_REASON_CODE = "crypto_settlement_proxy_for_cfb_rti"
 CRYPTO_ORDER_MODE_PASSIVE_ONLY = "passive_only"
 CRYPTO_ORDER_MODE_PASSIVE_THEN_TAKER = "passive_then_taker"
 CRYPTO_LAST_MINUTE_PASSIVE_REASON = "last_minute_passive_market_confidence"
+CRYPTO_EDGE_SHRINKAGE_NOTE_PREFIX = "crypto_edge_shrinkage"
 CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER = {
     "coinbase": 5,
     "coingecko": 90,
@@ -3403,6 +3405,55 @@ class CryptoForecastService:
             "payload": artifact_payload,
         }
 
+    async def refresh_edge_shrinkage(self, *, frequency: str = "15m") -> dict[str, Any]:
+        """Refit predicted-edge -> realized-P&L shrinkage from recent live fills.
+
+        Stores the fit in deployment-control notes under
+        ``crypto_edge_shrinkage:{frequency}`` so decision-time candidate
+        generation can discount predicted edges (runtime data, not config).
+        """
+        freq = normalize_frequency(frequency) or "15m"
+        note_key = crypto_edge_shrinkage_note_key(freq)
+        if not self.settings.crypto_edge_shrinkage_enabled:
+            return {"status": "disabled", "frequency": freq, "note_key": note_key}
+        lookback_days = max(1, int(self.settings.crypto_edge_shrinkage_lookback_days))
+        since = datetime.now(UTC) - timedelta(days=lookback_days)
+        strategy_code = crypto_strategy_code_for_frequency(freq)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            observations = await repo.list_crypto_edge_shrinkage_fill_observations(
+                strategy_codes=[strategy_code],
+                since=since,
+                kalshi_env=self.settings.kalshi_env,
+            )
+            fit = fit_edge_shrinkage(
+                observations,
+                beta_floor=float(self.settings.crypto_edge_shrinkage_beta_floor),
+            )
+            note_value = {
+                **fit,
+                "frequency": freq,
+                "strategy_code": strategy_code,
+                "lookback_days": lookback_days,
+                "kalshi_env": self.settings.kalshi_env,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            await repo.update_deployment_note_key(
+                note_key,
+                lambda _previous: note_value,
+                kalshi_env=self.settings.kalshi_env,
+            )
+            await session.commit()
+        logger.info(
+            "crypto edge shrinkage refreshed: frequency=%s beta=%s raw_beta=%s sample_count=%s status=%s",
+            freq,
+            note_value["beta"],
+            note_value["raw_beta"],
+            note_value["sample_count"],
+            note_value["status"],
+        )
+        return {**note_value, "note_key": note_key}
+
     async def candidates(
         self,
         *,
@@ -3588,6 +3639,11 @@ class CryptoForecastService:
                 settings=self.settings,
                 session_factory=self.session_factory,
             ).modes_from_notes(getattr(control, "notes", None))
+            edge_shrinkage = _crypto_edge_shrinkage_from_notes(
+                getattr(control, "notes", None),
+                frequency=market.frequency,
+                settings=self.settings,
+            )
             await session.commit()
         crypto_policy = _runtime_crypto_policy_with_asset_modes(
             crypto_policy,
@@ -3682,6 +3738,7 @@ class CryptoForecastService:
             last_minute_passive_price_matrix=last_minute_passive_price_matrix,
             enforce_empirical_bucket_gate=True,
             touch_replay_gate=touch_gate,
+            edge_shrinkage=edge_shrinkage,
         )
         entry_policy = crypto_policy.entry_for_asset(market.asset_symbol, frequency=market.frequency)
         runtime_trading_enabled = self.settings.crypto_trading_enabled or crypto_policy.trading_enabled
@@ -3770,6 +3827,8 @@ class CryptoForecastService:
                     ),
                     "candidate_status": trace.get("candidate_status"),
                     "expected_net_edge": trace.get("expected_net_edge"),
+                    "edge_shrinkage": trace.get("edge_shrinkage"),
+                    "shrunk_edge_bps": trace.get("shrunk_edge_bps"),
                     "rank": trace.get("rank"),
                     "bucket_key": trace.get("bucket_key"),
                     "empirical_bucket_gate": trace.get("empirical_bucket_gate"),
@@ -5457,6 +5516,36 @@ class CryptoWorkflowService:
                     signal=signal,
                     context=risk_context,
                 )
+                fee_to_edge_review = (
+                    sizing_diagnostics.get("fee_to_edge") if isinstance(sizing_diagnostics, dict) else None
+                )
+                if isinstance(fee_to_edge_review, dict) and fee_to_edge_review.get("status") == "blocked_fee_ratio":
+                    await repo.update_room_stage(room.id, RoomStage.COMPLETE)
+                    await repo.append_message(
+                        room.id,
+                        RoomMessageCreate(
+                            role=AgentRole.SYSTEM,
+                            kind=MessageKind.OBSERVATION,
+                            stage=RoomStage.COMPLETE,
+                            content=(
+                                "Rounded-up Kalshi fee consumes too much of the expected edge at every "
+                                "permitted order size; no trade ticket created."
+                            ),
+                            payload={
+                                "market_domain": "crypto",
+                                "frequency": market.frequency,
+                                "strategy_code": strategy_code,
+                                "market_ticker": market.market_ticker,
+                                "reason": "blocked_fee_ratio",
+                                "skip_reason": "blocked_fee_ratio",
+                                "fee_to_edge": fee_to_edge_review,
+                                "crypto_dynamic_sizing": sizing_diagnostics,
+                                "no_order_submitted": True,
+                            },
+                        ),
+                    )
+                    await session.commit()
+                    return
                 ticket = base_ticket.model_copy(update={"count_fp": count_fp})
                 client_order_id = make_client_order_id(room.id, market.market_ticker, ticket.nonce)
                 decision_lineage = _crypto_decision_lineage_payload(
@@ -7285,6 +7374,7 @@ def _crypto_recommendation(
     last_minute_passive_price_matrix: list[dict[str, Any]] | None = None,
     enforce_empirical_bucket_gate: bool = False,
     touch_replay_gate: Any | None = None,
+    edge_shrinkage: dict[str, Any] | None = None,
 ) -> tuple[TradeAction | None, ContractSide | None, Decimal | None, int, dict[str, Any]]:
     row = row or _crypto_live_market_row(market, settings=settings)
     btc_1h_touch_configured = _crypto_btc_1h_touch_policy_configured_for_row(row, settings=settings)
@@ -7425,6 +7515,7 @@ def _crypto_recommendation(
         empirical_bucket_matrix=empirical_bucket_matrix,
         last_minute_passive_price_matrix=last_minute_passive_price_matrix,
         enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
+        edge_shrinkage=edge_shrinkage,
     )
     entry_policy = _crypto_entry_policy_for_row(row, settings=settings, crypto_policy=crypto_policy)
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
@@ -7480,6 +7571,8 @@ def _crypto_recommendation(
         "selection_reason": selected.get("reason"),
         "pre_empirical_selection_reason": selected.get("pre_empirical_reason"),
         "expected_net_edge": selected.get("expected_net_edge"),
+        "edge_shrinkage": selected.get("edge_shrinkage"),
+        "shrunk_edge_bps": selected.get("shrunk_edge_bps"),
         "late_high_confidence_directional_entry": selected.get("late_high_confidence_directional_entry") is True,
         "last_minute_passive_market_confidence": selected.get("last_minute_passive_market_confidence") is True,
         "last_minute_passive": selected.get("last_minute_passive"),
@@ -7597,6 +7690,128 @@ def _crypto_ticket_unit_cost(ticket: TradeTicket) -> Decimal:
     return Decimal("1.0000") - ticket.yes_price_dollars
 
 
+def _crypto_signal_edge_per_contract_dollars(
+    signal: StrategySignal,
+    *,
+    unit_cost: Decimal,
+    settings: Settings,
+) -> tuple[Decimal | None, str]:
+    """Per-contract expected gross edge dollars for the selected candidate.
+
+    Prefers the shrunk edge when an edge-shrinkage review is recorded on the
+    candidate trace; otherwise reconstructs the raw edge as
+    ``expected_net_edge + single-contract taker fee``.
+    """
+    trace = signal.candidate_trace if isinstance(signal.candidate_trace, dict) else {}
+    selection = trace.get("trade_selection_model") if isinstance(trace.get("trade_selection_model"), dict) else {}
+    shrinkage = selection.get("edge_shrinkage")
+    if not isinstance(shrinkage, dict):
+        shrinkage = trace.get("edge_shrinkage")
+    if isinstance(shrinkage, dict) and shrinkage.get("enforced") is True and shrinkage.get("shrunk_edge_dollars") not in (None, ""):
+        try:
+            return Decimal(str(shrinkage["shrunk_edge_dollars"])), "shrunk_edge"
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+    raw_net = selection.get("expected_net_edge")
+    if raw_net in (None, ""):
+        raw_net = trace.get("expected_net_edge")
+    if raw_net in (None, ""):
+        return None, "missing"
+    try:
+        net_edge = Decimal(str(raw_net))
+    except (ArithmeticError, TypeError, ValueError):
+        return None, "invalid"
+    if unit_cost <= Decimal("0") or unit_cost >= Decimal("1"):
+        return None, "invalid_unit_cost"
+    single_contract_fee = estimate_kalshi_taker_fee_dollars(
+        price_dollars=unit_cost,
+        count=Decimal("1.00"),
+        fee_rate=Decimal(str(settings.kalshi_taker_fee_rate)),
+    )
+    return net_edge + single_contract_fee, "raw_edge"
+
+
+def _crypto_fee_to_edge_review(
+    *,
+    settings: Settings,
+    unit_cost: Decimal,
+    edge_per_contract_dollars: Decimal | None,
+    edge_source: str,
+    count_fp: Decimal,
+    max_count_fp: Decimal,
+) -> tuple[Decimal, dict[str, Any]]:
+    """Enforce a maximum (rounded-up taker fee) / (expected gross edge) ratio.
+
+    The cent ceiling on Kalshi fees is brutal at 1-2 contract sizes, so the
+    floor first tries to amortize the rounded-up fee by growing the count
+    toward ``max_count_fp``; if the caps prevent reaching the ratio the
+    candidate is blocked with ``blocked_fee_ratio``.
+    """
+    max_ratio = Decimal(str(settings.crypto_max_fee_to_edge_ratio))
+    review: dict[str, Any] = {
+        "status": "ok",
+        "max_ratio": float(max_ratio),
+        "edge_source": edge_source,
+        "edge_per_contract_dollars": _money_text(edge_per_contract_dollars),
+        "initial_count_fp": _count_text(count_fp),
+        "final_count_fp": _count_text(count_fp),
+        "max_count_fp": _count_text(max_count_fp),
+        "fee_dollars": None,
+        "edge_dollars": None,
+        "ratio": None,
+    }
+    if max_ratio <= Decimal("0"):
+        review["status"] = "skipped_disabled"
+        return count_fp, review
+    if edge_per_contract_dollars is None or edge_per_contract_dollars <= Decimal("0"):
+        review["status"] = "skipped_no_positive_edge"
+        return count_fp, review
+    if unit_cost <= Decimal("0") or unit_cost >= Decimal("1") or count_fp <= Decimal("0"):
+        review["status"] = "skipped_unpriceable"
+        return count_fp, review
+    fee_rate = Decimal(str(settings.kalshi_taker_fee_rate))
+
+    def fee_at(count_value: Decimal) -> Decimal:
+        return estimate_kalshi_taker_fee_dollars(
+            price_dollars=unit_cost,
+            count=count_value,
+            fee_rate=fee_rate,
+        )
+
+    def ratio_ok(count_value: Decimal) -> bool:
+        return fee_at(count_value) <= max_ratio * edge_per_contract_dollars * count_value
+
+    def record(count_value: Decimal, status: str) -> tuple[Decimal, dict[str, Any]]:
+        fee = fee_at(count_value)
+        edge_dollars = (edge_per_contract_dollars * count_value).quantize(Decimal("0.0001"))
+        review.update(
+            {
+                "status": status,
+                "final_count_fp": _count_text(count_value),
+                "fee_dollars": _money_text(fee),
+                "edge_dollars": _money_text(edge_dollars),
+                "ratio": float(fee / edge_dollars) if edge_dollars > 0 else None,
+            }
+        )
+        return count_value, review
+
+    if ratio_ok(count_fp):
+        return record(count_fp, "ok")
+    ceiling = max(count_fp, _floor_count_fp(max_count_fp))
+    candidate = count_fp
+    for _ in range(10_000):
+        next_candidate = min(ceiling, _floor_count_fp(candidate) + Decimal("1.00"))
+        if next_candidate <= candidate:
+            break
+        candidate = next_candidate
+        if ratio_ok(candidate):
+            return record(candidate, "adjusted")
+    if candidate > count_fp and ratio_ok(candidate):
+        return record(candidate, "adjusted")
+    blocked_count, blocked_review = record(count_fp, "blocked_fee_ratio")
+    return blocked_count, blocked_review
+
+
 def _floor_count_fp(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
@@ -7711,12 +7926,44 @@ def _crypto_dynamic_order_count_fp(
         "remaining_position_count_fp": _count_text(remaining_position_count),
         "raw_count_fp": None,
         "capped_count_fp": None,
+        "fee_to_edge": None,
     }
+
+    edge_per_contract, edge_source = _crypto_signal_edge_per_contract_dollars(
+        signal,
+        unit_cost=unit_cost,
+        settings=settings,
+    )
+
+    def apply_fee_to_edge_floor(count_value: Decimal, *, budget_cap_fp: Decimal | None = None) -> Decimal:
+        if candidate_status != CRYPTO_LIVE_QUALITY:
+            diagnostics["fee_to_edge"] = {
+                "status": "skipped_not_live_quality",
+                "candidate_status": candidate_status,
+            }
+            return count_value
+        cap_values = [_floor_count_fp(max_order_count), _floor_count_fp(max(Decimal("0"), remaining_position_count))]
+        if late_override_cap is not None and late_override_cap > Decimal("0"):
+            cap_values.append(_floor_count_fp(late_override_cap))
+        if budget_cap_fp is not None:
+            cap_values.append(_floor_count_fp(budget_cap_fp))
+        final_count, review = _crypto_fee_to_edge_review(
+            settings=settings,
+            unit_cost=unit_cost,
+            edge_per_contract_dollars=edge_per_contract,
+            edge_source=edge_source,
+            count_fp=count_value,
+            max_count_fp=min(cap_values),
+        )
+        diagnostics["fee_to_edge"] = review
+        if review["status"] == "adjusted":
+            diagnostics["requested_count_fp"] = _count_text(final_count)
+        return final_count
 
     def use_default(reason: str) -> tuple[Decimal, dict[str, Any]]:
         diagnostics["reason"] = reason
         diagnostics["requested_count_fp"] = _count_text(default_count)
-        return default_count, diagnostics
+        return apply_fee_to_edge_floor(default_count), diagnostics
 
     if not settings.crypto_dynamic_order_sizing_enabled:
         return use_default("dynamic_sizing_disabled")
@@ -7759,6 +8006,7 @@ def _crypto_dynamic_order_count_fp(
     diagnostics["mode"] = "dynamic"
     diagnostics["reason"] = "target_position_budget"
     diagnostics["requested_count_fp"] = _count_text(requested_count)
+    requested_count = quantize_count(apply_fee_to_edge_floor(requested_count, budget_cap_fp=raw_count))
     return requested_count, diagnostics
 
 
@@ -11805,6 +12053,7 @@ def _evaluate_crypto_walk_forward(
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
                 "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
                 "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
+                **_crypto_passive_replay_metrics([], rows),
             }
         )
         empty_metrics = _crypto_apply_empirical_bucket_gate_to_replay_metrics(
@@ -11983,6 +12232,7 @@ def _evaluate_crypto_walk_forward(
     _bucket_trades = model_candidate_trades_by_name.get(_winning_policy_name or "") or calibrated_trades
     bucket_matrix = _crypto_bucket_matrix(_bucket_trades, settings=settings)
     bucket_diagnostics = _crypto_bucket_diagnostics(selection_trades)
+    passive_replay_metrics = _crypto_passive_replay_metrics(selection_trades, rows)
     oos_by_asset: dict[str, int] = {}
     for _trade in selection_trades:
         _asset = str(_trade.get("asset_symbol") or "unknown")
@@ -12052,6 +12302,7 @@ def _evaluate_crypto_walk_forward(
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
                 "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
                 "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
+                **passive_replay_metrics,
                 "oos_trade_candidate_count_by_asset": oos_by_asset,
                 "per_asset_metrics": {
                     asset: {"oos_trade_candidate_count": count}
@@ -12175,6 +12426,84 @@ def _crypto_entry_policy_for_row(
         "min_remaining_payout_bps": CRYPTO_MIN_REMAINING_PAYOUT_BPS,
         "max_credible_edge_bps": int(settings.risk_max_credible_edge_bps),
     }
+
+
+def crypto_edge_shrinkage_note_key(frequency: object) -> str:
+    normalized = normalize_frequency(frequency) or "15m"
+    return f"{CRYPTO_EDGE_SHRINKAGE_NOTE_PREFIX}:{normalized}"
+
+
+def _crypto_edge_shrinkage_from_notes(
+    notes: dict[str, Any] | None,
+    *,
+    frequency: object,
+    settings: Settings,
+) -> dict[str, Any] | None:
+    if not settings.crypto_edge_shrinkage_enabled:
+        return None
+    if not isinstance(notes, dict):
+        return None
+    value = notes.get(crypto_edge_shrinkage_note_key(frequency))
+    return value if isinstance(value, dict) and value else None
+
+
+def _crypto_edge_shrinkage_review(
+    *,
+    raw_edge: Decimal,
+    fee: Decimal,
+    edge_shrinkage: dict[str, Any] | None,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Discount a candidate's raw edge by the fitted shrinkage beta.
+
+    Diagnostics are always recorded when a shrinkage fit is available; the
+    block flag only fires when enforcement is enabled, the fit status is ok,
+    and the fit has enough live fills behind it.
+    """
+    review: dict[str, Any] = {
+        "available": False,
+        "enforced": False,
+        "blocked": False,
+        "beta": None,
+        "fit_status": None,
+        "sample_count": 0,
+        "shrunk_edge_dollars": None,
+        "shrunk_edge_bps": None,
+        "shrunk_net_edge_dollars": None,
+    }
+    if not isinstance(edge_shrinkage, dict) or not edge_shrinkage:
+        return review
+    try:
+        beta = Decimal(str(edge_shrinkage.get("beta")))
+    except (ArithmeticError, TypeError, ValueError):
+        return review
+    fit_status = str(edge_shrinkage.get("status") or "")
+    try:
+        sample_count = int(edge_shrinkage.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        sample_count = 0
+    shrunk_edge = (raw_edge * beta).quantize(Decimal("0.0001"))
+    shrunk_net_edge = shrunk_edge - fee
+    review.update(
+        {
+            "available": True,
+            "beta": float(beta),
+            "fit_status": fit_status,
+            "sample_count": sample_count,
+            "shrunk_edge_dollars": str(shrunk_edge),
+            "shrunk_edge_bps": int((shrunk_edge * Decimal("10000")).to_integral_value()),
+            "shrunk_net_edge_dollars": str(shrunk_net_edge.quantize(Decimal("0.0001"))),
+        }
+    )
+    enforced = (
+        bool(settings.crypto_edge_shrinkage_enforce)
+        and fit_status == EDGE_SHRINKAGE_STATUS_OK
+        and sample_count >= int(settings.crypto_edge_shrinkage_min_fills)
+    )
+    review["enforced"] = enforced
+    if enforced and shrunk_net_edge <= Decimal("0"):
+        review["blocked"] = True
+    return review
 
 
 def _optional_int(value: Any) -> int | None:
@@ -13307,6 +13636,7 @@ def _crypto_trade_candidates(
     enforce_empirical_bucket_gate: bool = False,
     empirical_bucket_requested_assets: list[str] | None = None,
     force_empirical_bucket_for_requested_assets: bool = False,
+    edge_shrinkage: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     settlement_diagnostics = _crypto_settlement_diagnostics(row)
@@ -13527,6 +13857,19 @@ def _crypto_trade_candidates(
             status = "blocked"
             candidate_status = "blocked_max_entry_price"
             reason = "contract_price_above_crypto_max_entry"
+        edge_shrinkage_review = _crypto_edge_shrinkage_review(
+            raw_edge=expected_net_edge + fee,
+            fee=fee,
+            edge_shrinkage=edge_shrinkage,
+            settings=settings,
+        )
+        if (
+            edge_shrinkage_review.get("blocked") is True
+            and candidate_status in {CRYPTO_LIVE_QUALITY, CRYPTO_EXPLORATORY_SHADOW}
+        ):
+            status = "blocked"
+            candidate_status = "blocked_shrunk_edge"
+            reason = "shrunk_fee_adjusted_edge_not_positive"
         bucket_key = _crypto_bucket_key(row, {"side": side, "execution_price_dollars": _money_text(execution_cost)})
         pre_empirical_status = candidate_status
         pre_empirical_reason = reason
@@ -13584,6 +13927,8 @@ def _crypto_trade_candidates(
                 "model_winner": model_winner,
                 "raw_model_winner": raw_model_winner,
                 "expected_fee": str(fee.quantize(Decimal("0.0001"))),
+                "edge_shrinkage": edge_shrinkage_review,
+                "shrunk_edge_bps": edge_shrinkage_review.get("shrunk_edge_bps"),
                 "remaining_payout_dollars": str(remaining_payout.quantize(Decimal("0.0001"))),
                 "bucket_key": bucket_key,
                 "empirical_bucket_gate": empirical_bucket_gate,
@@ -13777,6 +14122,189 @@ def _crypto_touch_replay_first_touch(
         if bid >= target_exit_side_price:
             return future, bid
     return None
+
+
+def _crypto_passive_side_ask(row: dict[str, Any], side: str) -> Decimal | None:
+    """Side ask with a derived fallback: ask = 1 - opposite-side bid."""
+    ask = _crypto_side_ask(row, side)
+    if ask is not None:
+        return ask
+    opposite = "no" if str(side).lower() == "yes" else "yes"
+    opposite_bid = _crypto_side_bid(row, opposite)
+    if opposite_bid is None:
+        return None
+    return _clamp_price(Decimal("1.0000") - opposite_bid)
+
+
+def _crypto_passive_entry_limit_price(row: dict[str, Any], side: str) -> Decimal | None:
+    """Passive entry limit: the side's bid, else side mid minus one tick."""
+    bid = _crypto_side_bid(row, side)
+    if bid is not None:
+        return bid
+    side_mid = _crypto_market_side_probability(row, side)
+    if side_mid is None:
+        return None
+    return _clamp_price(side_mid - CRYPTO_PASSIVE_PRICE_TICK)
+
+
+def _crypto_passive_replay_first_fill(
+    future_rows: list[dict[str, Any]],
+    *,
+    side: str,
+    limit_price: Decimal,
+    decision_ts: datetime | None = None,
+    close_ts: datetime | None = None,
+) -> tuple[dict[str, Any], Decimal] | None:
+    """First later row where the market trades through the passive limit.
+
+    A resting buy at ``limit_price`` (in side terms) fills once a later
+    snapshot shows the side's ask at or below the limit. Rows outside the
+    ``decision_ts < t <= close_ts`` window are ignored.
+    """
+    for future in future_rows:
+        future_ts = future.get("decision_ts")
+        if decision_ts is not None or close_ts is not None:
+            if not isinstance(future_ts, datetime):
+                continue
+            if decision_ts is not None and future_ts <= decision_ts:
+                continue
+            if close_ts is not None and future_ts > close_ts:
+                continue
+        ask = _crypto_passive_side_ask(future, side)
+        if ask is None:
+            continue
+        if ask <= limit_price:
+            return future, ask
+    return None
+
+
+def _simulate_crypto_passive_trade(
+    row: dict[str, Any],
+    future_rows: list[dict[str, Any]],
+    selected: dict[str, Any],
+) -> dict[str, Any]:
+    """Passive-bid mirror of the taker settlement simulation.
+
+    Kalshi charges no maker fee, so passive fills are modeled fee-free; the
+    cost is adverse selection (orders fill mostly when the market moves
+    against the resting side), which this simulation surfaces.
+    """
+    side = str(selected.get("side") or "yes")
+    limit_price = _crypto_passive_entry_limit_price(row, side)
+    if limit_price is None:
+        return {
+            "status": "no_passive_price",
+            "side": side,
+            "filled": False,
+            "limit_price_dollars": None,
+            "fill_price_dollars": None,
+            "fill_decision_ts": None,
+            "gross_pnl": None,
+            "fees": None,
+            "net_pnl": None,
+        }
+    decision_ts = row.get("decision_ts") if isinstance(row.get("decision_ts"), datetime) else None
+    close_ts = row.get("settlement_ts") if isinstance(row.get("settlement_ts"), datetime) else None
+    filled = _crypto_passive_replay_first_fill(
+        future_rows,
+        side=side,
+        limit_price=limit_price,
+        decision_ts=decision_ts,
+        close_ts=close_ts,
+    )
+    result: dict[str, Any] = {
+        "status": "simulated",
+        "side": side,
+        "filled": filled is not None,
+        "limit_price_dollars": str(limit_price.quantize(Decimal("0.0001"))),
+        "fill_price_dollars": None,
+        "fill_decision_ts": None,
+        "gross_pnl": None,
+        "fees": None,
+        "net_pnl": None,
+    }
+    if filled is None:
+        return result
+    fill_row, fill_ask = filled
+    label_yes = int(row["label_yes"])
+    payoff = Decimal(label_yes) if side == "yes" else Decimal(1 - label_yes)
+    gross = payoff - limit_price
+    result.update(
+        {
+            "fill_price_dollars": str(fill_ask.quantize(Decimal("0.0001"))),
+            "fill_decision_ts": fill_row.get("decision_ts"),
+            "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
+            "fees": "0.0000",
+            "net_pnl": str(gross.quantize(Decimal("0.0001"))),
+        }
+    )
+    return result
+
+
+def _crypto_passive_replay_metrics(
+    selection_trades: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Adverse-selection-aware passive simulation across replay candidates.
+
+    For every taker-filled replay candidate, simulates resting a passive bid
+    at the candidate's bid (or mid minus one tick) and filling only when a
+    later snapshot of the same market trades through the limit before close.
+    Settlement P&L at the taker price is kept per candidate so filled vs
+    unfilled cohorts expose adverse selection.
+    """
+    rows_by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        rows_by_market[str(row.get("market_ticker") or "")].append(row)
+    for market_rows in rows_by_market.values():
+        market_rows.sort(key=lambda row: row.get("decision_ts") or datetime.max.replace(tzinfo=UTC))
+
+    eligible_count = 0
+    filled_count = 0
+    passive_net = Decimal("0")
+    taker_net = Decimal("0")
+    filled_taker_pnls: list[Decimal] = []
+    unfilled_taker_pnls: list[Decimal] = []
+    filled_passive_pnls: list[Decimal] = []
+    for trade in selection_trades:
+        simulation = trade.get("simulation") if isinstance(trade.get("simulation"), dict) else {}
+        taker_pnl = _decimal(simulation.get("net_pnl") or Decimal("0"))
+        taker_net += taker_pnl
+        market_rows = rows_by_market.get(str(trade.get("market_ticker") or ""), [])
+        decision_ts = trade.get("decision_ts")
+        future_rows = [
+            future
+            for future in market_rows
+            if isinstance(future.get("decision_ts"), datetime)
+            and isinstance(decision_ts, datetime)
+            and future["decision_ts"] > decision_ts
+        ]
+        passive = _simulate_crypto_passive_trade(trade, future_rows, simulation)
+        if passive["status"] != "simulated":
+            continue
+        eligible_count += 1
+        if passive["filled"]:
+            filled_count += 1
+            passive_pnl = _decimal(passive["net_pnl"])
+            passive_net += passive_pnl
+            filled_passive_pnls.append(passive_pnl)
+            filled_taker_pnls.append(taker_pnl)
+        else:
+            unfilled_taker_pnls.append(taker_pnl)
+
+    def _mean(values: list[Decimal]) -> float | None:
+        return float(sum(values, Decimal("0")) / Decimal(len(values))) if values else None
+
+    return {
+        "passive_eligible_candidate_count": eligible_count,
+        "passive_filled_candidate_count": filled_count,
+        "passive_fill_rate": _ratio(filled_count / eligible_count) if eligible_count else None,
+        "passive_net_simulated_pl_dollars": float(passive_net),
+        "passive_avg_pnl_filled": _mean(filled_passive_pnls),
+        "taker_vs_passive_pl_delta_dollars": float(taker_net - passive_net),
+        "passive_filled_avg_settlement_pnl": _mean(filled_taker_pnls),
+        "passive_unfilled_avg_settlement_pnl": _mean(unfilled_taker_pnls),
+    }
 
 
 def _simulate_crypto_touch_trade(

@@ -12,6 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from kalshi_bot.db.models import (
     CityAssignmentEventRecord,
     CityStrategyAssignment,
+    FillRecord,
     HistoricalReplayRunRecord,
     HistoricalSettlementLabelRecord,
     Signal,
@@ -790,3 +791,64 @@ class StrategyRepositoryMixin:
             record.finished_at = finished_at
         await self.session.flush()
         return records
+
+    async def list_crypto_edge_shrinkage_fill_observations(
+        self,
+        *,
+        strategy_codes: list[str],
+        since: datetime,
+        kalshi_env: str | None = None,
+    ) -> list[tuple[float, float]]:
+        """(predicted edge $, realized P&L $) pairs per contract, per buy fill.
+
+        Buy fills must carry ``decision_edge_bps``. Realized P&L follows the
+        same convention as ``get_strategy_city_fill_metrics_since``: average
+        matching sell price first, settlement result as the fallback exit.
+        Buys with neither a sell nor a settlement result are skipped.
+        """
+        if not strategy_codes:
+            return []
+        env = self._resolved_kalshi_env(kalshi_env)
+        stmt = select(FillRecord).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.created_at >= since,
+            FillRecord.strategy_code.in_(strategy_codes),
+        )
+        all_fills = list((await self.session.execute(stmt)).scalars())
+        buys: dict[tuple[str, str], list[FillRecord]] = {}
+        sells: dict[tuple[str, str], list[FillRecord]] = {}
+        for fill in all_fills:
+            key = (fill.market_ticker, fill.side)
+            if fill.action == "buy":
+                buys.setdefault(key, []).append(fill)
+            elif fill.action == "sell":
+                sells.setdefault(key, []).append(fill)
+
+        observations: list[tuple[float, float]] = []
+        for key, buy_fills in buys.items():
+            _ticker, side = key
+            sell_fills = sells.get(key, [])
+            avg_sell: float | None = None
+            if sell_fills:
+                sell_count = sum(float(s.count_fp) for s in sell_fills)
+                if sell_count > 0:
+                    avg_sell = sum(float(s.yes_price_dollars) * float(s.count_fp) for s in sell_fills) / sell_count
+            for buy_fill in buy_fills:
+                if buy_fill.decision_edge_bps is None:
+                    continue
+                buy_px = float(buy_fill.yes_price_dollars)
+                pnl_per_contract: float | None = None
+                if avg_sell is not None:
+                    pnl_per_contract = (avg_sell - buy_px) if side == "yes" else (buy_px - avg_sell)
+                elif buy_fill.settlement_result is not None:
+                    won_leg = buy_fill.settlement_result == "win"
+                    pnl_per_contract = (
+                        (1.0 if won_leg else 0.0) - buy_px
+                        if side == "yes"
+                        else (1.0 if won_leg else 0.0) - (1.0 - buy_px)
+                    )
+                if pnl_per_contract is None:
+                    continue
+                predicted_edge_dollars = float(buy_fill.decision_edge_bps) / 10000.0
+                observations.append((predicted_edge_dollars, pnl_per_contract))
+        return observations

@@ -239,6 +239,17 @@ class Settings(BaseSettings):
     crypto_live_pnl_gate_min_contracts: float = 20.0
     crypto_live_pnl_gate_min_net_pnl_dollars: float = 0.0
     crypto_live_pnl_gate_min_pnl_per_contract_dollars: float = 0.0
+    # Empirical edge shrinkage: predicted decision edges vs realized fill P&L.
+    # The fitted beta is runtime data stored in deployment-control notes under
+    # crypto_edge_shrinkage:{frequency}; these are compute/enforce toggles only.
+    crypto_edge_shrinkage_enabled: bool = True
+    crypto_edge_shrinkage_enforce: bool = True
+    crypto_edge_shrinkage_lookback_days: int = 30
+    crypto_edge_shrinkage_min_fills: int = 40
+    crypto_edge_shrinkage_beta_floor: float = 0.2
+    # Maximum allowed (rounded-up taker fee) / (expected gross edge dollars)
+    # at the chosen order size. A value <= 0 disables the floor.
+    crypto_max_fee_to_edge_ratio: float = 0.5
     crypto_entry_policy_optimizer_auto_enabled: bool = True
     crypto_entry_policy_optimizer_days: int = 30
     crypto_portfolio_max_allocation_pct: float = 1.0
