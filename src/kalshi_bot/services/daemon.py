@@ -220,7 +220,27 @@ class DaemonService:
                     result["autonomous_gate_tuning"] = {"status": "skipped", "reason": "inactive_color"}
             else:
                 result["autonomous_gate_tuning"] = {"status": "disabled"}
+            result["crypto_edge_shrinkage"] = await self._refresh_crypto_edge_shrinkage()
         return result
+
+    async def _refresh_crypto_edge_shrinkage(self) -> dict[str, Any]:
+        """Refit edge shrinkage after settlements update fill results."""
+        if not self.settings.crypto_edge_shrinkage_enabled:
+            return {"status": "disabled"}
+        if self.crypto_forecast_service is None:
+            return {"status": "skipped", "reason": "crypto_forecast_service_unavailable"}
+        if not await self._is_active_color():
+            return {"status": "skipped", "reason": "inactive_color"}
+        results: dict[str, Any] = {"status": "ok", "frequencies": {}}
+        for frequency in enabled_crypto_frequencies(self.settings):
+            try:
+                results["frequencies"][frequency] = await self.crypto_forecast_service.refresh_edge_shrinkage(
+                    frequency=frequency,
+                )
+            except Exception as exc:  # pragma: no cover - defensive; shrinkage must not break reconcile
+                logger.warning("crypto edge shrinkage refresh failed for %s: %s", frequency, exc)
+                results["frequencies"][frequency] = {"status": "error", "error": str(exc)}
+        return results
 
     async def heartbeat_once(self, *, run_follow_up: bool = True) -> dict[str, Any]:
         payload = {
