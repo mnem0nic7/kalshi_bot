@@ -687,3 +687,76 @@ async def test_stale_refresh_returns_none_on_api_error():
     now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
 
     assert await service._refresh_stale_market_state("KXETH15M-26JUN091200-00", now) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_parses_fractional_dollar_quote_fields():
+    # tapered_deci_cent markets (15m crypto) publish *_dollars strings and omit
+    # the legacy integer-cent fields entirely — the 2026-06-10 BNB incident.
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market(
+            {
+                "market": {
+                    "status": "active",
+                    "price_level_structure": "tapered_deci_cent",
+                    "yes_bid_dollars": "0.1500",
+                    "yes_ask_dollars": "0.1900",
+                }
+            }
+        ),
+    )
+    now = datetime(2026, 6, 10, 16, 5, tzinfo=UTC)
+
+    ms = await service._refresh_stale_market_state("KXBNB15M-26JUN101215-15", now)
+
+    assert ms is not None
+    assert ms.yes_bid_dollars == Decimal("0.1500")
+    assert ms.yes_ask_dollars == Decimal("0.1900")
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_prefers_dollar_fields_over_cent_fields():
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market(
+            {
+                "market": {
+                    "status": "active",
+                    "yes_bid_dollars": "0.3825",
+                    "yes_ask_dollars": "0.4100",
+                    "yes_bid": 38,
+                    "yes_ask": 41,
+                }
+            }
+        ),
+    )
+    now = datetime(2026, 6, 10, 16, 5, tzinfo=UTC)
+
+    ms = await service._refresh_stale_market_state("KXBNB15M-26JUN101215-15", now)
+
+    assert ms is not None
+    assert ms.yes_bid_dollars == Decimal("0.3825")
+    assert ms.yes_ask_dollars == Decimal("0.4100")
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_dollar_fields_boundary_returns_none():
+    service = StopLossService(
+        Settings(app_color="blue"),
+        MagicMock(),
+        _exec_with_market(
+            {
+                "market": {
+                    "status": "active",
+                    "yes_bid_dollars": "0.0000",
+                    "yes_ask_dollars": "1.0000",
+                }
+            }
+        ),
+    )
+    now = datetime(2026, 6, 10, 16, 5, tzinfo=UTC)
+
+    assert await service._refresh_stale_market_state("KXBNB15M-26JUN101215-15", now) is None

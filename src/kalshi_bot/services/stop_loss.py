@@ -240,18 +240,30 @@ class StopLossService:
         if status and status not in {"active", "open"}:
             return None
 
-        def _cents_to_dollars(key: str) -> Decimal | None:
-            raw = market.get(key)
-            if raw is None:
-                return None
-            value = Decimal(str(raw)) / Decimal("100")
+        def _quote_dollars(key: str) -> Decimal | None:
+            # Fractional-price markets (price_level_structure tapered_deci_cent,
+            # e.g. the 15m crypto series) omit the legacy integer-cent fields and
+            # publish dollar-string fields instead.
+            raw = market.get(f"{key}_dollars")
+            if raw is not None:
+                value = Decimal(str(raw))
+            else:
+                raw = market.get(key)
+                if raw is None:
+                    return None
+                value = Decimal(str(raw)) / Decimal("100")
             if value <= Decimal("0") or value >= Decimal("1"):
                 return None
             return value
 
-        yes_bid = _cents_to_dollars("yes_bid")
-        yes_ask = _cents_to_dollars("yes_ask")
+        yes_bid = _quote_dollars("yes_bid")
+        yes_ask = _quote_dollars("yes_ask")
         if yes_bid is None or yes_ask is None:
+            logger.warning(
+                "stop_loss stale refresh for %s returned no two-sided book (status=%s)",
+                market_ticker,
+                status or "unknown",
+            )
             return None
         return MarketState(
             kalshi_env=self.settings.kalshi_env,
@@ -304,11 +316,18 @@ class StopLossService:
         stale_cutoff = timedelta(seconds=self.settings.risk_stale_market_seconds)
         for position in positions:
             ms = market_states.get(position.market_ticker)
-            if ms is None:
-                continue
 
-            observed_at = _as_utc(ms.observed_at)
-            if observed_at is None or (now - observed_at) > stale_cutoff:
+            observed_at = _as_utc(ms.observed_at) if ms is not None else None
+            needs_refresh = (
+                ms is None
+                or observed_at is None
+                or (now - observed_at) > stale_cutoff
+                # A fresh state row without a two-sided book (e.g. fractional-price
+                # 15m markets whose stream writer records no quotes) still leaves
+                # the position uncovered — treat it like a stale state.
+                or _midpoint(ms, position.side) is None
+            )
+            if needs_refresh:
                 refreshed = (
                     await self._refresh_stale_market_state(position.market_ticker, now)
                     if self.settings.stop_loss_stale_refresh_enabled
@@ -316,7 +335,7 @@ class StopLossService:
                 )
                 if refreshed is None:
                     logger.warning(
-                        "stop_loss skipping %s: market state stale (observed_at=%s)",
+                        "stop_loss skipping %s: no usable market state (observed_at=%s)",
                         position.market_ticker,
                         observed_at,
                     )
@@ -325,6 +344,10 @@ class StopLossService:
 
             mid = _midpoint(ms, position.side)
             if mid is None:
+                logger.warning(
+                    "stop_loss skipping %s: one-sided book after refresh",
+                    position.market_ticker,
+                )
                 continue
 
             prices = price_histories.get(position.market_ticker, [])
