@@ -134,6 +134,9 @@ class CryptoTakeProfitService:
         self.settings = settings
         self.session_factory = session_factory
         self.execution_service = execution_service
+        # Open-position count from the last check; the daemon loop runs hot
+        # (sub-interval) while this is non-zero.
+        self.last_position_count: int = 0
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
@@ -144,6 +147,7 @@ class CryptoTakeProfitService:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             if control.active_color != self.settings.app_color:
+                self.last_position_count = 0
                 await session.commit()
                 return triggered
             positions = await repo.list_positions(
@@ -151,6 +155,7 @@ class CryptoTakeProfitService:
                 kalshi_env=self.settings.kalshi_env,
                 subaccount=self.settings.kalshi_subaccount,
             )
+        self.last_position_count = len(positions)
 
         if not positions:
             return triggered

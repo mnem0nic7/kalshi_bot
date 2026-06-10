@@ -746,9 +746,30 @@ class DaemonService:
             payload = await self.heartbeat_once(run_follow_up=False)
             self._schedule_heartbeat_follow_up(payload)
 
+    @staticmethod
+    def _position_exit_loop_interval(
+        *,
+        enabled: bool,
+        service: Any,
+        idle_seconds: float,
+        hot_seconds: float,
+    ) -> float:
+        """Idle interval while flat; hot interval (floored at 0.2s) while any
+        position is open. 30s is an eternity on a 15-minute binary."""
+        if not enabled or service is None or int(getattr(service, "last_position_count", 0) or 0) <= 0:
+            return max(0.2, float(idle_seconds))
+        return max(0.2, min(float(idle_seconds), float(hot_seconds)))
+
     async def _periodic_stop_loss_loop(self) -> None:
         while True:
-            await asyncio.sleep(self.settings.stop_loss_check_interval_seconds)
+            await asyncio.sleep(
+                self._position_exit_loop_interval(
+                    enabled=self.settings.stop_loss_enabled,
+                    service=self.stop_loss_service,
+                    idle_seconds=self.settings.stop_loss_check_interval_seconds,
+                    hot_seconds=self.settings.position_exit_hot_loop_interval_seconds,
+                )
+            )
             if not self.settings.stop_loss_enabled:
                 continue
             if self.stop_loss_service is None:
@@ -760,7 +781,14 @@ class DaemonService:
 
     async def _periodic_crypto_take_profit_loop(self) -> None:
         while True:
-            await asyncio.sleep(self.settings.crypto_take_profit_check_interval_seconds)
+            await asyncio.sleep(
+                self._position_exit_loop_interval(
+                    enabled=self.settings.crypto_take_profit_enabled,
+                    service=self.crypto_take_profit_service,
+                    idle_seconds=self.settings.crypto_take_profit_check_interval_seconds,
+                    hot_seconds=self.settings.position_exit_hot_loop_interval_seconds,
+                )
+            )
             if not self.settings.crypto_take_profit_enabled:
                 continue
             if self.crypto_take_profit_service is None:

@@ -481,6 +481,15 @@ class Settings(BaseSettings):
     # otherwise a stale row re-triggers the exit and the second IOC sell opens
     # the opposite position (2026-06-10 BNB flip incidents).
     position_exit_filled_cooldown_seconds: int = 180
+    # While any position is open the stop/take-profit loops run at this hot
+    # interval instead of their idle interval. Floor ~1s: each hot cycle may
+    # cost one Kalshi quote refresh per position, so an unbounded loop would
+    # burn API rate limits for no added protection.
+    position_exit_hot_loop_interval_seconds: float = 1.0
+    # Rapid-adverse readings stay spaced like the original 30s cadence even
+    # when the loop runs hot, so "two consecutive 7c drops" keeps meaning a
+    # sustained crash rather than two ticks inside one second.
+    stop_loss_rapid_adverse_reading_spacing_seconds: int = 15
     stop_loss_check_interval_seconds: int = 30
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2

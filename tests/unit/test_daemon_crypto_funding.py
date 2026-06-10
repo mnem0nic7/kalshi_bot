@@ -113,3 +113,40 @@ def test_ops_event_escalation_fires_only_on_repeated_failures() -> None:
     should = DaemonService._crypto_funding_failure_should_log_ops_event
     assert [n for n in range(1, 10) if should(n)] == [3, 6, 9]
     assert should(0) is False
+
+
+# ── adaptive exit-loop interval ──────────────────────────────────────────────
+
+from kalshi_bot.services.daemon import DaemonService
+
+
+class _StubExitService:
+    def __init__(self, count: int) -> None:
+        self.last_position_count = count
+
+
+def test_exit_loop_interval_idle_when_flat():
+    assert DaemonService._position_exit_loop_interval(
+        enabled=True, service=_StubExitService(0), idle_seconds=30, hot_seconds=1.0
+    ) == 30.0
+
+
+def test_exit_loop_interval_hot_with_open_positions():
+    assert DaemonService._position_exit_loop_interval(
+        enabled=True, service=_StubExitService(2), idle_seconds=30, hot_seconds=1.0
+    ) == 1.0
+
+
+def test_exit_loop_interval_idle_when_disabled_or_missing():
+    assert DaemonService._position_exit_loop_interval(
+        enabled=False, service=_StubExitService(2), idle_seconds=30, hot_seconds=1.0
+    ) == 30.0
+    assert DaemonService._position_exit_loop_interval(
+        enabled=True, service=None, idle_seconds=30, hot_seconds=1.0
+    ) == 30.0
+
+
+def test_exit_loop_interval_floors_at_200ms():
+    assert DaemonService._position_exit_loop_interval(
+        enabled=True, service=_StubExitService(1), idle_seconds=30, hot_seconds=0.0
+    ) == 0.2

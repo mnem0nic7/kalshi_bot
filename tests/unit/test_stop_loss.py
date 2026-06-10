@@ -806,3 +806,37 @@ def test_filled_exit_cooldown_falls_back_to_stopped_at():
     payload = {"stopped_at": "2026-06-10T18:07:22+00:00"}
 
     assert _within_filled_exit_cooldown(payload, now, settings) is True
+
+
+# ── hot exit loop: reading spacing + adaptive interval ───────────────────────
+
+from kalshi_bot.services.stop_loss import _append_spaced_mid_reading
+
+
+def test_spaced_reading_skipped_inside_spacing_window():
+    now = datetime(2026, 6, 10, 18, 0, 0, tzinfo=UTC)
+    readings = [(Decimal("0.40"), now)]
+
+    _append_spaced_mid_reading(readings, Decimal("0.33"), now + timedelta(seconds=1), 15)
+
+    assert len(readings) == 1  # 1s after the last reading: not appended
+
+
+def test_spaced_reading_appended_after_spacing_and_capped_at_two():
+    now = datetime(2026, 6, 10, 18, 0, 0, tzinfo=UTC)
+    readings = [(Decimal("0.40"), now), (Decimal("0.38"), now + timedelta(seconds=15))]
+
+    _append_spaced_mid_reading(readings, Decimal("0.30"), now + timedelta(seconds=30), 15)
+
+    assert len(readings) == 2
+    assert readings[-1][0] == Decimal("0.30")
+    assert readings[0][0] == Decimal("0.38")
+
+
+def test_spaced_reading_zero_spacing_appends_every_time():
+    now = datetime(2026, 6, 10, 18, 0, 0, tzinfo=UTC)
+    readings = [(Decimal("0.40"), now)]
+
+    _append_spaced_mid_reading(readings, Decimal("0.39"), now + timedelta(milliseconds=100), 0)
+
+    assert len(readings) == 2

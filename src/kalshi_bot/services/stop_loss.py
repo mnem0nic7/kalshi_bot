@@ -208,6 +208,24 @@ def _within_filled_exit_cooldown(payload: dict | None, now: datetime, settings: 
     return now - submitted < timedelta(seconds=cooldown)
 
 
+def _append_spaced_mid_reading(
+    readings: list[tuple[Decimal, datetime]],
+    mid: Decimal,
+    now: datetime,
+    spacing_seconds: int,
+) -> None:
+    """Append a (mid, ts) reading only if the spacing has elapsed, keeping the
+    rapid-adverse trigger's per-reading semantics stable when the check loop
+    runs faster than the original 30s cadence. Keeps the last 2 readings."""
+    if readings and spacing_seconds > 0:
+        last_ts = readings[-1][1]
+        if (now - last_ts).total_seconds() < spacing_seconds:
+            return
+    readings.append((mid, now))
+    while len(readings) > 2:
+        readings.pop(0)
+
+
 def _strategy_csv(value: str | None) -> set[str]:
     return {
         raw.strip().upper()
@@ -244,6 +262,9 @@ class StopLossService:
         self.execution_service = execution_service
         # Keyed by position id → last 2 (mid, observed_at) readings for rapid-drop detection
         self._prev_mids: dict[int, list[tuple[Decimal, datetime]]] = {}
+        # Open-position count from the last check; the daemon loop runs hot
+        # (sub-interval) while this is non-zero.
+        self.last_position_count: int = 0
 
     async def _refresh_stale_market_state(self, market_ticker: str, now: datetime) -> MarketState | None:
         """Fetch a live quote from Kalshi when the stored market state is stale.
@@ -308,6 +329,7 @@ class StopLossService:
             repo = PlatformRepository(session)
             control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
             if control.active_color != self.settings.app_color:
+                self.last_position_count = 0
                 await session.commit()
                 return triggered
             positions = await repo.list_positions(
@@ -315,6 +337,7 @@ class StopLossService:
                 kalshi_env=self.settings.kalshi_env,
                 subaccount=self.settings.kalshi_subaccount,
             )
+            self.last_position_count = len(positions)
             if not positions:
                 return triggered
             tickers = [p.market_ticker for p in positions]
@@ -378,9 +401,12 @@ class StopLossService:
             result = await self._evaluate_and_submit(position, ms, mid, prices, now, prev_mids=prev_readings)
             # Always update, even if trigger fired (orphaned key is harmless after position closes)
             readings = self._prev_mids.setdefault(position.id, [])
-            readings.append((mid, now))
-            if len(readings) > 2:
-                readings.pop(0)
+            _append_spaced_mid_reading(
+                readings,
+                mid,
+                now,
+                self.settings.stop_loss_rapid_adverse_reading_spacing_seconds,
+            )
             if result is not None:
                 triggered.append(result)
 
