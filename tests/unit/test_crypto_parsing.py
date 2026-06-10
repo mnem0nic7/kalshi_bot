@@ -146,3 +146,26 @@ def test_btci_ticker_resolves_to_btc_via_alias() -> None:
 
 def test_kxbtcc_ticker_resolves_to_btc_via_alias() -> None:
     assert asset_symbol_from_series({"ticker": "KXBTCC", "category": "Crypto", "frequency": "hourly"}) == "BTC"
+
+
+def test_crypto_market_parser_reads_fractional_fp_volume_fields() -> None:
+    # Fractional (deci-cent) markets publish volume_fp/open_interest_fp and
+    # omit the legacy integer fields entirely.
+    market = parse_crypto_market(
+        {
+            "ticker": "KXETH15M-26JUN101500-00",
+            "series_ticker": "KXETH15M",
+            "floor_strike": "2633.74",
+            "close_time": "2026-06-10T19:15:00Z",
+            "yes_bid_dollars": "0.4725",
+            "yes_ask_dollars": "0.5000",
+            "volume_fp": "2826.68",
+            "volume_24h_fp": "0.00",
+            "open_interest_fp": "1385.07",
+            "status": "open",
+        },
+    )
+
+    assert market is not None
+    assert market.volume == 2826
+    assert market.open_interest == 1385

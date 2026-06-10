@@ -592,6 +592,51 @@ def _filter_crypto_snapshot_rows(rows: list[Any], asset_symbols: list[str] | Non
     return [row for row in rows if normalize_asset_symbol(str(getattr(row, "asset_symbol", "") or "")) in symbols]
 
 
+def _crypto_spot_feature_asset_scope(asset_symbols: list[str] | None) -> list[str] | None:
+    """Spot rows also feed the cross-asset return features, so a single-asset
+    training/replay run must still see the cross-feature assets' spot history."""
+    symbols = set(normalize_asset_symbols(asset_symbols))
+    if not symbols:
+        return None
+    symbols.update(CRYPTO_CROSS_ASSET_FEATURE_ASSETS)
+    return sorted(symbols)
+
+
+async def _list_crypto_spot_rows_with_cross_assets(
+    repo: PlatformRepository,
+    *,
+    frequency: str,
+    kalshi_env: str,
+    requested_assets: list[str] | None,
+    since: datetime | None,
+    limit: int,
+) -> list[Any]:
+    """Load the requested assets' spot rows under their own row budget, then the
+    remaining cross-feature assets under a second budget, so widening the scope
+    for cross-asset returns can never truncate the primary asset's coverage."""
+    primary = await repo.list_crypto_spot_ohlc(
+        frequency=frequency,
+        kalshi_env=kalshi_env,
+        asset_symbols=requested_assets or None,
+        since=since,
+        limit=limit,
+    )
+    requested = set(normalize_asset_symbols(requested_assets))
+    if not requested:
+        return primary
+    cross = sorted(set(CRYPTO_CROSS_ASSET_FEATURE_ASSETS) - requested)
+    if not cross:
+        return primary
+    cross_rows = await repo.list_crypto_spot_ohlc(
+        frequency=frequency,
+        kalshi_env=kalshi_env,
+        asset_symbols=cross,
+        since=since,
+        limit=limit,
+    )
+    return [*primary, *cross_rows]
+
+
 def _dedupe_crypto_snapshot_rows(rows: list[Any]) -> list[Any]:
     deduped: list[Any] = []
     seen: set[Any] = set()
@@ -1361,10 +1406,12 @@ class CryptoMarketService:
                 asset_symbols=requested_assets or None,
                 limit=200_000,
             )
-            spot_rows = await repo.list_crypto_spot_ohlc(
+            spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                repo,
                 frequency=normalize_frequency(frequency) or "15m",
                 kalshi_env=self.settings.kalshi_env,
-                asset_symbols=requested_assets or None,
+                requested_assets=requested_assets,
+                since=None,
                 limit=500_000,
             )
             shadow_evidence = await _crypto_shadow_evidence_counts(
@@ -1378,7 +1425,7 @@ class CryptoMarketService:
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         all_snapshots = _filter_crypto_snapshot_rows(all_snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
         quote_rows = _crypto_decision_rows(all_snapshots, candles, spot_rows, settings=self.settings)
         if len(requested_assets) == 1:
             async with self.session_factory() as session:
@@ -3119,16 +3166,17 @@ class CryptoTrainingBackfillService:
                 limit=self.settings.crypto_train_max_candlesticks,
                 defer_payload=True,
             )
-            spot_rows = await repo.list_crypto_spot_ohlc(
+            spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                repo,
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
-                asset_symbols=requested_assets or None,
+                requested_assets=requested_assets,
                 since=since,
                 limit=self.settings.crypto_train_max_spot_rows,
             )
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
 
         # COMPUTE PHASE — pure in-memory; no DB connection held. Run in a thread
         # so the asyncio event loop is not blocked during the multi-hour CPU pass.
@@ -3540,16 +3588,17 @@ class CryptoForecastService:
                     since=since,
                     limit=self.settings.crypto_train_max_candlesticks,
                 )
-                spot_rows = await repo.list_crypto_spot_ohlc(
+                spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                    repo,
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets or None,
+                    requested_assets=requested_assets,
                     since=since,
                     limit=self.settings.crypto_train_max_spot_rows,
                 )
                 rows = _filter_crypto_snapshot_rows(rows, requested_assets)
                 candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-                spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+                spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
                 rows = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, rows)
                 decision_rows = _crypto_decision_rows(
                     rows,
@@ -3744,10 +3793,11 @@ class CryptoForecastService:
                     since=cutoff,
                     limit=200_000,
                 )
-                spot_rows = await repo.list_crypto_spot_ohlc(
+                spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                    repo,
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets or None,
+                    requested_assets=requested_assets,
                     since=cutoff,
                     limit=500_000,
                 )
@@ -3768,7 +3818,7 @@ class CryptoForecastService:
         else:
             rows = _filter_crypto_snapshot_rows(rows, requested_assets)
             candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+            spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
             rows = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, rows)
             decision_rows = _crypto_decision_rows(rows, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         model_payload = artifact.payload if artifact is not None else None
@@ -3883,6 +3933,12 @@ class CryptoForecastService:
                 frequency=market.frequency,
                 settings=self.settings,
             )
+            prior_quote_rows = await repo.list_crypto_market_snapshots(
+                market_ticker=market.market_ticker,
+                kalshi_env=self.settings.kalshi_env,
+                limit=1,
+            )
+            prior_quote = prior_quote_rows[0] if prior_quote_rows else None
             await session.commit()
         crypto_policy = _runtime_crypto_policy_with_asset_modes(
             crypto_policy,
@@ -3893,7 +3949,14 @@ class CryptoForecastService:
             ),
         )
         mid = market.mid_yes_dollars or market.last_price_dollars or Decimal("0.5000")
-        market_row = _crypto_live_market_row(market, spot_rows=spot_rows, cross_asset_spot=cross_asset_spot, funding_rate_rows=funding_rate_rows, settings=self.settings)
+        market_row = _crypto_live_market_row(
+            market,
+            spot_rows=spot_rows,
+            cross_asset_spot=cross_asset_spot,
+            funding_rate_rows=funding_rate_rows,
+            prior_quote=prior_quote,
+            settings=self.settings,
+        )
         features = {**features, "spot_features": _json_ready_spot_features(market_row)}
         empirical_bucket_matrix = _crypto_empirical_bucket_matrix_from_artifacts(gate, backtest)
         last_minute_passive_price_matrix = _crypto_last_minute_passive_price_matrix_from_artifacts(gate, backtest)
@@ -4326,10 +4389,11 @@ class CryptoReplayService:
                     since=cutoff,
                     limit=500_000,
                 )
-                spot_rows = await repo.list_crypto_spot_ohlc(
+                spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                    repo,
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets or None,
+                    requested_assets=requested_assets,
                     since=cutoff,
                     limit=1_000_000,
                 )
@@ -4344,7 +4408,7 @@ class CryptoReplayService:
         else:
             snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
             candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+            spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
             snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
             rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
@@ -4786,10 +4850,11 @@ class CryptoReplayService:
                 since=cutoff,
                 limit=500_000,
             )
-            spot_rows = await repo.list_crypto_spot_ohlc(
+            spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                repo,
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
-                asset_symbols=requested_assets,
+                requested_assets=requested_assets,
                 since=cutoff,
                 limit=1_000_000,
             )
@@ -4802,7 +4867,7 @@ class CryptoReplayService:
         dataset_source = "settled_live_quote_paths"
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-        spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+        spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
         snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
         rebuilt_rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         proxy_quote_row_count = sum(1 for row in rebuilt_rows if row.get("quote_source") != "snapshot_quotes")
@@ -4939,10 +5004,11 @@ class CryptoReplayService:
                     since=cutoff,
                     limit=500_000,
                 )
-                spot_rows = await repo.list_crypto_spot_ohlc(
+                spot_rows = await _list_crypto_spot_rows_with_cross_assets(
+                    repo,
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
-                    asset_symbols=requested_assets or None,
+                    requested_assets=requested_assets,
                     since=cutoff,
                     limit=1_000_000,
                 )
@@ -4968,7 +5034,7 @@ class CryptoReplayService:
         else:
             snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
             candles = _filter_crypto_snapshot_rows(candles, requested_assets)
-            spot_rows = _filter_crypto_snapshot_rows(spot_rows, requested_assets)
+            spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
             snapshots = _filter_snapshots_by_per_asset_funding_cutoff(funding_rate_rows, snapshots)
             rows = _crypto_decision_rows(snapshots, candles, spot_rows, funding_rate_rows=funding_rate_rows, settings=self.settings)
         rows.sort(key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
@@ -7601,6 +7667,7 @@ def _crypto_live_market_row(
     spot_rows: list[CryptoSpotOHLCRecord] | None = None,
     cross_asset_spot: dict[str, list[CryptoSpotOHLCRecord]] | None = None,
     funding_rate_rows: list[CryptoFundingRateRecord] | None = None,
+    prior_quote: CryptoMarketSnapshotRecord | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
@@ -7663,6 +7730,17 @@ def _crypto_live_market_row(
         )
     )
     row.update(_cross_asset_context(cross_asset_spot or {}, decision_ts=now))
+    if prior_quote is not None:
+        row.update(
+            _crypto_quote_sequence_context(
+                _clamp_price(mid),
+                float(market.spread_bps) if market.spread_bps is not None else None,
+                now,
+                _row_mid(prior_quote),
+                _crypto_snapshot_spread_bps(prior_quote, None, None),
+                prior_quote.observed_at,
+            )
+        )
     funding_by_asset: dict[str, list[CryptoFundingRateRecord]] = defaultdict(list)
     for rate in funding_rate_rows or []:
         funding_by_asset[rate.asset_symbol].append(rate)
@@ -8886,6 +8964,41 @@ def _crypto_readiness_score(
     }
 
 
+def _crypto_quote_sequence_context(
+    current_mid: Decimal | None,
+    current_spread_bps: int | float | None,
+    current_observed_at: datetime | None,
+    prior_mid: Decimal | None,
+    prior_spread_bps: int | float | None,
+    prior_observed_at: datetime | None,
+) -> dict[str, Any]:
+    """Quote-to-quote dynamics for the same market: mid change, velocity,
+    spread change, and observation gap. Empty when there is no prior quote."""
+    if current_mid is None or prior_mid is None or current_observed_at is None or prior_observed_at is None:
+        return {}
+    gap_seconds = (_as_utc_datetime(current_observed_at) - _as_utc_datetime(prior_observed_at)).total_seconds()
+    if gap_seconds <= 0:
+        return {}
+    change = current_mid - prior_mid
+    context: dict[str, Any] = {
+        "market_mid_change_1": change,
+        "market_mid_velocity_per_min": change / Decimal(str(gap_seconds / 60.0)),
+        "quote_observation_gap_seconds": gap_seconds,
+    }
+    if current_spread_bps is not None and prior_spread_bps is not None:
+        context["spread_change_bps_1"] = float(current_spread_bps) - float(prior_spread_bps)
+    return context
+
+
+def _crypto_snapshot_spread_bps(snapshot: Any, yes_bid: Decimal | None, yes_ask: Decimal | None) -> float | None:
+    recorded = getattr(snapshot, "spread_bps", None)
+    if recorded is not None:
+        return float(recorded)
+    if yes_bid is None or yes_ask is None:
+        return None
+    return float((yes_ask - yes_bid) * Decimal("10000"))
+
+
 def _crypto_decision_rows(
     snapshots: list[CryptoMarketSnapshotRecord],
     candles: list[CryptoMarketCandlestickRecord],
@@ -8920,6 +9033,17 @@ def _crypto_decision_rows(
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, datetime]] = set()
     settled_snapshots_by_market = _crypto_settlement_snapshots_by_market(snapshots)
+    prior_snapshot_by_key: dict[tuple[str, datetime], CryptoMarketSnapshotRecord] = {}
+    snapshots_by_market: dict[str, list[CryptoMarketSnapshotRecord]] = defaultdict(list)
+    for snapshot in snapshots:
+        snapshots_by_market[snapshot.market_ticker].append(snapshot)
+    for market_snapshots in snapshots_by_market.values():
+        market_snapshots.sort(key=lambda r: _as_utc_datetime(r.observed_at))
+        prev: CryptoMarketSnapshotRecord | None = None
+        for snap in market_snapshots:
+            if prev is not None:
+                prior_snapshot_by_key[(snap.market_ticker, snap.observed_at)] = prev
+            prev = snap
     for snapshot in snapshots:
         settlement_snapshot = settled_snapshots_by_market.get(snapshot.market_ticker)
         settlement_result = getattr(snapshot, "settlement_result", None)
@@ -8966,6 +9090,15 @@ def _crypto_decision_rows(
         candle_momentum = None
         if candle is not None and prior_candle is not None and candle.close_dollars is not None and prior_candle.close_dollars is not None:
             candle_momentum = candle.close_dollars - prior_candle.close_dollars
+        prior_snap = prior_snapshot_by_key.get((snapshot.market_ticker, decision_ts))
+        quote_sequence_context = _crypto_quote_sequence_context(
+            mid,
+            _crypto_snapshot_spread_bps(snapshot, yes_bid, yes_ask),
+            decision_ts,
+            _row_mid(prior_snap) if prior_snap is not None else None,
+            _crypto_snapshot_spread_bps(prior_snap, None, None) if prior_snap is not None else None,
+            prior_snap.observed_at if prior_snap is not None else None,
+        )
         spot_context = _spot_context_for_decision(
             spot_by_asset.get(snapshot.asset_symbol, []),
             spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
@@ -9023,6 +9156,7 @@ def _crypto_decision_rows(
                 **settlement_window_context,
                 **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
                 **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
+                **quote_sequence_context,
             }
         )
     for market_ticker, snapshot in settled_snapshots_by_market.items():
@@ -9271,6 +9405,18 @@ def _spot_context_for_decision(
             "spot_return_24_pct": None,
             "spot_realized_volatility_32": None,
         }
+    # Microstructure (exchange best bid/ask, recent trade count) only rides on
+    # spot_tick payloads; capture the latest one BEFORE the historical mode
+    # drops tick rows, so training sees the same features as live.
+    microstructure_row = next(
+        (
+            row
+            for row in reversed(eligible)
+            if isinstance(getattr(row, "payload", None), dict)
+            and isinstance(row.payload.get("market_microstructure"), dict)
+        ),
+        None,
+    )
     if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
         historical_eligible = [
             row
@@ -9338,6 +9484,8 @@ def _spot_context_for_decision(
     kalshi_gap = mid_yes - spot_probability_proxy if spot_probability_proxy is not None else None
     payload = current.payload if isinstance(current.payload, dict) else {}
     microstructure = payload.get("market_microstructure") if isinstance(payload.get("market_microstructure"), dict) else {}
+    if not microstructure and microstructure_row is not None:
+        microstructure = microstructure_row.payload.get("market_microstructure") or {}
     best_bid_ask = microstructure.get("best_bid_ask") if isinstance(microstructure.get("best_bid_ask"), dict) else {}
     latest_trade = microstructure.get("latest_trade") if isinstance(microstructure.get("latest_trade"), dict) else {}
     spot_exchange_bid = _optional_decimal(best_bid_ask.get("best_bid_dollars"))

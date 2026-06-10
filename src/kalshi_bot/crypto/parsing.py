@@ -142,8 +142,13 @@ def parse_crypto_market(
             dollar_keys=("last_price_dollars", "last_trade_price_dollars"),
             cent_keys=("last_price", "last_trade_price"),
         ),
-        volume=parse_int(market.get("volume") or market.get("volume_24h")),
-        open_interest=parse_int(market.get("open_interest")),
+        volume=parse_int(
+            market.get("volume")
+            or market.get("volume_fp")
+            or market.get("volume_24h")
+            or market.get("volume_24h_fp")
+        ),
+        open_interest=parse_int(market.get("open_interest") or market.get("open_interest_fp")),
         settlement_result=parse_settlement_result(market),
         raw=market,
     )
