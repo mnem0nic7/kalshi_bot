@@ -185,6 +185,29 @@ def exit_retry_delay_seconds(settings: Settings, market_ticker: str) -> int:
     return max(10, int(settings.stop_loss_retry_seconds))
 
 
+def _within_filled_exit_cooldown(payload: dict | None, now: datetime, settings: Settings) -> bool:
+    """True while a just-filled exit should suppress further exit submissions.
+
+    Shared by StopLossService and CryptoTakeProfitService. The local positions
+    row lags the exchange by up to a reconcile cycle after an exit fills; any
+    exit submitted from that stale row sells contracts we no longer hold and
+    flips the position to the opposite side.
+    """
+    cooldown = int(getattr(settings, "position_exit_filled_cooldown_seconds", 0) or 0)
+    if cooldown <= 0:
+        return False
+    raw = (payload or {}).get("submitted_at") or (payload or {}).get("stopped_at")
+    if raw is None:
+        return False
+    try:
+        submitted = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=UTC)
+    return now - submitted < timedelta(seconds=cooldown)
+
+
 def _strategy_csv(value: str | None) -> set[str]:
     return {
         raw.strip().upper()
@@ -388,6 +411,13 @@ class StopLossService:
             if submit_cp is not None:
                 outcome_status = str((submit_cp.payload or {}).get("outcome_status") or "")
                 if outcome_status == STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL:
+                    return None
+                if outcome_status == STOP_LOSS_OUTCOME_FILLED_EXIT and _within_filled_exit_cooldown(
+                    submit_cp.payload, now, self.settings
+                ):
+                    # The position row is stale until reconciliation lands the
+                    # fill; re-submitting here sells a position we no longer
+                    # hold, which opens the OPPOSITE side.
                     return None
                 next_retry = submit_cp.payload.get("next_retry_at")
                 if next_retry is not None:

@@ -15,7 +15,7 @@ from kalshi_bot.db.models import CryptoMarketSnapshotRecord, PositionRecord
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.services.execution import ExecutionService
 from kalshi_bot.services.fee_model import estimate_kalshi_taker_fee_dollars
-from kalshi_bot.services.stop_loss import exit_retry_delay_seconds
+from kalshi_bot.services.stop_loss import exit_retry_delay_seconds, _within_filled_exit_cooldown
 from kalshi_bot.services.position_governance import (
     STOP_LOSS_OUTCOME_CANCELLED_OR_UNFILLED,
     STOP_LOSS_OUTCOME_FILLED_EXIT,
@@ -193,6 +193,13 @@ class CryptoTakeProfitService:
             if submit_cp is not None:
                 outcome_status = str((submit_cp.payload or {}).get("outcome_status") or "")
                 if outcome_status == STOP_LOSS_OUTCOME_SUBMITTED_PENDING_FILL:
+                    return None
+                if outcome_status == STOP_LOSS_OUTCOME_FILLED_EXIT and _within_filled_exit_cooldown(
+                    submit_cp.payload, now, self.settings
+                ):
+                    # Stale position row until reconciliation lands the fill;
+                    # re-submitting sells contracts we no longer hold and opens
+                    # the opposite side.
                     return None
                 next_retry = (submit_cp.payload or {}).get("next_retry_at")
                 if next_retry is not None and now < datetime.fromisoformat(next_retry):

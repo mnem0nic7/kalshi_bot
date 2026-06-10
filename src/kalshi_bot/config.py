@@ -476,6 +476,11 @@ class Settings(BaseSettings):
     stop_loss_reentry_cooldown_seconds: int = 14400
     stop_loss_momentum_reentry_window_seconds: int = 300
     stop_loss_submit_cooldown_seconds: int = 300
+    # After an exit order fills, suppress further stop/take-profit submissions
+    # for the same ticker until reconciliation can zero the local position row;
+    # otherwise a stale row re-triggers the exit and the second IOC sell opens
+    # the opposite position (2026-06-10 BNB flip incidents).
+    position_exit_filled_cooldown_seconds: int = 180
     stop_loss_check_interval_seconds: int = 30
     stop_loss_momentum_slope_threshold_cents_per_min: float = -0.2
     stop_loss_momentum_reentry_slope_threshold_cents_per_min: float = -0.2

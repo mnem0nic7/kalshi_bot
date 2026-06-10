@@ -760,3 +760,49 @@ async def test_stale_refresh_dollar_fields_boundary_returns_none():
     now = datetime(2026, 6, 10, 16, 5, tzinfo=UTC)
 
     assert await service._refresh_stale_market_state("KXBNB15M-26JUN101215-15", now) is None
+
+
+# ── filled-exit cooldown (2026-06-10 BNB position-flip incidents) ────────────
+
+from kalshi_bot.services.stop_loss import _within_filled_exit_cooldown
+
+
+def test_filled_exit_cooldown_blocks_within_window():
+    settings = Settings(app_color="blue", position_exit_filled_cooldown_seconds=180)
+    now = datetime(2026, 6, 10, 18, 8, 0, tzinfo=UTC)
+    payload = {"submitted_at": "2026-06-10T18:07:22+00:00", "outcome_status": "filled_exit"}
+
+    assert _within_filled_exit_cooldown(payload, now, settings) is True
+
+
+def test_filled_exit_cooldown_expires_after_window():
+    settings = Settings(app_color="blue", position_exit_filled_cooldown_seconds=180)
+    now = datetime(2026, 6, 10, 18, 11, 0, tzinfo=UTC)
+    payload = {"submitted_at": "2026-06-10T18:07:22+00:00"}
+
+    assert _within_filled_exit_cooldown(payload, now, settings) is False
+
+
+def test_filled_exit_cooldown_disabled_when_zero():
+    settings = Settings(app_color="blue", position_exit_filled_cooldown_seconds=0)
+    now = datetime(2026, 6, 10, 18, 7, 30, tzinfo=UTC)
+    payload = {"submitted_at": "2026-06-10T18:07:22+00:00"}
+
+    assert _within_filled_exit_cooldown(payload, now, settings) is False
+
+
+def test_filled_exit_cooldown_handles_missing_or_bad_timestamp():
+    settings = Settings(app_color="blue", position_exit_filled_cooldown_seconds=180)
+    now = datetime(2026, 6, 10, 18, 8, 0, tzinfo=UTC)
+
+    assert _within_filled_exit_cooldown({}, now, settings) is False
+    assert _within_filled_exit_cooldown({"submitted_at": "garbage"}, now, settings) is False
+    assert _within_filled_exit_cooldown(None, now, settings) is False
+
+
+def test_filled_exit_cooldown_falls_back_to_stopped_at():
+    settings = Settings(app_color="blue", position_exit_filled_cooldown_seconds=180)
+    now = datetime(2026, 6, 10, 18, 8, 0, tzinfo=UTC)
+    payload = {"stopped_at": "2026-06-10T18:07:22+00:00"}
+
+    assert _within_filled_exit_cooldown(payload, now, settings) is True
