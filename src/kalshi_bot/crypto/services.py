@@ -20,7 +20,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.constants import CRYPTO_MIN_REMAINING_PAYOUT_BPS
+from kalshi_bot.core.constants import (
+    CRYPTO_MAX_SPREAD_BPS,
+    CRYPTO_MIN_REMAINING_PAYOUT_BPS,
+    CRYPTO_MIN_SPREAD_BPS,
+)
 from kalshi_bot.core.enums import (
     AgentRole,
     ContractSide,

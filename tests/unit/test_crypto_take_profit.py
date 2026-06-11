@@ -235,3 +235,14 @@ def test_threshold_frequency_map_parses_from_json_env(monkeypatch):
     monkeypatch.setenv("CRYPTO_TAKE_PROFIT_THRESHOLD_PCT_BY_FREQUENCY", '{"15m": 0.5}')
     settings = Settings(_env_file=None)
     assert settings.crypto_take_profit_threshold_pct_by_frequency == {"15m": 0.5}
+
+
+def test_crypto_pnl_sizing_target_pct_runs_without_nameerror():
+    # Regression: crypto_pnl_sizing_target_pct referenced CRYPTO_MIN/MAX_SPREAD_BPS
+    # without importing them; first executed by the pooled nightly on 2026-06-11.
+    from kalshi_bot.config import Settings
+    from kalshi_bot.crypto.services import crypto_pnl_sizing_target_pct
+
+    result = crypto_pnl_sizing_target_pct({}, settings=Settings(_env_file=None))
+    assert set(result) >= {"target_position_pct", "max_spread_bps", "diagnostics"}
+    assert 100 <= result["max_spread_bps"] <= 1500

@@ -49,6 +49,9 @@ class Settings(BaseSettings):
         return self
 
     database_url: str | None = None
+    # Long CPU-bound stretches in model training can leave a transaction idle
+    # well past 30 min; production raises this via DB_IDLE_IN_TRANSACTION_TIMEOUT_MS.
+    db_idle_in_transaction_timeout_ms: int = 1800000
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "kalshi_bot"
