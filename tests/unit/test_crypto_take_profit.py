@@ -12,6 +12,7 @@ from kalshi_bot.services.crypto_take_profit import (
     _crypto_sell_price,
     _crypto_take_profit_frequencies,
     _profit_ratio,
+    _resolve_take_profit_threshold,
     _round_trip_net_profit_ratio,
 )
 
@@ -190,3 +191,47 @@ def test_round_trip_net_profit_ratio_handles_no_side_sell_price():
     )
 
     assert ratio == pytest.approx(0.325)
+
+
+# --- _resolve_take_profit_threshold ---
+
+
+def test_threshold_resolution_global_when_no_overrides():
+    assert _resolve_take_profit_threshold(
+        "BTC", "15m", global_threshold=0.30, by_asset={}, by_frequency={}
+    ) == 0.30
+
+
+def test_threshold_resolution_asset_map_beats_global():
+    assert _resolve_take_profit_threshold(
+        "HYPE", "1h", global_threshold=0.30, by_asset={"HYPE": 0.40}, by_frequency={}
+    ) == 0.40
+
+
+def test_threshold_resolution_frequency_map_beats_asset_map():
+    assert _resolve_take_profit_threshold(
+        "HYPE", "15m",
+        global_threshold=0.30,
+        by_asset={"HYPE": 0.40},
+        by_frequency={"15m": 0.50},
+    ) == 0.50
+
+
+def test_threshold_resolution_other_frequency_falls_through():
+    assert _resolve_take_profit_threshold(
+        "BTC", "1h", global_threshold=0.30, by_asset={}, by_frequency={"15m": 0.50}
+    ) == 0.30
+
+
+def test_threshold_resolution_unknown_asset_and_frequency_use_global():
+    assert _resolve_take_profit_threshold(
+        None, None, global_threshold=0.30, by_asset={"BTC": 0.25}, by_frequency={"15m": 0.50}
+    ) == 0.30
+
+
+def test_threshold_frequency_map_parses_from_json_env(monkeypatch):
+    from kalshi_bot.config import Settings
+
+    monkeypatch.setenv("CRYPTO_TAKE_PROFIT_THRESHOLD_PCT_BY_FREQUENCY", '{"15m": 0.5}')
+    settings = Settings(_env_file=None)
+    assert settings.crypto_take_profit_threshold_pct_by_frequency == {"15m": 0.5}

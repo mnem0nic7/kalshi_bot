@@ -442,6 +442,7 @@ class Settings(BaseSettings):
     crypto_take_profit_frequencies: str = "15m,1h"
     crypto_take_profit_threshold_pct: float = 0.20
     crypto_take_profit_threshold_pct_by_asset: dict[str, float] = Field(default_factory=dict)
+    crypto_take_profit_threshold_pct_by_frequency: dict[str, float] = Field(default_factory=dict)
     crypto_take_profit_check_interval_seconds: int = 30
     crypto_take_profit_stale_snapshot_seconds: int = 120
     crypto_book_noise_gate_enabled: bool = False

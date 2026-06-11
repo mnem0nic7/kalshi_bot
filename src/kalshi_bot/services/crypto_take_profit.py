@@ -68,6 +68,21 @@ def _crypto_take_profit_frequencies(raw: str | None) -> set[str]:
 
 
 
+def _resolve_take_profit_threshold(
+    asset: str | None,
+    frequency: str | None,
+    *,
+    global_threshold: float,
+    by_asset: dict[str, float],
+    by_frequency: dict[str, float],
+) -> float:
+    if frequency is not None and frequency in by_frequency:
+        return by_frequency[frequency]
+    if asset is not None and asset in by_asset:
+        return by_asset[asset]
+    return global_threshold
+
+
 def _crypto_mid(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decimal | None:
     yes_bid = snapshot.yes_bid_dollars
     yes_ask = snapshot.yes_ask_dollars
@@ -164,13 +179,20 @@ class CryptoTakeProfitService:
         stale_cutoff = timedelta(seconds=self.settings.crypto_take_profit_stale_snapshot_seconds)
         global_threshold = self.settings.crypto_take_profit_threshold_pct
         by_asset = self.settings.crypto_take_profit_threshold_pct_by_asset
+        by_frequency = self.settings.crypto_take_profit_threshold_pct_by_frequency
         enabled_frequencies = _crypto_take_profit_frequencies(self.settings.crypto_take_profit_frequencies)
 
         for position in positions:
             asset, frequency = _crypto_market_identity(position.market_ticker)
             if frequency not in enabled_frequencies:
                 continue
-            threshold = by_asset.get(asset, global_threshold) if asset else global_threshold
+            threshold = _resolve_take_profit_threshold(
+                asset,
+                frequency,
+                global_threshold=global_threshold,
+                by_asset=by_asset,
+                by_frequency=by_frequency,
+            )
             result = await self._evaluate(position, now, stale_cutoff, threshold)
             if result is not None:
                 triggered.append(result)
