@@ -61,6 +61,32 @@ def _sell_price(market_state: MarketState, side: str) -> Decimal | None:
     return price
 
 
+def _escalate_sell_price(
+    sell_price: Decimal,
+    side: str,
+    prior_attempts: int,
+    *,
+    enabled: bool,
+    step: Decimal,
+) -> Decimal:
+    """Price a stop exit IOC more aggressively after missed attempts.
+
+    Selling NO is priced in yes terms, so "worse for the seller" moves the
+    yes price UP for a NO position and DOWN for a YES position.
+    """
+    if not enabled or prior_attempts <= 0:
+        return sell_price
+    floor_yes = Decimal("0.01")
+    ceil_yes = Decimal("0.99")
+    if side == "yes":
+        if prior_attempts >= 2:
+            return floor_yes
+        return max(floor_yes, sell_price - step)
+    if prior_attempts >= 2:
+        return ceil_yes
+    return min(ceil_yes, sell_price + step)
+
+
 def _side_value_from_yes_price(yes_price: Decimal, side: str) -> Decimal:
     return yes_price if side == "yes" else Decimal("1") - yes_price
 
@@ -206,6 +232,36 @@ def _within_filled_exit_cooldown(payload: dict | None, now: datetime, settings: 
     if submitted.tzinfo is None:
         submitted = submitted.replace(tzinfo=UTC)
     return now - submitted < timedelta(seconds=cooldown)
+
+
+def _prior_attempts_for_position(submit_cp: Any | None, position: PositionRecord) -> int:
+    """Count prior stop attempts belonging to THIS position's exit episode.
+
+    A checkpoint only counts if it was submitted after the position row was
+    created and for the same side — an old checkpoint from a previous position
+    (or a side flip) must not start a new episode at escalated pricing.
+    """
+    if submit_cp is None:
+        return 0
+    payload = dict(getattr(submit_cp, "payload", None) or {})
+    if str(payload.get("stopped_side") or "") != position.side:
+        return 0
+    raw = payload.get("submitted_at")
+    if raw is None:
+        return 0
+    try:
+        submitted = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return 0
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=UTC)
+    created = position.created_at
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    if created is not None and submitted < created:
+        return 0
+    # Legacy payloads predate attempt_count; a matching checkpoint is one attempt.
+    return max(1, int(payload.get("attempt_count") or 1))
 
 
 def _append_spaced_mid_reading(
@@ -456,6 +512,8 @@ class StopLossService:
                         if now - last_dt < timedelta(seconds=self.settings.stop_loss_submit_cooldown_seconds):
                             return None
 
+            prior_attempts = _prior_attempts_for_position(submit_cp, position)
+
             inferred_strategy = _strategy_for_market_ticker(position.market_ticker)
             enabled_strategies = _strategy_csv(self.settings.stop_loss_enabled_strategies)
             if enabled_strategies and (inferred_strategy or "") not in enabled_strategies:
@@ -495,6 +553,7 @@ class StopLossService:
                     repo, position, sell_px, mid, abs(net_return_ratio), now,
                     kill_switch_enabled=kill_switch_enabled,
                     active_color=active_color,
+                    prior_attempts=prior_attempts,
                     trigger="hard_stop",
                     net_return_ratio=net_return_ratio,
                 )
@@ -521,6 +580,7 @@ class StopLossService:
                             repo, position, sell_px, mid, trailing_ratio, now,
                             kill_switch_enabled=kill_switch_enabled,
                             active_color=active_color,
+                            prior_attempts=prior_attempts,
                             trigger="trailing_stop", peak=peak,
                         )
                         await session.commit()
@@ -538,6 +598,7 @@ class StopLossService:
                             repo, position, sell_px, mid, trailing_ratio, now,
                             kill_switch_enabled=kill_switch_enabled,
                             active_color=active_color,
+                            prior_attempts=prior_attempts,
                             trigger="rapid_adverse_move",
                             peak=peak,
                             rapid_drop1=drop1,
@@ -583,6 +644,7 @@ class StopLossService:
                 repo, position, sell_px, mid, trailing_ratio, now,
                 kill_switch_enabled=kill_switch_enabled,
                 active_color=active_color,
+                prior_attempts=prior_attempts,
                 trigger=trigger, slope=slope, peak=peak,
             )
             await session.commit()
@@ -605,8 +667,16 @@ class StopLossService:
         rapid_drop1: Decimal | None = None,
         rapid_drop2: Decimal | None = None,
         net_return_ratio: float | None = None,
+        prior_attempts: int = 0,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
+        sell_price = _escalate_sell_price(
+            sell_price,
+            position.side,
+            prior_attempts,
+            enabled=self.settings.stop_loss_escalation_enabled,
+            step=Decimal(str(self.settings.stop_loss_escalation_step_dollars)),
+        )
         peak_display = str(peak) if peak is not None else "n/a"
         mark_display = str(mid)
         sell_display = str(sell_price)
@@ -703,6 +773,7 @@ class StopLossService:
             "net_return_ratio": round(net_return_ratio, 4) if net_return_ratio is not None else None,
             "peak_price": str(peak) if peak is not None else None,
             "trigger": trigger,
+            "attempt_count": prior_attempts + 1,
         }
 
         if shadow:

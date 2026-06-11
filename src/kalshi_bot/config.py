@@ -480,6 +480,13 @@ class Settings(BaseSettings):
     stop_loss_reentry_cooldown_seconds: int = 14400
     stop_loss_momentum_reentry_window_seconds: int = 300
     stop_loss_submit_cooldown_seconds: int = 300
+    # On collapsing books the bid can fall through an IOC limit before the
+    # order lands (three misses observed 2026-06-10/11). After a missed stop
+    # attempt, cross the spread by the step; after two misses, floor the limit
+    # so the exit takes whatever bid exists. Stop-loss only — take-profit
+    # stays passive so winners are never dumped at the floor.
+    stop_loss_escalation_enabled: bool = True
+    stop_loss_escalation_step_dollars: float = 0.05
     # After an exit order fills, suppress further stop/take-profit submissions
     # for the same ticker until reconciliation can zero the local position row;
     # otherwise a stale row re-triggers the exit and the second IOC sell opens

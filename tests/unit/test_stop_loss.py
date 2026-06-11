@@ -840,3 +840,113 @@ def test_spaced_reading_zero_spacing_appends_every_time():
     _append_spaced_mid_reading(readings, Decimal("0.39"), now + timedelta(milliseconds=100), 0)
 
     assert len(readings) == 2
+
+
+# --- exit escalation after missed IOC attempts ---
+
+from kalshi_bot.services.stop_loss import _escalate_sell_price, _prior_attempts_for_position
+
+
+def test_escalation_first_attempt_sells_at_bid():
+    assert _escalate_sell_price(
+        Decimal("0.28"), "yes", 0, enabled=True, step=Decimal("0.05")
+    ) == Decimal("0.28")
+
+
+def test_escalation_second_attempt_crosses_step_yes_side():
+    assert _escalate_sell_price(
+        Decimal("0.28"), "yes", 1, enabled=True, step=Decimal("0.05")
+    ) == Decimal("0.23")
+
+
+def test_escalation_second_attempt_crosses_step_no_side():
+    # NO sell priced in yes terms: worse for the seller = HIGHER yes price
+    assert _escalate_sell_price(
+        Decimal("0.72"), "no", 1, enabled=True, step=Decimal("0.05")
+    ) == Decimal("0.77")
+
+
+def test_escalation_third_attempt_floors_yes_side():
+    assert _escalate_sell_price(
+        Decimal("0.28"), "yes", 2, enabled=True, step=Decimal("0.05")
+    ) == Decimal("0.01")
+
+
+def test_escalation_third_attempt_floors_no_side():
+    assert _escalate_sell_price(
+        Decimal("0.72"), "no", 5, enabled=True, step=Decimal("0.05")
+    ) == Decimal("0.99")
+
+
+def test_escalation_clamps_step_at_floor():
+    assert _escalate_sell_price(
+        Decimal("0.03"), "yes", 1, enabled=True, step=Decimal("0.05")
+    ) == Decimal("0.01")
+
+
+def test_escalation_disabled_returns_bid():
+    assert _escalate_sell_price(
+        Decimal("0.28"), "yes", 3, enabled=False, step=Decimal("0.05")
+    ) == Decimal("0.28")
+
+
+def _submit_cp(payload: dict) -> MagicMock:
+    cp = MagicMock()
+    cp.payload = payload
+    return cp
+
+
+def _escalation_pos(side: str, created_at: datetime) -> MagicMock:
+    pos = MagicMock()
+    pos.side = side
+    pos.created_at = created_at
+    return pos
+
+
+def test_prior_attempts_none_checkpoint_is_zero():
+    pos = _escalation_pos("yes", datetime(2026, 6, 11, 15, 30, tzinfo=UTC))
+    assert _prior_attempts_for_position(None, pos) == 0
+
+
+def test_prior_attempts_counts_same_episode():
+    created = datetime(2026, 6, 11, 15, 30, tzinfo=UTC)
+    pos = _escalation_pos("no", created)
+    cp = _submit_cp({
+        "stopped_side": "no",
+        "submitted_at": (created + timedelta(seconds=60)).isoformat(),
+        "attempt_count": 2,
+    })
+    assert _prior_attempts_for_position(cp, pos) == 2
+
+
+def test_prior_attempts_legacy_payload_counts_as_one():
+    created = datetime(2026, 6, 11, 15, 30, tzinfo=UTC)
+    pos = _escalation_pos("no", created)
+    cp = _submit_cp({
+        "stopped_side": "no",
+        "submitted_at": (created + timedelta(seconds=60)).isoformat(),
+    })
+    assert _prior_attempts_for_position(cp, pos) == 1
+
+
+def test_prior_attempts_resets_on_side_flip():
+    created = datetime(2026, 6, 11, 15, 30, tzinfo=UTC)
+    pos = _escalation_pos("no", created)
+    cp = _submit_cp({
+        "stopped_side": "yes",
+        "submitted_at": (created + timedelta(seconds=60)).isoformat(),
+        "attempt_count": 3,
+    })
+    assert _prior_attempts_for_position(cp, pos) == 0
+
+
+def test_prior_attempts_resets_for_new_position():
+    # Checkpoint predates the position row: belongs to a previous position.
+    created = datetime(2026, 6, 11, 15, 30, tzinfo=UTC)
+    pos = _escalation_pos("no", created)
+    cp = _submit_cp({
+        "stopped_side": "no",
+        "submitted_at": (created - timedelta(minutes=10)).isoformat(),
+        "attempt_count": 3,
+    })
+    assert _prior_attempts_for_position(cp, pos) == 0
