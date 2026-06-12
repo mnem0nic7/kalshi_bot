@@ -95,7 +95,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v7"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v8"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -7733,7 +7733,13 @@ def _crypto_live_market_row(
             as_of=now,
         )
     )
-    row.update(_cross_asset_context(cross_asset_spot or {}, decision_ts=now))
+    row.update(
+        _cross_asset_context(
+            cross_asset_spot or {},
+            decision_ts=now,
+            exclude_asset=market.asset_symbol,
+        )
+    )
     if prior_quote is not None:
         row.update(
             _crypto_quote_sequence_context(
@@ -9158,7 +9164,7 @@ def _crypto_decision_rows(
                 "candle_momentum_dollars": candle_momentum,
                 **spot_context,
                 **settlement_window_context,
-                **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
+                **_cross_asset_context(spot_by_asset, decision_ts=decision_ts, exclude_asset=snapshot.asset_symbol),
                 **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
                 **quote_sequence_context,
             }
@@ -9233,7 +9239,7 @@ def _crypto_decision_rows(
                     "candle_momentum_dollars": candle_momentum,
                     **spot_context,
                     **settlement_window_context,
-                    **_cross_asset_context(spot_by_asset, decision_ts=decision_ts),
+                    **_cross_asset_context(spot_by_asset, decision_ts=decision_ts, exclude_asset=snapshot.asset_symbol),
                     **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
                 }
             )
@@ -9543,7 +9549,16 @@ def _cross_asset_context(
     spot_by_asset: dict[str, list[CryptoSpotOHLCRecord]],
     *,
     decision_ts: datetime,
+    exclude_asset: str | None = None,
 ) -> dict[str, Any]:
+    """Per-asset spot returns for every cross-asset feature the schema consumes.
+
+    The feature vector reads `{asset}_return_{1,3}_pct` for ALL of
+    CRYPTO_CROSS_ASSET_FEATURE_ASSETS; only emitting BTC/ETH left the other
+    five permanently zero (dead features in every trained model). The market's
+    own asset is excluded so training matches the live path, which never
+    feeds self-asset rows here (own momentum is already in spot_return_*).
+    """
     decision_utc = _as_utc_datetime(decision_ts)
 
     def _cross_return(asset: str, periods: int) -> Decimal | None:
@@ -9554,12 +9569,17 @@ def _cross_asset_context(
         )
         return _spot_return_pct(eligible, periods=periods)
 
-    return {
-        "btc_return_1_pct": _cross_return("BTC", 1),
-        "btc_return_3_pct": _cross_return("BTC", 3),
-        "eth_return_1_pct": _cross_return("ETH", 1),
-        "eth_return_3_pct": _cross_return("ETH", 3),
-    }
+    excluded = (exclude_asset or "").strip().upper()
+    context: dict[str, Any] = {}
+    for asset in CRYPTO_CROSS_ASSET_FEATURE_ASSETS:
+        key = asset.lower()
+        if asset == excluded:
+            context[f"{key}_return_1_pct"] = None
+            context[f"{key}_return_3_pct"] = None
+            continue
+        context[f"{key}_return_1_pct"] = _cross_return(asset, 1)
+        context[f"{key}_return_3_pct"] = _cross_return(asset, 3)
+    return context
 
 
 def _funding_rate_context_for_decision(
