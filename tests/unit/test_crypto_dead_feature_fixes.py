@@ -126,3 +126,31 @@ def test_cross_asset_context_missing_asset_rows_yield_none() -> None:
 
     for asset in CRYPTO_CROSS_ASSET_FEATURE_ASSETS:
         assert ctx[f"{asset.lower()}_return_1_pct"] is None
+
+
+def test_cross_asset_context_handles_descending_live_lists() -> None:
+    # The live path fetches most-recent-first lists from the repo; the
+    # bisect path must normalize ordering before computing returns.
+    from kalshi_bot.crypto.services import _cross_asset_context
+
+    descending = [
+        _spot_row("BTC", NOW, "103"),
+        _spot_row("BTC", NOW - timedelta(minutes=1), "102"),
+        _spot_row("BTC", NOW - timedelta(minutes=2), "101"),
+    ]
+    ctx = _cross_asset_context({"BTC": descending}, decision_ts=NOW)
+
+    assert ctx["btc_return_1_pct"] == (Decimal("103") - Decimal("102")) / Decimal("102")
+
+
+def test_cross_asset_context_respects_as_of_cutoff() -> None:
+    from kalshi_bot.crypto.services import _cross_asset_context
+
+    rows = [
+        _spot_row("BTC", NOW - timedelta(minutes=2), "100"),
+        _spot_row("BTC", NOW - timedelta(minutes=1), "110"),
+        _spot_row("BTC", NOW + timedelta(minutes=1), "999"),  # future row must be ignored
+    ]
+    ctx = _cross_asset_context({"BTC": rows}, decision_ts=NOW)
+
+    assert ctx["btc_return_1_pct"] == (Decimal("110") - Decimal("100")) / Decimal("100")

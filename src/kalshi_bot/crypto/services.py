@@ -9562,12 +9562,21 @@ def _cross_asset_context(
     decision_utc = _as_utc_datetime(decision_ts)
 
     def _cross_return(asset: str, periods: int) -> Decimal | None:
+        # Called once per training row; the per-call sorted() over a year of
+        # backfilled spot rows turned training into an O(rows x spot log spot)
+        # crawl (10h+ CPU). Rows arrive ascending from the training builders;
+        # the live path fetches small most-recent-first lists, so normalize
+        # cheaply and bisect to the as-of cutoff instead.
         rows = spot_by_asset.get(asset) or []
-        eligible = sorted(
-            (r for r in rows if _as_utc_datetime(r.end_ts) <= decision_utc and r.close_dollars is not None),
-            key=lambda r: r.end_ts,
-        )
-        return _spot_return_pct(eligible, periods=periods)
+        if not rows:
+            return None
+        if len(rows) > 1 and _as_utc_datetime(rows[0].end_ts) > _as_utc_datetime(rows[-1].end_ts):
+            rows = sorted(rows, key=lambda r: r.end_ts)
+        idx = bisect_right(rows, decision_utc, key=lambda r: _as_utc_datetime(r.end_ts))
+        if idx <= periods:
+            return None
+        window = [r for r in rows[max(0, idx - (periods + 8)) : idx] if r.close_dollars is not None]
+        return _spot_return_pct(window, periods=periods)
 
     excluded = (exclude_asset or "").strip().upper()
     context: dict[str, Any] = {}
