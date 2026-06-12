@@ -1037,11 +1037,25 @@ class CryptoMarketService:
         self.kalshi = kalshi
         self.agent_pack_service = agent_pack_service
         self.asset_control_service = asset_control_service
+        # Discovery results barely change between autonomy iterations, but the
+        # active-color loop has no sleep — uncached discovery re-pages the full
+        # series + market listings dozens of times per second and saturates the
+        # shared Kalshi API budget (429s on live quote polls, starved crawls).
+        self._series_cache: dict[str, tuple[float, list[CryptoSeries]]] = {}
+        self._markets_cache: dict[tuple[Any, ...], tuple[float, list[CryptoMarket]]] = {}
+
+    def _discovery_cache_ttl(self) -> float:
+        return max(0.0, float(getattr(self.settings, "crypto_market_discovery_cache_seconds", 0.0) or 0.0))
 
     async def discover_series(self, *, frequency: str = "15m") -> list[CryptoSeries]:
         if not self.settings.crypto_enabled:
             return []
         wanted = normalize_frequency(frequency) or "15m"
+        ttl = self._discovery_cache_ttl()
+        if ttl > 0:
+            cached = self._series_cache.get(wanted)
+            if cached is not None and (time.monotonic() - cached[0]) < ttl:
+                return list(cached[1])
         cursor: str | None = None
         seen_cursors: set[str] = set()
         series: list[CryptoSeries] = []
@@ -1059,7 +1073,10 @@ class CryptoMarketService:
                 break
             seen_cursors.add(cursor)
         deduped: dict[str, CryptoSeries] = {item.series_ticker: item for item in series}
-        return sorted(deduped.values(), key=lambda item: item.asset_symbol)
+        result = sorted(deduped.values(), key=lambda item: item.asset_symbol)
+        if ttl > 0:
+            self._series_cache[wanted] = (time.monotonic(), list(result))
+        return result
 
     async def discover_markets(
         self,
@@ -1072,6 +1089,18 @@ class CryptoMarketService:
         max_close_time: datetime | None = None,
     ) -> list[CryptoMarket]:
         requested_assets = set(normalize_asset_symbols(asset_symbols))
+        ttl = self._discovery_cache_ttl()
+        cache_key: tuple[Any, ...] | None = None
+        if ttl > 0 and min_close_time is None and max_close_time is None:
+            cache_key = (
+                normalize_frequency(frequency) or "15m",
+                status,
+                tuple(sorted(requested_assets)),
+                bool(persist),
+            )
+            cached = self._markets_cache.get(cache_key)
+            if cached is not None and (time.monotonic() - cached[0]) < ttl:
+                return list(cached[1])
         series_rows = await self.discover_series(frequency=frequency)
         if requested_assets:
             series_rows = [
@@ -1110,6 +1139,8 @@ class CryptoMarketService:
                 for market in markets:
                     await self.record_market_snapshot(repo, market, source_kind="live")
                 await session.commit()
+        if cache_key is not None:
+            self._markets_cache[cache_key] = (time.monotonic(), list(markets))
         return markets
 
     async def get_market(self, market_ticker: str, *, persist: bool = True) -> CryptoMarket:

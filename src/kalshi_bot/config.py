@@ -192,6 +192,12 @@ class Settings(BaseSettings):
     # Settled markets' candles never change; skipping already-covered markets keeps
     # the nightly crawl from re-fetching the whole lookback window every run.
     crypto_history_skip_existing_candles: bool = True
+    # TTL for series/market discovery results. The no-sleep active autonomy loop
+    # re-discovers every iteration; without a cache that saturates the Kalshi API
+    # budget. New 15m markets appear at most every 15 minutes, and the live path
+    # separately requires CRYPTO_LIVE_MIN_MARKET_AGE_SECONDS of market age, so a
+    # short TTL costs nothing. 0 disables caching.
+    crypto_market_discovery_cache_seconds: float = 20.0
     crypto_order_mode: str = "passive_then_taker"
     crypto_passive_timeout_seconds: int = 5
     crypto_taker_fallback_close_seconds: int = 0
