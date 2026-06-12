@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
 import importlib.metadata as importlib_metadata
 import json
@@ -10914,9 +10915,32 @@ def _fit_crypto_model_candidates(
         for name in ("sklearn_logistic", "xgboost_classifier", "lightgbm_classifier"):
             result[name] = {"name": name, "status": "unavailable", "reason": reason, "dependency_version": None}
         return result
-    result["sklearn_logistic"] = _fit_crypto_logistic_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
-    result["xgboost_classifier"] = _fit_crypto_xgboost_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
-    result["lightgbm_classifier"] = _fit_crypto_lightgbm_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
+    def _fit_logistic() -> dict[str, Any]:
+        return _fit_crypto_logistic_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback)
+
+    def _fit_xgboost() -> dict[str, Any]:
+        return _fit_crypto_xgboost_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
+
+    def _fit_lightgbm() -> dict[str, Any]:
+        return _fit_crypto_lightgbm_model(rows, raw_matrix, labels, schema=schema, defaults=defaults, fallback=fallback, settings=settings)
+
+    if _crypto_resolved_xgb_device(len(labels)) in _GPU_TREE_DEVICES:
+        # XGBoost trains on the GPU while logistic + LightGBM occupy the CPU
+        # cores; all three fits release the GIL, so overlapping wastes neither
+        # device. Kept sequential on CPU-only hosts to avoid oversubscribing
+        # cores between two OpenMP fits.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="crypto-xgb-fit") as pool:
+            xgboost_future = pool.submit(_fit_xgboost)
+            logistic_result = _fit_logistic()
+            lightgbm_result = _fit_lightgbm()
+            xgboost_result = xgboost_future.result()
+    else:
+        logistic_result = _fit_logistic()
+        xgboost_result = _fit_xgboost()
+        lightgbm_result = _fit_lightgbm()
+    result["sklearn_logistic"] = logistic_result
+    result["xgboost_classifier"] = xgboost_result
+    result["lightgbm_classifier"] = lightgbm_result
     return result
 
 
@@ -11088,6 +11112,13 @@ def _resolve_tree_device(
     return requested, None
 
 
+def _crypto_resolved_xgb_device(n_rows: int) -> str:
+    requested = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cpu").lower()
+    gpu_min_rows = int(os.environ.get("CRYPTO_GPU_MIN_ROWS", "20000") or 20000)
+    device, _ = _resolve_tree_device(requested, n_rows, gpu_min_rows=gpu_min_rows)
+    return device
+
+
 def _fit_tree_with_device_fallback(
     build_and_fit: "Callable[[str], Any]", device: str, *, model_label: str
 ) -> tuple["Any", str]:
@@ -11126,28 +11157,33 @@ def _fit_crypto_xgboost_model(
         _xgb_device, _xgb_downgrade = _resolve_tree_device(_xgb_requested, len(labels), gpu_min_rows=_xgb_gpu_min_rows)
         if _xgb_downgrade:
             logger.debug("crypto_xgboost_device_downgraded: %s", _xgb_downgrade)
-        _xgb_kwargs: dict[str, Any] = {"tree_method": "hist"}
-        if _xgb_device not in ("", "cpu"):
-            _xgb_kwargs["device"] = _xgb_device
         _xgb_min_child = 20 if len(raw_matrix) > 20000 else 10 if len(raw_matrix) > 5000 else 5
-        classifier = xgb.XGBClassifier(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=_xgb_min_child,
-            reg_lambda=1.5,
-            eval_metric="logloss",
-            random_state=17,
-            n_jobs=-1,
-            **_xgb_kwargs,
-        )
         # Fit on full dataset; hold out most-recent 15% for isotonic calibration when
         # there's enough data — prevents in-sample calibration overfitting.
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
         _sample_weights = _crypto_training_sample_weights(rows[:_cal_split_idx], settings=settings)
-        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
+
+        def _build_and_fit_xgb(device: str) -> Any:
+            kwargs: dict[str, Any] = {"tree_method": "hist"}
+            if device not in ("", "cpu"):
+                kwargs["device"] = device
+            fitted = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=_xgb_min_child,
+                reg_lambda=1.5,
+                eval_metric="logloss",
+                random_state=17,
+                n_jobs=-1,
+                **kwargs,
+            )
+            fitted.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
+            return fitted
+
+        classifier, _xgb_device = _fit_tree_with_device_fallback(_build_and_fit_xgb, _xgb_device, model_label="xgboost")
         booster = classifier.get_booster()
         try:
             raw_booster = booster.save_raw(raw_format="json")
@@ -11204,23 +11240,28 @@ def _fit_crypto_lightgbm_model(
         # gpu_min_rows=0: no size gate for LightGBM — honor operator request as-is.
         _lgb_device, _ = _resolve_tree_device(_lgb_requested, len(labels), gpu_min_rows=0)
         _lgb_min_child = 20 if len(raw_matrix) > 20000 else 10 if len(raw_matrix) > 5000 else 5
-        classifier = lgb.LGBMClassifier(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.05,
-            num_leaves=15,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=_lgb_min_child,
-            reg_lambda=1.5,
-            random_state=17,
-            n_jobs=_lgb_n_jobs,
-            device=_lgb_device,
-            verbosity=-1,
-        )
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
         _sample_weights = _crypto_training_sample_weights(rows[:_cal_split_idx], settings=settings)
-        classifier.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
+
+        def _build_and_fit_lgb(device: str) -> Any:
+            fitted = lgb.LGBMClassifier(
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.05,
+                num_leaves=15,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_samples=_lgb_min_child,
+                reg_lambda=1.5,
+                random_state=17,
+                n_jobs=_lgb_n_jobs,
+                device=device,
+                verbosity=-1,
+            )
+            fitted.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
+            return fitted
+
+        classifier, _lgb_device = _fit_tree_with_device_fallback(_build_and_fit_lgb, _lgb_device, model_label="lightgbm")
         booster = classifier.booster_
         model = {
             "model_type": "lightgbm_classifier",
