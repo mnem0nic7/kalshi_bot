@@ -189,6 +189,9 @@ class Settings(BaseSettings):
     crypto_settled_pagination_stop_at_cutoff: bool = True
     crypto_historical_pagination_stop_at_cutoff: bool = True
     crypto_history_candle_concurrency: int = 1
+    # Settled markets' candles never change; skipping already-covered markets keeps
+    # the nightly crawl from re-fetching the whole lookback window every run.
+    crypto_history_skip_existing_candles: bool = True
     crypto_order_mode: str = "passive_then_taker"
     crypto_passive_timeout_seconds: int = 5
     crypto_taker_fallback_close_seconds: int = 0

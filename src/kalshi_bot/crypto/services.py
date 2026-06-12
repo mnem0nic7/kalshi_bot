@@ -1763,6 +1763,7 @@ class CryptoHistoryService:
                 market_items,
                 cutoff=cutoff,
                 commit_batch_size=commit_batch_size,
+                frequency=frequency,
             )
             for _market, capture in captures:
                 candle_stats["stored"] += int(capture["stored"])
@@ -1954,6 +1955,7 @@ class CryptoHistoryService:
                     settled_markets,
                     cutoff=cutoff,
                     commit_batch_size=commit_batch_size,
+                    frequency=freq,
                 )
             else:
                 candle_stats["skipped_reason"] = "crypto_collect_settled_candles_disabled"
@@ -2484,9 +2486,15 @@ class CryptoHistoryService:
         *,
         cutoff: datetime,
         commit_batch_size: int,
+        frequency: str | None = None,
     ) -> list[tuple[CryptoMarket, dict[str, Any]]]:
         concurrency = max(1, int(self.settings.crypto_history_candle_concurrency))
         captures: list[tuple[CryptoMarket, dict[str, Any]]] = []
+        markets = self._partition_covered_markets(
+            markets,
+            captures,
+            coverage=await self._candlestick_coverage_for_skip(repo, cutoff=cutoff, frequency=frequency, market_count=len(markets)),
+        )
         stored_since_commit = 0
         for offset in range(0, len(markets), concurrency):
             batch = markets[offset : offset + concurrency]
@@ -2508,6 +2516,69 @@ class CryptoHistoryService:
         if stored_since_commit:
             await session.commit()
         return captures
+
+    async def _candlestick_coverage_for_skip(
+        self,
+        repo: PlatformRepository,
+        *,
+        cutoff: datetime,
+        frequency: str | None,
+        market_count: int,
+    ) -> dict[str, datetime]:
+        if not self.settings.crypto_history_skip_existing_candles or market_count == 0:
+            return {}
+        return await repo.map_crypto_candlestick_coverage(
+            kalshi_env=self.settings.kalshi_env,
+            frequency=normalize_frequency(frequency) if frequency else None,
+            since=cutoff,
+        )
+
+    def _partition_covered_markets(
+        self,
+        markets: list[CryptoMarket],
+        captures: list[tuple[CryptoMarket, dict[str, Any]]],
+        *,
+        coverage: dict[str, datetime],
+    ) -> list[CryptoMarket]:
+        """Append skipped_existing captures for settled markets whose stored candles
+        already reach their close time; return the markets still needing a fetch."""
+        if not coverage:
+            return markets
+        now = datetime.now(UTC)
+        pending: list[CryptoMarket] = []
+        skipped = 0
+        for market in markets:
+            close_time = market.close_time
+            covered_until = coverage.get(market.market_ticker)
+            if covered_until is not None and covered_until.tzinfo is None:
+                covered_until = covered_until.replace(tzinfo=UTC)
+            if (
+                close_time is not None
+                and close_time < now
+                and covered_until is not None
+                and covered_until >= close_time - timedelta(minutes=1)
+            ):
+                skipped += 1
+                captures.append(
+                    (
+                        market,
+                        {
+                            "status": "skipped_existing",
+                            "stored": 0,
+                            "source": "db_cache",
+                            "attempted_sources": [],
+                        },
+                    )
+                )
+                continue
+            pending.append(market)
+        if skipped:
+            logger.info(
+                "crypto candlestick crawl skipping %d/%d markets with complete stored candles",
+                skipped,
+                len(markets),
+            )
+        return pending
 
 
 class CryptoSpotService:

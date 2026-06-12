@@ -2556,6 +2556,25 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def map_crypto_candlestick_coverage(
+        self,
+        *,
+        frequency: str | None = None,
+        kalshi_env: str | None = None,
+        since: datetime | None = None,
+    ) -> dict[str, datetime]:
+        """Latest stored candle end time per market ticker, for crawl skip decisions."""
+        stmt = select(
+            CryptoMarketCandlestickRecord.market_ticker,
+            func.max(CryptoMarketCandlestickRecord.end_period_ts),
+        ).where(CryptoMarketCandlestickRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env))
+        if frequency is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.frequency == frequency)
+        if since is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
+        stmt = stmt.group_by(CryptoMarketCandlestickRecord.market_ticker)
+        return {ticker: end_ts for ticker, end_ts in (await self.session.execute(stmt)).all() if end_ts is not None}
+
     async def upsert_crypto_spot_ohlc(
         self,
         *,
