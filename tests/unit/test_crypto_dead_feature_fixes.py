@@ -154,3 +154,58 @@ def test_cross_asset_context_respects_as_of_cutoff() -> None:
     ctx = _cross_asset_context({"BTC": rows}, decision_ts=NOW)
 
     assert ctx["btc_return_1_pct"] == (Decimal("110") - Decimal("100")) / Decimal("100")
+
+
+def _ohlc_row(end_ts, close, source_kind="ohlc", provider="coinbase", payload=None):
+    from unittest.mock import MagicMock
+
+    row = MagicMock()
+    row.end_ts = end_ts
+    row.close_dollars = Decimal(close) if close is not None else None
+    row.source_kind = source_kind
+    row.provider = provider
+    row.payload = payload or {}
+    row.interval_seconds = 60
+    row.open_dollars = row.high_dollars = row.low_dollars = row.close_dollars
+    return row
+
+
+def test_prepared_spot_context_matches_legacy_path() -> None:
+    from kalshi_bot.crypto.services import (
+        _as_utc_datetime,
+        _prepare_spot_context_series,
+        _spot_context_for_decision,
+    )
+
+    base = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    rows = []
+    for i in range(60):  # one candle per minute
+        rows.append(_ohlc_row(base + timedelta(minutes=i), str(100 + i)))
+    for i in range(0, 60, 7):  # kraken duplicates on some timestamps
+        rows.append(_ohlc_row(base + timedelta(minutes=i), str(200 + i), provider="kraken"))
+    for i in range(40, 60):  # ticks near the end, some with microstructure
+        payload = {"market_microstructure": {"best_bid": "1.0"}} if i % 3 == 0 else {}
+        rows.append(
+            _ohlc_row(base + timedelta(minutes=i, seconds=30), str(150 + i), source_kind="spot_tick", payload=payload)
+        )
+    rows.append(_ohlc_row(base + timedelta(minutes=30, seconds=10), None))  # null close dropped
+    rows.sort(key=lambda r: r.end_ts)
+    end_times = [_as_utc_datetime(r.end_ts) for r in rows]
+    prepared = _prepare_spot_context_series(rows)
+
+    for cutoff in (
+        base + timedelta(minutes=5),
+        base + timedelta(minutes=35),
+        base + timedelta(minutes=50, seconds=45),
+        base + timedelta(hours=2),
+        base - timedelta(minutes=1),
+    ):
+        legacy = _spot_context_for_decision(
+            rows, spot_end_times=end_times, decision_ts=cutoff,
+            target_price=Decimal("120"), mid_yes=Decimal("0.50"),
+        )
+        fast = _spot_context_for_decision(
+            rows, spot_end_times=end_times, prepared=prepared, decision_ts=cutoff,
+            target_price=Decimal("120"), mid_yes=Decimal("0.50"),
+        )
+        assert fast == legacy, f"divergence at cutoff {cutoff}"

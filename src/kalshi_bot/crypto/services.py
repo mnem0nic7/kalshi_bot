@@ -9039,6 +9039,10 @@ def _crypto_decision_rows(
         asset: [_as_utc_datetime(row.end_ts) for row in asset_rows]
         for asset, asset_rows in spot_by_asset.items()
     }
+    prepared_spot_by_asset = {
+        asset: _prepare_spot_context_series(asset_rows)
+        for asset, asset_rows in spot_by_asset.items()
+    }
 
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, datetime]] = set()
@@ -9112,6 +9116,7 @@ def _crypto_decision_rows(
         spot_context = _spot_context_for_decision(
             spot_by_asset.get(snapshot.asset_symbol, []),
             spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
+            prepared=prepared_spot_by_asset.get(snapshot.asset_symbol),
             decision_ts=decision_ts,
             target_price=snapshot.target_price_dollars or (settlement_snapshot.target_price_dollars if settlement_snapshot is not None else None),
             mid_yes=_clamp_price(mid),
@@ -9192,6 +9197,7 @@ def _crypto_decision_rows(
             spot_context = _spot_context_for_decision(
                 spot_by_asset.get(snapshot.asset_symbol, []),
                 spot_end_times=spot_end_times_by_asset.get(snapshot.asset_symbol),
+                prepared=prepared_spot_by_asset.get(snapshot.asset_symbol),
                 decision_ts=decision_ts,
                 target_price=snapshot.target_price_dollars,
                 mid_yes=mid,
@@ -9365,6 +9371,39 @@ def _dedup_spot_rows_by_provider_preference(rows: list[CryptoSpotOHLCRecord]) ->
     return [best_by_key[key][1] for key in keys_in_order]
 
 
+def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[str, Any]:
+    """Precompute the decision-time-independent parts of _spot_context_for_decision.
+
+    Dedup, the close-not-None filter, and the tick/historical split do not
+    depend on the decision timestamp, so doing them per training row made
+    feature building O(rows x spot) — hours over a 180d lookback. Prepared
+    once per asset, each row needs only a bisect plus a <=40-row tail.
+    """
+    clean = _dedup_spot_rows_by_provider_preference(
+        [row for row in spot_rows if row.close_dollars is not None]
+    )
+    hist = [row for row in clean if str(row.source_kind or "").strip().lower() != "spot_tick"]
+    micro_prefix: list[int] = []
+    last = -1
+    for i, row in enumerate(clean):
+        payload = getattr(row, "payload", None)
+        if isinstance(payload, dict) and isinstance(payload.get("market_microstructure"), dict):
+            last = i
+        micro_prefix.append(last)
+    return {
+        "rows": clean,
+        "end_times": [_as_utc_datetime(row.end_ts) for row in clean],
+        "hist_rows": hist,
+        "hist_end_times": [_as_utc_datetime(row.end_ts) for row in hist],
+        "micro_prefix": micro_prefix,
+    }
+
+
+# Largest tail any consumer needs: returns up to periods=24 (25 rows) and the
+# 33-row volatility window, with headroom.
+_SPOT_CONTEXT_TAIL_ROWS = 40
+
+
 def _spot_context_for_decision(
     spot_rows: list[CryptoSpotOHLCRecord],
     *,
@@ -9374,17 +9413,29 @@ def _spot_context_for_decision(
     mid_yes: Decimal,
     settings: Settings | None = None,
     mode: str = CRYPTO_SPOT_CONTEXT_HISTORICAL,
+    prepared: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     decision_utc = _as_utc_datetime(decision_ts)
-    if spot_end_times is not None:
+    prepared_microstructure_row: CryptoSpotOHLCRecord | None = None
+    if prepared is not None:
+        idx = bisect_right(prepared["end_times"], decision_utc)
+        eligible = prepared["rows"][max(0, idx - _SPOT_CONTEXT_TAIL_ROWS) : idx]
+        micro_i = prepared["micro_prefix"][idx - 1] if idx > 0 else -1
+        prepared_microstructure_row = prepared["rows"][micro_i] if micro_i >= 0 else None
+        if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
+            hidx = bisect_right(prepared["hist_end_times"], decision_utc)
+            if hidx > 0:
+                eligible = prepared["hist_rows"][max(0, hidx - _SPOT_CONTEXT_TAIL_ROWS) : hidx]
+    elif spot_end_times is not None:
         eligible = [row for row in spot_rows[:bisect_right(spot_end_times, decision_utc)] if row.close_dollars is not None]
+        eligible = _dedup_spot_rows_by_provider_preference(eligible)
     else:
         eligible = [
             row
             for row in spot_rows
             if _as_utc_datetime(row.end_ts) <= decision_utc and row.close_dollars is not None
         ]
-    eligible = _dedup_spot_rows_by_provider_preference(eligible)
+        eligible = _dedup_spot_rows_by_provider_preference(eligible)
     if not eligible:
         return {
             "spot_feature_status": "missing",
@@ -9418,23 +9469,26 @@ def _spot_context_for_decision(
     # Microstructure (exchange best bid/ask, recent trade count) only rides on
     # spot_tick payloads; capture the latest one BEFORE the historical mode
     # drops tick rows, so training sees the same features as live.
-    microstructure_row = next(
-        (
-            row
-            for row in reversed(eligible)
-            if isinstance(getattr(row, "payload", None), dict)
-            and isinstance(row.payload.get("market_microstructure"), dict)
-        ),
-        None,
-    )
-    if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
-        historical_eligible = [
-            row
-            for row in eligible
-            if str(row.source_kind or "").strip().lower() != "spot_tick"
-        ]
-        if historical_eligible:
-            eligible = historical_eligible
+    if prepared is not None:
+        microstructure_row = prepared_microstructure_row
+    else:
+        microstructure_row = next(
+            (
+                row
+                for row in reversed(eligible)
+                if isinstance(getattr(row, "payload", None), dict)
+                and isinstance(row.payload.get("market_microstructure"), dict)
+            ),
+            None,
+        )
+        if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
+            historical_eligible = [
+                row
+                for row in eligible
+                if str(row.source_kind or "").strip().lower() != "spot_tick"
+            ]
+            if historical_eligible:
+                eligible = historical_eligible
     current = eligible[-1]
     close = _decimal(current.close_dollars)
     stale_seconds = int((decision_utc - _as_utc_datetime(current.end_ts)).total_seconds())
