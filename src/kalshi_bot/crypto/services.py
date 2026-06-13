@@ -96,7 +96,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v9"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v10"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -10403,11 +10403,58 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         onehot_assets = assets
     feature_names = [*numeric, *[f"asset={asset}" for asset in onehot_assets]]
-    return {
+    schema = {
         "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
         "feature_names": feature_names,
         "numeric_feature_names": numeric,
         "asset_categories": assets,
+    }
+    return _crypto_prune_constant_features(schema, rows)
+
+
+# Availability flags are legitimately constant for assets whose data is never
+# missing; pruning them is routine. Any OTHER constant column is a pipeline
+# regression signal and is pruned loudly.
+_CRYPTO_EXPECTED_CONSTANT_FEATURES = frozenset({"spot_available", "settlement_window_available"})
+# Variance estimates from toy corpora are meaningless — unit tests and tiny
+# replay slices keep the full schema.
+_CRYPTO_CONSTANT_PRUNE_MIN_ROWS = 1000
+
+
+def _crypto_prune_constant_features(schema: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(rows) < _CRYPTO_CONSTANT_PRUNE_MIN_ROWS:
+        return schema
+    feature_names = list(schema["feature_names"])
+    first_vector: list[float] | None = None
+    varying: set[int] = set()
+    for row in rows:
+        vector = _crypto_raw_feature_vector(row, schema)
+        if first_vector is None:
+            first_vector = vector
+            continue
+        for index, value in enumerate(vector):
+            if index not in varying and value != first_vector[index]:
+                varying.add(index)
+        if len(varying) == len(feature_names):
+            return schema
+    constant = [name for index, name in enumerate(feature_names) if index not in varying]
+    if not constant:
+        return schema
+    unexpected = [name for name in constant if name not in _CRYPTO_EXPECTED_CONSTANT_FEATURES]
+    if unexpected:
+        logger.warning(
+            "crypto_schema_pruned_unexpected_constant_features count=%d names=%s",
+            len(unexpected),
+            ",".join(unexpected),
+        )
+    else:
+        logger.info("crypto_schema_pruned_constant_features names=%s", ",".join(constant))
+    constant_set = set(constant)
+    return {
+        **schema,
+        "feature_names": [name for name in feature_names if name not in constant_set],
+        "numeric_feature_names": [name for name in schema["numeric_feature_names"] if name not in constant_set],
+        "pruned_constant_features": constant,
     }
 
 
@@ -10521,7 +10568,10 @@ def _crypto_raw_feature_vector(
         "time_to_close_bucket_15m_plus": 1.0 if time_to_close_bucket == "15m_plus" else 0.0,
         "market_age_ratio": min(market_age_seconds / 900.0, 8.0) / 8.0,
         "spot_exchange_spread_bps": min(spot_exchange_spread / 200.0, 1.0),
-        "spot_exchange_recent_trade_count": min(spot_exchange_trade_count, 50.0) / 50.0,
+        # Log scaling: the old min(count, 50)/50 saturated permanently for liquid
+        # assets (BTC always has 50+ recent trades), flattening the feature to a
+        # constant. log1p keeps low-end resolution and ceilings at ~500 trades.
+        "spot_exchange_recent_trade_count": min(math.log1p(spot_exchange_trade_count) / math.log1p(500.0), 1.0),
         "spot_return_12_pct": max(-0.20, min(0.20, spot_return_12)) * 5.0,
         "spot_return_24_pct": max(-0.30, min(0.30, spot_return_24)) * (10.0 / 3.0),
         "spot_realized_volatility_32": max(0.0, min(0.20, spot_volatility_32)) * 5.0,
