@@ -10060,13 +10060,45 @@ def _crypto_dead_feature_report(
             if index not in varying and value != first_vector[index]:
                 varying.add(index)
     dead = [name for index, name in enumerate(feature_names) if index not in varying]
-    if dead:
+    # Microstructure features (exchange spread, recent-trade-count) only exist in
+    # the dense live spot snapshots; historical OHLC backfill has none, so they
+    # read constant on any history-dominated corpus. That is a data-density
+    # symptom — the same one behind the spot-coverage blocker — not a pipeline
+    # bug, so it is reported at INFO. Any OTHER dead feature is a real regression
+    # and stays at WARNING.
+    data_density_dead = [name for name in dead if name in _CRYPTO_DATA_DENSITY_FEATURES]
+    unexpected_dead = [name for name in dead if name not in _CRYPTO_DATA_DENSITY_FEATURES]
+    if unexpected_dead:
         logger.warning(
             "crypto_training_dead_features count=%d names=%s",
-            len(dead),
-            ",".join(dead),
+            len(unexpected_dead),
+            ",".join(unexpected_dead),
         )
-    return {"dead_feature_names": dead, "dead_feature_count": len(dead)}
+    if data_density_dead:
+        logger.info(
+            "crypto_training_data_density_constant_features count=%d names=%s",
+            len(data_density_dead),
+            ",".join(data_density_dead),
+        )
+    return {
+        "dead_feature_names": dead,
+        "dead_feature_count": len(dead),
+        "unexpected_dead_feature_names": unexpected_dead,
+        "data_density_dead_feature_names": data_density_dead,
+    }
+
+
+# Features that are populated only by dense live spot snapshots (market
+# microstructure + availability flags). They read constant on history-dominated
+# corpora until enough live data accumulates; not pipeline regressions.
+_CRYPTO_DATA_DENSITY_FEATURES = frozenset(
+    {
+        "spot_available",
+        "settlement_window_available",
+        "spot_exchange_spread_bps",
+        "spot_exchange_recent_trade_count",
+    }
+)
 
 
 def _crypto_training_quality_blockers(
@@ -10403,58 +10435,20 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         onehot_assets = assets
     feature_names = [*numeric, *[f"asset={asset}" for asset in onehot_assets]]
-    schema = {
+    # NOTE: do not auto-prune corpus-constant columns here. This builder is called
+    # per walk-forward fold, so per-fold pruning would yield inconsistent schemas
+    # across folds and flood logs with false-alarm warnings for features that are
+    # merely constant in an early/sparse fold (volume_log, funding_rate, ...).
+    # Structural constants (lone one-hot, self cross-returns) are pruned above
+    # because they are constant by construction in every fold. Data-driven
+    # constants (microstructure features with no historical coverage) are surfaced
+    # once on the full corpus by _crypto_dead_feature_report instead — that keeps
+    # the dead-feature signal meaningful and the fold schemas stable.
+    return {
         "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
         "feature_names": feature_names,
         "numeric_feature_names": numeric,
         "asset_categories": assets,
-    }
-    return _crypto_prune_constant_features(schema, rows)
-
-
-# Availability flags are legitimately constant for assets whose data is never
-# missing; pruning them is routine. Any OTHER constant column is a pipeline
-# regression signal and is pruned loudly.
-_CRYPTO_EXPECTED_CONSTANT_FEATURES = frozenset({"spot_available", "settlement_window_available"})
-# Variance estimates from toy corpora are meaningless — unit tests and tiny
-# replay slices keep the full schema.
-_CRYPTO_CONSTANT_PRUNE_MIN_ROWS = 1000
-
-
-def _crypto_prune_constant_features(schema: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
-    if len(rows) < _CRYPTO_CONSTANT_PRUNE_MIN_ROWS:
-        return schema
-    feature_names = list(schema["feature_names"])
-    first_vector: list[float] | None = None
-    varying: set[int] = set()
-    for row in rows:
-        vector = _crypto_raw_feature_vector(row, schema)
-        if first_vector is None:
-            first_vector = vector
-            continue
-        for index, value in enumerate(vector):
-            if index not in varying and value != first_vector[index]:
-                varying.add(index)
-        if len(varying) == len(feature_names):
-            return schema
-    constant = [name for index, name in enumerate(feature_names) if index not in varying]
-    if not constant:
-        return schema
-    unexpected = [name for name in constant if name not in _CRYPTO_EXPECTED_CONSTANT_FEATURES]
-    if unexpected:
-        logger.warning(
-            "crypto_schema_pruned_unexpected_constant_features count=%d names=%s",
-            len(unexpected),
-            ",".join(unexpected),
-        )
-    else:
-        logger.info("crypto_schema_pruned_constant_features names=%s", ",".join(constant))
-    constant_set = set(constant)
-    return {
-        **schema,
-        "feature_names": [name for name in feature_names if name not in constant_set],
-        "numeric_feature_names": [name for name in schema["numeric_feature_names"] if name not in constant_set],
-        "pruned_constant_features": constant,
     }
 
 
