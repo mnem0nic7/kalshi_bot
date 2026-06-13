@@ -41,3 +41,7 @@ Thumbs.db
 junit*.xml
 .hypothesis/
 infra/data/
+
+# Session-specific operational one-offs (reusable infra scripts stay tracked,
+# e.g. scripts/migrate_docker_to_ssd.sh, scripts/blue_green_redeploy.sh)
+scripts/spot_densify_and_retrain.sh
