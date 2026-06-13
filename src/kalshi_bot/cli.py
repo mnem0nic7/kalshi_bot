@@ -3555,6 +3555,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 max_messages=args.max_messages,
                 run_seconds=args.run_seconds,
                 crypto_only=args.crypto_only,
+                training_node=getattr(args, "training_node", False),
                 heartbeat_role=args.heartbeat_role,
             )
             print(json.dumps(result, indent=2))
@@ -5035,6 +5036,11 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--max-messages", type=int, default=None)
     daemon.add_argument("--run-seconds", type=float, default=None)
     daemon.add_argument("--crypto-only", action="store_true")
+    daemon.add_argument(
+        "--training-node",
+        action="store_true",
+        help="Run as a dedicated training node: only the nightly model-training scheduler, no trading/autonomy/exits.",
+    )
     daemon.add_argument("--heartbeat-role", default="daemon")
     daemon_trigger_group = daemon.add_mutually_exclusive_group()
     daemon_trigger_group.add_argument("--auto-trigger", action="store_true")

@@ -4,8 +4,14 @@ x-build: &build
     context: ..
     dockerfile: infra/docker/Dockerfile
 
+# 50/50 physical-core split (8 cores, hyperthreaded as sibling pairs n & n+8):
+# prod gets cores 0-3 (CPUs 0-3,8-11), the dedicated trainer gets cores 4-7
+# (CPUs 4-7,12-15). Keeps the live system isolated from training compute.
 x-cpu-limits: &cpu-limits
-  cpuset: "0-15"
+  cpuset: "0-3,8-11"
+
+x-cpu-trainer: &cpu-trainer
+  cpuset: "4-7,12-15"
 
 x-gpu-access: &gpu-access
   gpus: ${KALSHI_BOT_GPUS:-all}
@@ -445,14 +451,14 @@ services:
       APP_COLOR: green
 
   app_production_blue:
-    <<: [*production-app-base, *gpu-access]
+    <<: *production-app-base
     environment:
       <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: blue
 
   app_production_green:
-    <<: [*production-app-base, *gpu-access]
+    <<: *production-app-base
     environment:
       <<: *production-env
       KALSHI_ENV: production
@@ -485,11 +491,12 @@ services:
       start_period: 120s
 
   daemon_production_blue:
-    <<: [*production-daemon-base, *gpu-access]
+    <<: *production-daemon-base
     environment:
       <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: blue
+      CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "false"
       CRYPTO_QUOTE_EVIDENCE_ENABLED: "false"
       CRYPTO_SPOT_CURRENT_AUTO_ENABLED: "false"
     healthcheck:
@@ -500,11 +507,44 @@ services:
       start_period: 120s
 
   daemon_production_green:
-    <<: [*production-daemon-base, *gpu-access]
+    <<: *production-daemon-base
     environment:
       <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: green
+      CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "false"
+      CRYPTO_QUOTE_EVIDENCE_ENABLED: "false"
+      CRYPTO_SPOT_CURRENT_AUTO_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "python", "-m", "kalshi_bot.docker_healthcheck", "daemon"]
+      interval: 60s
+      timeout: 60s
+      retries: 3
+      start_period: 120s
+
+  # Dedicated training node: owns the GPU + cores 4-7, runs ONLY the nightly
+  # model-training scheduler (no trading/autonomy/exits/streaming). Writes model
+  # artifacts + replay gates to the shared DB that the live daemons read. Sized
+  # to leave cores 0-3 + all live-trading work isolated on the prod half.
+  trainer_production:
+    # cpu-trainer first so its cpuset wins the merge (YAML <<: earlier entries
+    # take precedence) over the prod cpuset carried by production-daemon-base.
+    <<: [*cpu-trainer, *gpu-access, *production-daemon-base]
+    command: ["python", "-m", "kalshi_bot.cli", "daemon", "--training-node"]
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+      APP_COLOR: trainer
+      CRYPTO_TRAINING_NODE: "true"
+      CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "true"
+      CRYPTO_XGBOOST_DEVICE: cuda
+      # Triple-guard: a trainer must never place orders.
+      CRYPTO_AUTONOMY_ENABLED: "false"
+      CRYPTO_TRADING_ENABLED: "false"
+      APP_SHADOW_MODE: "true"
+      APP_ENABLE_KILL_SWITCH: "true"
+      # Continuous collectors stay on the live daemons; the nightly refreshes its
+      # own training window inline.
       CRYPTO_QUOTE_EVIDENCE_ENABLED: "false"
       CRYPTO_SPOT_CURRENT_AUTO_ENABLED: "false"
     healthcheck:
@@ -515,7 +555,7 @@ services:
       start_period: 120s
 
   daemon_production_crypto_1h_blue:
-    <<: [*production-daemon-base, *gpu-access]
+    <<: *production-daemon-base
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
@@ -538,7 +578,7 @@ services:
       start_period: 120s
 
   daemon_production_crypto_1h_green:
-    <<: [*production-daemon-base, *gpu-access]
+    <<: *production-daemon-base
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env

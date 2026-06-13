@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     app_color: str = "blue"
+    # When true, this process is a dedicated training node: it runs ONLY the
+    # nightly model-training scheduler (no autonomy, exits, streaming, or order
+    # path) and bypasses the active-color gate so the single dedicated trainer
+    # always trains regardless of which color holds the live execution lock.
+    crypto_training_node: bool = False
     app_shadow_mode: bool = True
     app_auto_init_db: bool = False
     app_enable_kill_switch: bool = True

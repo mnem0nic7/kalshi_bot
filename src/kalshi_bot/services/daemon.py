@@ -347,9 +347,17 @@ class DaemonService:
         max_messages: int | None = None,
         run_seconds: float | None = None,
         crypto_only: bool = False,
+        training_node: bool = False,
         heartbeat_role: str | None = None,
     ) -> dict[str, Any]:
         previous_heartbeat_role = self._heartbeat_role
+        is_training_node = training_node or self.settings.crypto_training_node
+        if is_training_node:
+            self._heartbeat_role = self._normalize_heartbeat_role(heartbeat_role or "trainer")
+            try:
+                return await self._run_training_node(run_seconds=run_seconds)
+            finally:
+                self._heartbeat_role = previous_heartbeat_role
         self._heartbeat_role = self._normalize_heartbeat_role(heartbeat_role or ("crypto" if crypto_only else "daemon"))
         if crypto_only:
             try:
@@ -471,6 +479,66 @@ class DaemonService:
                 await asyncio.gather(follow_up_task, return_exceptions=True)
             self._stop_threaded_liveness_heartbeat()
             self._heartbeat_role = previous_heartbeat_role
+
+    async def _run_training_node(self, *, run_seconds: float | None = None) -> dict[str, Any]:
+        """Dedicated training node: heartbeat + the nightly model-training loop only.
+
+        No streaming, autonomy, exits, reconcile, or order path — those stay on
+        the live (color-scoped) daemons. The nightly's active-color gate is
+        bypassed (see _maybe_run_crypto_model_nightly_if_active) so this single
+        dedicated trainer always trains, writing artifacts/gates to the shared DB
+        that the live daemons read. Continuous data collection also stays on the
+        live daemons; the nightly refreshes its own training window inline.
+        """
+        tasks: dict[str, asyncio.Task] = {}
+        try:
+            await self.heartbeat_once(run_follow_up=False)
+            if run_seconds is None:
+                self._start_threaded_liveness_heartbeat()
+            tasks["heartbeat"] = asyncio.create_task(self._periodic_heartbeat_loop())
+
+            startup_delay = self._startup_delay_seconds()
+            if startup_delay > 0:
+                logger.info(
+                    "Training-node startup warmup delaying work for %.1f seconds env=%s color=%s",
+                    startup_delay,
+                    self.settings.kalshi_env,
+                    self.settings.app_color,
+                )
+                await asyncio.sleep(startup_delay)
+
+            if self.settings.crypto_model_nightly_auto_enabled:
+                tasks["crypto_model_nightly"] = asyncio.create_task(
+                    self._periodic_crypto_model_nightly_loop()
+                )
+            else:
+                logger.warning(
+                    "training-node started but crypto_model_nightly_auto_enabled=false — nothing to train"
+                )
+            if run_seconds is not None:
+                tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
+
+            done, pending = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+            completed_name = next(name for name, task in tasks.items() if task in done)
+            done_task = tasks[completed_name]
+            exc = None if done_task.cancelled() else done_task.exception()
+            if exc is not None:
+                raise exc
+
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            return {
+                "completed": completed_name,
+                "mode": "training_node",
+                "daemon_role": self._heartbeat_role,
+            }
+        finally:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            self._stop_threaded_liveness_heartbeat()
 
     async def _run_crypto_only(self, *, run_seconds: float | None = None) -> dict[str, Any]:
         tasks: dict[str, asyncio.Task] = {}
@@ -1225,7 +1293,9 @@ class DaemonService:
     async def _maybe_run_crypto_model_nightly_if_active(self) -> dict[str, Any] | None:
         if not self.settings.crypto_model_nightly_auto_enabled:
             return None
-        if not await self._is_active_color():
+        # A dedicated training node is the sole trainer (live daemons have the
+        # nightly disabled), so it trains regardless of which color is active.
+        if not self.settings.crypto_training_node and not await self._is_active_color():
             return None
         result = await self._maybe_run_crypto_model_nightly()
         if result is not None:
