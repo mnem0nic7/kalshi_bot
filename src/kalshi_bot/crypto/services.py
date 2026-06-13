@@ -2792,9 +2792,15 @@ class CryptoSpotService:
         days: int | None = None,
         frequency: str = "15m",
         asset_symbols: list[str] | None = None,
+        interval_seconds: int | None = None,
     ) -> dict[str, Any]:
         freq = normalize_frequency(frequency) or "15m"
-        interval_seconds = interval_seconds_for_frequency(freq)
+        # interval_seconds override lets a one-time historical densification fetch
+        # finer candles (e.g. 60s) than the frequency default (900s for 15m).
+        # Finer rows coexist with the coarse ones — interval_seconds is part of
+        # the spot-OHLC unique key — and the training lookup reads by frequency,
+        # so both densify the same series.
+        interval_seconds = int(interval_seconds) if interval_seconds else interval_seconds_for_frequency(freq)
         lookback_days = days or self.settings.crypto_history_lookback_days
         end = datetime.now(UTC)
         start = end - timedelta(days=lookback_days)

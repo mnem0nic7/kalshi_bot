@@ -717,6 +717,7 @@ async def _run_crypto_spot_command(args: argparse.Namespace, container: AppConta
             days=args.days,
             frequency=args.frequency,
             asset_symbols=asset_symbols,
+            interval_seconds=getattr(args, "interval_seconds", None),
         )
     elif args.crypto_spot_command == "status":
         result = await container.crypto_spot_service.status(
@@ -5082,6 +5083,12 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_spot_backfill.add_argument("--days", type=int, default=180)
     crypto_spot_backfill.add_argument("--frequency", default="15m")
     crypto_spot_backfill.add_argument("--assets", nargs="*", default=None)
+    crypto_spot_backfill.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=None,
+        help="Override candle granularity (e.g. 60 for 1-min historical densification); default uses the frequency interval.",
+    )
     crypto_spot_backfill.add_argument("--json", action="store_true")
     crypto_spot_status = crypto_spot_subparsers.add_parser("status")
     add_kalshi_env_argument(crypto_spot_status)
