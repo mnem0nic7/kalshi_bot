@@ -96,7 +96,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v8"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v9"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -9107,6 +9107,13 @@ def _crypto_snapshot_spread_bps(snapshot: Any, yes_bid: Decimal | None, yes_ask:
     recorded = getattr(snapshot, "spread_bps", None)
     if recorded is not None:
         return float(recorded)
+    # Market snapshots have no spread_bps column (only order-book snapshots do):
+    # derive from the snapshot's own quotes when the caller didn't extract them,
+    # otherwise prior-quote spread is always None and spread_change_bps_1 is dead.
+    if yes_bid is None and snapshot is not None:
+        yes_bid = _snapshot_price(snapshot, attr="yes_bid_dollars", dollar_keys=("yes_bid_dollars",), cent_keys=("yes_bid",))
+    if yes_ask is None and snapshot is not None:
+        yes_ask = _snapshot_price(snapshot, attr="yes_ask_dollars", dollar_keys=("yes_ask_dollars",), cent_keys=("yes_ask",))
     if yes_bid is None or yes_ask is None:
         return None
     return float((yes_ask - yes_bid) * Decimal("10000"))
@@ -9857,216 +9864,6 @@ def _json_ready_spot_features(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _nearest_candle(
-    candles: list[CryptoMarketCandlestickRecord],
-    decision_ts: datetime,
-) -> CryptoMarketCandlestickRecord | None:
-    eligible = [row for row in candles if row.end_period_ts <= decision_ts]
-    return eligible[-1] if eligible else None
-
-
-def _prior_candle(
-    candles: list[CryptoMarketCandlestickRecord],
-    decision_ts: datetime,
-) -> CryptoMarketCandlestickRecord | None:
-    eligible = [row for row in candles if row.end_period_ts < decision_ts]
-    return eligible[-2] if len(eligible) >= 2 else None
-
-
-def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    assets = sorted({str(row.get("asset_symbol") or "unknown") for row in rows})
-    numeric = [
-        "market_mid_logit",
-        "mid_yes",
-        "time_to_close_ratio",
-        "execution_spread",
-        "volume_log",
-        "open_interest_log",
-        "candle_momentum",
-        "target_price_log",
-        "spot_available",
-        "spot_moneyness_pct",
-        "spot_momentum_pct",
-        "spot_return_1_pct",
-        "spot_return_3_pct",
-        "spot_return_6_pct",
-        "spot_realized_volatility",
-        "spot_target_distance_volatility",
-        "kalshi_mid_spot_gap",
-        "spot_stale_ratio",
-        "asset_recent_yes_rate_delta",
-        "asset_recent_mid_error",
-        "quote_source_candlestick_proxy",
-        "quote_source_snapshot_quotes",
-        "strict_trade_eligible",
-        "time_to_close_bucket_0_5m",
-        "time_to_close_bucket_5_10m",
-        "time_to_close_bucket_10_15m",
-        "time_to_close_bucket_15m_plus",
-        "market_age_ratio",
-        "spot_exchange_spread_bps",
-        "spot_exchange_recent_trade_count",
-        "spot_return_12_pct",
-        "spot_return_24_pct",
-        "spot_realized_volatility_32",
-        "close_hour_sin",
-        "close_hour_cos",
-        "close_dow_sin",
-        "close_dow_cos",
-        "btc_return_1_pct",
-        "btc_return_3_pct",
-        "eth_return_1_pct",
-        "eth_return_3_pct",
-        "funding_rate_current",
-        "funding_rate_delta",
-    ]
-    feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
-    return {
-        "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
-        "feature_names": feature_names,
-        "numeric_feature_names": numeric,
-        "asset_categories": assets,
-    }
-
-
-def _crypto_feature_defaults(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    by_asset: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        by_asset[str(row.get("asset_symbol") or "unknown")].append(row)
-    asset_defaults: dict[str, dict[str, float]] = {}
-    for asset, asset_rows in by_asset.items():
-        recent_yes = [
-            float(_decimal(row["asset_recent_yes_rate"]))
-            for row in asset_rows
-            if row.get("asset_recent_yes_rate") is not None
-        ]
-        recent_error = [
-            float(_decimal(row["asset_recent_mid_error"]))
-            for row in asset_rows
-            if row.get("asset_recent_mid_error") is not None
-        ]
-        asset_defaults[asset] = {
-            "asset_recent_yes_rate": sum(recent_yes) / len(recent_yes) if recent_yes else 0.5,
-            "asset_recent_mid_error": sum(recent_error) / len(recent_error) if recent_error else 0.0,
-        }
-    return {
-        "global": {
-            "asset_recent_yes_rate": 0.5,
-            "asset_recent_mid_error": 0.0,
-        },
-        "by_asset": asset_defaults,
-    }
-
-
-def _crypto_raw_feature_vector(
-    row: dict[str, Any],
-    schema: dict[str, Any],
-    *,
-    defaults: dict[str, Any] | None = None,
-) -> list[float]:
-    mid = float(_clamp_price(_decimal(row.get("mid_yes_dollars") or Decimal("0.5000"))))
-    asset = str(row.get("asset_symbol") or "unknown")
-    spread_bps = float(row.get("spread_bps") or 0)
-    time_to_close = max(0.0, float(row.get("time_to_close_seconds") or 0))
-    volume = max(0.0, float(row.get("volume") or 0))
-    open_interest = max(0.0, float(row.get("open_interest") or 0))
-    target_price = max(0.0, float(_decimal(row.get("target_price_dollars") or Decimal("0"))))
-    candle_momentum = float(_decimal(row.get("candle_momentum_dollars") or Decimal("0")))
-    spot_moneyness = float(_decimal(row.get("spot_moneyness_pct") or Decimal("0")))
-    spot_momentum = float(_decimal(row.get("spot_momentum_pct") or Decimal("0")))
-    spot_return_1 = float(_decimal(row.get("spot_return_1_pct") or Decimal("0")))
-    spot_return_3 = float(_decimal(row.get("spot_return_3_pct") or Decimal("0")))
-    spot_return_6 = float(_decimal(row.get("spot_return_6_pct") or Decimal("0")))
-    spot_return_12 = float(_decimal(row.get("spot_return_12_pct") or Decimal("0")))
-    spot_return_24 = float(_decimal(row.get("spot_return_24_pct") or Decimal("0")))
-    spot_volatility = float(_decimal(row.get("spot_realized_volatility") or Decimal("0")))
-    spot_volatility_32 = float(_decimal(row.get("spot_realized_volatility_32") or Decimal("0")))
-    spot_target_distance_volatility = float(_decimal(row.get("spot_target_distance_volatility") or Decimal("0")))
-    kalshi_mid_spot_gap = float(_decimal(row.get("kalshi_mid_spot_gap") or Decimal("0")))
-    spot_stale_seconds = max(0.0, float(row.get("spot_stale_seconds") or 0))
-    spot_exchange_spread = max(0.0, float(row.get("spot_exchange_spread_bps") or 0))
-    spot_exchange_trade_count = max(0.0, float(row.get("spot_exchange_recent_trade_count") or 0))
-    btc_return_1 = float(_decimal(row.get("btc_return_1_pct") or Decimal("0")))
-    btc_return_3 = float(_decimal(row.get("btc_return_3_pct") or Decimal("0")))
-    eth_return_1 = float(_decimal(row.get("eth_return_1_pct") or Decimal("0")))
-    eth_return_3 = float(_decimal(row.get("eth_return_3_pct") or Decimal("0")))
-    funding_rate_current = float(_decimal(row.get("funding_rate_current") or Decimal("0")))
-    funding_rate_delta = float(_decimal(row.get("funding_rate_delta") or Decimal("0")))
-    market_age_seconds = max(0.0, float(row.get("market_age_seconds") or 0))
-    default_values = _crypto_default_values_for_asset(asset, defaults or {})
-    recent_yes = row.get("asset_recent_yes_rate")
-    recent_error = row.get("asset_recent_mid_error")
-    time_to_close_bucket = _crypto_time_to_close_bucket(time_to_close)
-    settlement_ts = row.get("settlement_ts")
-    if isinstance(settlement_ts, datetime):
-        _close_hour = _as_utc_datetime(settlement_ts).hour
-        _close_dow = _as_utc_datetime(settlement_ts).weekday()
-        close_hour_sin = math.sin(2 * math.pi * _close_hour / 24)
-        close_hour_cos = math.cos(2 * math.pi * _close_hour / 24)
-        close_dow_sin = math.sin(2 * math.pi * _close_dow / 7)
-        close_dow_cos = math.cos(2 * math.pi * _close_dow / 7)
-    else:
-        close_hour_sin = close_hour_cos = close_dow_sin = close_dow_cos = 0.0
-    numeric_values = {
-        "market_mid_logit": math.log(max(1e-6, mid) / max(1e-6, 1.0 - mid)),
-        "mid_yes": mid,
-        "time_to_close_ratio": min(time_to_close / 900.0, 4.0),
-        "execution_spread": min(spread_bps / 10000.0, 1.0),
-        "volume_log": math.log1p(volume) / 12.0,
-        "open_interest_log": math.log1p(open_interest) / 12.0,
-        "candle_momentum": max(-0.25, min(0.25, candle_momentum)) * 4.0,
-        "target_price_log": math.log1p(target_price) / 12.0 if target_price > 0 else 0.0,
-        "spot_available": 1.0 if row.get("spot_feature_status") == "available" else 0.0,
-        "spot_moneyness_pct": max(-0.25, min(0.25, spot_moneyness)) * 4.0,
-        "spot_momentum_pct": max(-0.05, min(0.05, spot_momentum)) * 20.0,
-        "spot_return_1_pct": max(-0.05, min(0.05, spot_return_1)) * 20.0,
-        "spot_return_3_pct": max(-0.10, min(0.10, spot_return_3)) * 10.0,
-        "spot_return_6_pct": max(-0.15, min(0.15, spot_return_6)) * (20.0 / 3.0),
-        "spot_realized_volatility": max(0.0, min(0.10, spot_volatility)) * 10.0,
-        "spot_target_distance_volatility": max(-8.0, min(8.0, spot_target_distance_volatility)) / 8.0,
-        "kalshi_mid_spot_gap": max(-0.50, min(0.50, kalshi_mid_spot_gap)) * 2.0,
-        "spot_stale_ratio": min(spot_stale_seconds / 3600.0, 6.0) / 6.0,
-        "asset_recent_yes_rate_delta": float(_decimal(recent_yes)) - 0.5 if recent_yes is not None else default_values["asset_recent_yes_rate"] - 0.5,
-        "asset_recent_mid_error": float(_decimal(recent_error)) if recent_error is not None else default_values["asset_recent_mid_error"],
-        "quote_source_candlestick_proxy": 1.0 if row.get("quote_source") == "candlestick_close_proxy" else 0.0,
-        "quote_source_snapshot_quotes": 1.0 if row.get("quote_source") in {"snapshot_quotes", "live_market_snapshot"} else 0.0,
-        "strict_trade_eligible": 1.0 if row.get("strict_trade_eligible") else 0.0,
-        "time_to_close_bucket_0_5m": 1.0 if time_to_close_bucket == "0_5m" else 0.0,
-        "time_to_close_bucket_5_10m": 1.0 if time_to_close_bucket == "5_10m" else 0.0,
-        "time_to_close_bucket_10_15m": 1.0 if time_to_close_bucket == "10_15m" else 0.0,
-        "time_to_close_bucket_15m_plus": 1.0 if time_to_close_bucket == "15m_plus" else 0.0,
-        "market_age_ratio": min(market_age_seconds / 900.0, 8.0) / 8.0,
-        "spot_exchange_spread_bps": min(spot_exchange_spread / 200.0, 1.0),
-        "spot_exchange_recent_trade_count": min(spot_exchange_trade_count, 50.0) / 50.0,
-        "spot_return_12_pct": max(-0.20, min(0.20, spot_return_12)) * 5.0,
-        "spot_return_24_pct": max(-0.30, min(0.30, spot_return_24)) * (10.0 / 3.0),
-        "spot_realized_volatility_32": max(0.0, min(0.20, spot_volatility_32)) * 5.0,
-        "close_hour_sin": close_hour_sin,
-        "close_hour_cos": close_hour_cos,
-        "close_dow_sin": close_dow_sin,
-        "close_dow_cos": close_dow_cos,
-        "btc_return_1_pct": max(-0.05, min(0.05, btc_return_1)) * 20.0,
-        "btc_return_3_pct": max(-0.10, min(0.10, btc_return_3)) * 10.0,
-        "eth_return_1_pct": max(-0.05, min(0.05, eth_return_1)) * 20.0,
-        "eth_return_3_pct": max(-0.10, min(0.10, eth_return_3)) * 10.0,
-        "funding_rate_current": max(-1.0, min(1.0, funding_rate_current / 0.003)),
-        "funding_rate_delta": max(-1.0, min(1.0, funding_rate_delta / 0.002)),
-    }
-    values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
-    values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
-    return values
-
-
-def _crypto_time_to_close_bucket(seconds: float) -> str:
-    if seconds <= 300:
-        return "0_5m"
-    if seconds <= 600:
-        return "5_10m"
-    if seconds <= 900:
-        return "10_15m"
-    return "15m_plus"
-
-
 def _crypto_spot_distance_signal_value(row: dict[str, Any]) -> Decimal | None:
     value = row.get("spot_target_distance_volatility")
     if value is None:
@@ -10078,38 +9875,6 @@ def _crypto_spot_distance_signal_value(row: dict[str, Any]) -> Decimal | None:
         return _decimal(value)
     except Exception:
         return None
-
-
-def _crypto_spot_distance_band(row: dict[str, Any]) -> str:
-    value = _crypto_spot_distance_signal_value(row)
-    if value is None:
-        return "missing"
-    score = float(value)
-    if score <= -2.0:
-        return "far_below"
-    if score < -0.5:
-        return "below"
-    if score <= 0.5:
-        return "near"
-    if score < 2.0:
-        return "above"
-    return "far_above"
-
-
-def _crypto_market_age_seconds(decision_ts: datetime, open_time: datetime | None) -> int | None:
-    if open_time is None:
-        return None
-    return max(0, int((_as_utc_datetime(decision_ts) - _as_utc_datetime(open_time)).total_seconds()))
-
-
-def _crypto_default_values_for_asset(asset: str, defaults: dict[str, Any]) -> dict[str, float]:
-    global_defaults = defaults.get("global") if isinstance(defaults.get("global"), dict) else {}
-    by_asset = defaults.get("by_asset") if isinstance(defaults.get("by_asset"), dict) else {}
-    asset_defaults = by_asset.get(asset) if isinstance(by_asset.get(asset), dict) else {}
-    return {
-        "asset_recent_yes_rate": float(asset_defaults.get("asset_recent_yes_rate", global_defaults.get("asset_recent_yes_rate", 0.5))),
-        "asset_recent_mid_error": float(asset_defaults.get("asset_recent_mid_error", global_defaults.get("asset_recent_mid_error", 0.0))),
-    }
 
 
 def _crypto_training_step_summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -10591,10 +10356,12 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "quote_source_candlestick_proxy",
         "quote_source_snapshot_quotes",
         "strict_trade_eligible",
+        # time_to_close_bucket_15m_plus is intentionally absent: 15m markets never
+        # reach it and the 1h bucketing emits different bucket names, so the column
+        # was constant-zero in every corpus — and one-hots drop one level anyway.
         "time_to_close_bucket_0_5m",
         "time_to_close_bucket_5_10m",
         "time_to_close_bucket_10_15m",
-        "time_to_close_bucket_15m_plus",
         "market_age_ratio",
         "spot_exchange_spread_bps",
         "spot_exchange_recent_trade_count",
@@ -10626,7 +10393,16 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "is_us_session",
         "is_asia_session",
     ]
-    feature_names = [*numeric, *[f"asset={asset}" for asset in assets]]
+    if len(assets) == 1:
+        # Single-asset corpus: the self cross-asset return is excluded at feature
+        # build time (train/live skew guard) and a lone one-hot is constant — both
+        # carry zero information, so drop the columns instead of training on them.
+        self_keys = {f"{assets[0].lower()}_return_1_pct", f"{assets[0].lower()}_return_3_pct"}
+        numeric = [name for name in numeric if name not in self_keys]
+        onehot_assets: list[str] = []
+    else:
+        onehot_assets = assets
+    feature_names = [*numeric, *[f"asset={asset}" for asset in onehot_assets]]
     return {
         "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
         "feature_names": feature_names,
@@ -10789,7 +10565,15 @@ def _crypto_raw_feature_vector(
         numeric_values["is_us_session"] = 0.0
         numeric_values["is_asia_session"] = 0.0
     values: list[float] = [numeric_values[name] for name in schema.get("numeric_feature_names") or []]
-    values.extend(1.0 if asset == category else 0.0 for category in schema.get("asset_categories") or [])
+    # Emit one-hots for exactly the asset columns the schema's feature_names carry:
+    # new single-asset schemas prune the constant lone one-hot, while artifacts
+    # trained before the pruning still list (and expect) it.
+    feature_name_set = set(schema.get("feature_names") or [])
+    values.extend(
+        1.0 if asset == category else 0.0
+        for category in schema.get("asset_categories") or []
+        if f"asset={category}" in feature_name_set
+    )
     return values
 
 
