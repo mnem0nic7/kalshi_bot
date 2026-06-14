@@ -67,3 +67,23 @@ async def test_bulk_upsert_empty_is_noop(tmp_path) -> None:
     async with session_factory() as session:
         repo = PlatformRepository(session, kalshi_env="production")
         assert await repo.bulk_upsert_crypto_training_feature_rows([]) == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_upsert_multi_chunk_accumulation(tmp_path) -> None:
+    """chunk_size=1 forces three separate chunks; all rows must be persisted and
+    the return value must reflect the total written across all chunks."""
+    session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        written = await repo.bulk_upsert_crypto_training_feature_rows(
+            [_row("x"), _row("y"), _row("z")],
+            chunk_size=1,
+        )
+        await session.commit()
+        assert written == 3
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        rows = await repo.list_crypto_training_feature_rows(frequency="15m", kalshi_env="production", limit=100)
+        assert {r.row_id for r in rows} == {"x", "y", "z"}

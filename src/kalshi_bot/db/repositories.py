@@ -2820,9 +2820,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             else:
                 for payload in chunk:
                     self.session.add(CryptoTrainingFeatureRowRecord(**payload))
-                await self.session.flush()
                 written += len(chunk)
                 continue
+            # Assumes all dicts in a chunk share the same keys — true for in-house callers
+            # that build rows from a uniform schema.
             update_cols = {
                 col: getattr(stmt.excluded, col)
                 for col in chunk[0].keys()
@@ -2837,8 +2838,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 set_=update_cols,
             )
             await self.session.execute(stmt)
-            await self.session.flush()
             written += len(chunk)
+        await self.session.flush()
         return written
 
     async def list_crypto_training_feature_rows(
