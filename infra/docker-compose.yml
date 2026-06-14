@@ -16,6 +16,15 @@ x-cpu-trainer: &cpu-trainer
 x-gpu-access: &gpu-access
   gpus: ${KALSHI_BOT_GPUS:-all}
 
+# OOM guardrail: the live trading stack (apps, daemons, Postgres) must never be
+# the kernel's victim under HOST-level memory pressure. A strongly negative
+# oom_score_adj makes the kernel reap default-priority processes first — stray
+# host-level analysis jobs (adj 0) and the trainer (adj +500, set on its block)
+# die before any trading container. This is the durable fix for the 2026-06-14
+# host-OOM incident; mem_limit alone only governs per-cgroup OOM, not host-wide.
+x-oom-protect: &oom-protect
+  oom_score_adj: -900
+
 x-common-env-base: &common-env-base
   APP_AUTO_INIT_DB: ${APP_AUTO_INIT_DB:-false}
   APP_ENABLE_KILL_SWITCH: ${APP_ENABLE_KILL_SWITCH:-true}
@@ -306,7 +315,7 @@ x-training-data-volumes: &training-data-volumes
   - training_data:/app/data/training
 
 x-app-common: &app-common
-  <<: [*build, *cpu-limits]
+  <<: [*build, *cpu-limits, *oom-protect]
   env_file: [../.env]
   expose: ["8000"]
   volumes: *codex-volumes
@@ -343,7 +352,7 @@ x-production-app-base: &production-app-base
       condition: service_completed_successfully
 
 x-daemon-common: &daemon-common
-  <<: [*build, *cpu-limits]
+  <<: [*build, *cpu-limits, *oom-protect]
   command: ["python", "-m", "kalshi_bot.cli", "daemon"]
   env_file: [../.env]
   volumes: *codex-volumes
@@ -375,7 +384,7 @@ x-production-daemon-base: &production-daemon-base
 
 services:
   postgres_demo:
-    <<: *cpu-limits
+    <<: [*cpu-limits, *oom-protect]
     image: pgvector/pgvector:pg16
     env_file: [../.env]
     environment:
@@ -392,7 +401,7 @@ services:
       - postgres_demo_data:/var/lib/postgresql/data
 
   postgres_production:
-    <<: *cpu-limits
+    <<: [*cpu-limits, *oom-protect]
     image: pgvector/pgvector:pg16
     env_file: [../.env]
     environment:
@@ -536,6 +545,13 @@ services:
     # take precedence) over the prod cpuset carried by production-daemon-base.
     <<: [*cpu-trainer, *gpu-access, *production-daemon-base]
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--training-node"]
+    # Override the inherited -900 protection: the trainer is NOT trading-critical,
+    # so it should be the kernel's first victim under host pressure. mem_limit caps
+    # its cgroup so a runaway materialize/booster build self-limits (cgroup-OOM +
+    # restart) instead of starving the host. 32g leaves ~30g for the live stack,
+    # Postgres page cache, and headroom on this 62g box.
+    oom_score_adj: 500
+    mem_limit: 32g
     environment:
       <<: *production-env
       KALSHI_ENV: production
