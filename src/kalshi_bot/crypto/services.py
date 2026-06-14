@@ -615,29 +615,37 @@ def _resolve_incremental_materialize_since(
     enabled: bool,
     warmup_hours: int,
     max_gap_hours: int,
-) -> tuple[datetime, str]:
-    """Decide the effective READ-phase ``since`` for ``_materialize_once``.
+    label_refresh_hours: int,
+) -> tuple[datetime, datetime | None, str]:
+    """Return ``(effective_since, upsert_floor, reason)``.
 
-    Returns ``(effective_since, reason)`` where ``reason`` is one of
-    ``'full_disabled'``, ``'full_cold_cache'``, ``'full_gap_exceeds_max'``, or
-    ``'incremental'``. The incremental tail reads from ``watermark - warmup`` but
-    is clamped so it never reads earlier than ``full_since`` (never more than the
-    configured lookback window).
+    ``reason`` is one of ``'full_disabled'``, ``'full_cold_cache'``,
+    ``'full_gap_exceeds_max'``, or ``'incremental'``. The incremental tail reads
+    from ``watermark - warmup`` but is clamped so it never reads earlier than
+    ``full_since`` (never more than the configured lookback window).
+
+    ``upsert_floor`` is ``None`` for full rebuilds (upsert everything); for
+    incremental it is ``watermark - label_refresh_hours`` (only rows newer than
+    this are re-upserted, so re-upserted rows always have their full recency
+    look-back contained in the read window and recompute identically to a full
+    rebuild). Because ``warmup_hours >> label_refresh_hours`` every re-upserted
+    row has many hours of prior settled markets loaded ahead of it.
     """
     if not enabled:
-        return full_since, "full_disabled"
+        return full_since, None, "full_disabled"
     if watermark is None:
         # Cold cache or a feature-schema bump invalidated all persisted rows.
-        return full_since, "full_cold_cache"
+        return full_since, None, "full_cold_cache"
     if watermark.tzinfo is None:
         watermark = watermark.replace(tzinfo=UTC)
     else:
         watermark = watermark.astimezone(UTC)
     if now - watermark > timedelta(hours=max_gap_hours):
-        return full_since, "full_gap_exceeds_max"
+        return full_since, None, "full_gap_exceeds_max"
     candidate = watermark - timedelta(hours=max(1, warmup_hours))
     effective_since = max(full_since, candidate)
-    return effective_since, "incremental"
+    upsert_floor = watermark - timedelta(hours=max(1, label_refresh_hours))
+    return effective_since, upsert_floor, "incremental"
 
 
 async def _list_crypto_spot_rows_with_cross_assets(
@@ -3295,20 +3303,22 @@ class CryptoTrainingBackfillService:
                     kalshi_env=self.settings.kalshi_env,
                     feature_schema_version=CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
                 )
-            since, since_reason = _resolve_incremental_materialize_since(
+            since, upsert_floor, since_reason = _resolve_incremental_materialize_since(
                 full_since=full_since,
                 now=now_utc,
                 watermark=watermark,
                 enabled=self.settings.crypto_train_incremental_materialize_enabled,
                 warmup_hours=self.settings.crypto_train_incremental_warmup_hours,
                 max_gap_hours=self.settings.crypto_train_incremental_max_gap_hours,
+                label_refresh_hours=self.settings.crypto_train_incremental_label_refresh_hours,
             )
             logger.info(
-                "crypto_materialize window freq=%s mode=%s since=%s watermark=%s",
+                "crypto_materialize window freq=%s mode=%s since=%s watermark=%s upsert_floor=%s",
                 freq,
                 since_reason,
                 since.isoformat(),
                 watermark.isoformat() if watermark else None,
+                upsert_floor.isoformat() if upsert_floor else None,
             )
             snapshots = await repo.list_crypto_settled_market_snapshots(
                 frequency=freq,
@@ -3371,6 +3381,10 @@ class CryptoTrainingBackfillService:
                 )
             feature_row_values: list[dict[str, Any]] = []
             for row in decision_rows:
+                if upsert_floor is not None:
+                    row_dt = _as_utc_datetime(row.get("decision_ts"))
+                    if row_dt is not None and row_dt <= upsert_floor:
+                        continue
                 payload = _crypto_training_json_ready(row)
                 feature_hash = _crypto_training_build_id(payload)
                 feature_row_values.append(
@@ -3395,6 +3409,7 @@ class CryptoTrainingBackfillService:
                     )
                 )
             await repo.bulk_upsert_crypto_training_feature_rows(feature_row_values)
+            rows_upserted = len(feature_row_values)
             outcome_count = await self._materialize_decision_outcomes(
                 session,
                 repo,
@@ -3423,7 +3438,7 @@ class CryptoTrainingBackfillService:
                 source_build_id=build_id,
                 window_start_ts=window_start,
                 window_end_ts=window_end,
-                rows_materialized=len(decision_rows),
+                rows_materialized=rows_upserted,
                 strict_trade_eligible_rows=strict_rows,
                 spot_coverage_pct=spot_coverage,
                 decision_outcome_count=outcome_count,
@@ -3451,7 +3466,7 @@ class CryptoTrainingBackfillService:
             "status": quality_status,
             "source_build_id": build_id,
             "quality_run_id": quality.id,
-            "rows_materialized": len(decision_rows),
+            "rows_materialized": rows_upserted,
             "strict_trade_eligible_rows": strict_rows,
             "spot_coverage_pct": spot_coverage,
             "decision_outcome_count": outcome_count,

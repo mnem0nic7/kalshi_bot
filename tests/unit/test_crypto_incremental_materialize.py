@@ -190,7 +190,7 @@ async def test_incremental_materialize_narrows_window_and_refreshes_late_label(t
 
     # Capture the effective `since` the resolver hands the READ phase on each call.
     real_resolve = crypto_services._resolve_incremental_materialize_since
-    resolved: list[tuple[datetime, str]] = []
+    resolved: list[tuple[datetime, datetime | None, str]] = []
 
     def _spy(**kwargs):
         result = real_resolve(**kwargs)
@@ -211,7 +211,7 @@ async def test_incremental_materialize_narrows_window_and_refreshes_late_label(t
     )
     store_a = await _store_map(session_factory, settings)
     # Cold cache -> full window read. OLD + MID settled (LATE still open -> no row).
-    assert resolved[-1][1] == "full_cold_cache"
+    assert resolved[-1][2] == "full_cold_cache"
     assert "KXBTC15M-OLD:2026-06-02T23:50:00" in store_a
     assert "KXBTC15M-MID:2026-06-07T23:50:00" in store_a
     late_key = "KXBTC15M-LATE:2026-06-12T17:50:00"
@@ -230,8 +230,9 @@ async def test_incremental_materialize_narrows_window_and_refreshes_late_label(t
 
     # (a) The incremental run narrowed the READ window to watermark - warmup, which
     # is strictly newer than the full lookback window start.
-    effective_since, reason = resolved[-1]
+    effective_since, upsert_floor, reason = resolved[-1]
     assert reason == "incremental"
+    assert upsert_floor is not None
     full_since_floor = NOW - timedelta(days=LOOKBACK_DAYS + 1)
     assert effective_since > full_since_floor
     # The tail must start well after the OLD market (10 days back) and after the
@@ -247,3 +248,176 @@ async def test_incremental_materialize_narrows_window_and_refreshes_late_label(t
     # preserved untouched from build A.
     assert "KXBTC15M-OLD:2026-06-02T23:50:00" in store_b
     assert store_b["KXBTC15M-OLD:2026-06-02T23:50:00"] == store_a["KXBTC15M-OLD:2026-06-02T23:50:00"]
+
+
+# --- Real byte-for-byte parity test for the label-refresh zone --------------
+#
+# warmup_hours is set large enough that the incremental read window contains the
+# FULL recency look-back (<=20 prior settled markets) for every re-upserted row,
+# and label_refresh_hours is small so only the newest few rows are re-upserted.
+# Under those conditions every re-upserted row MUST recompute byte-for-byte
+# identically to a from-scratch full rebuild.
+PARITY_WARMUP_HOURS = 20 * 24  # 20 days: contains all priors for re-upserted rows
+PARITY_LABEL_REFRESH_HOURS = 2  # only rows within 2h of the watermark are re-upserted
+
+
+def _parity_settings(tmp_path, name: str) -> Settings:
+    return Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/{name}.db",
+        kalshi_env="production",
+        crypto_train_lookback_days=LOOKBACK_DAYS,
+        crypto_train_incremental_materialize_enabled=True,
+        crypto_train_incremental_warmup_hours=PARITY_WARMUP_HOURS,
+        crypto_train_incremental_max_gap_hours=24 * 365,
+        crypto_train_incremental_label_refresh_hours=PARITY_LABEL_REFRESH_HOURS,
+        crypto_min_training_samples=1,
+    )
+
+
+def _parity_market_set() -> dict[str, datetime]:
+    """A run of settled BTC markets spaced 1h apart ending near NOW. Spacing keeps
+    the whole set inside the 20-day warmup so re-upserted rows' look-back is fully
+    loaded in the narrow read window."""
+    return {
+        "KXBTC15M-M01": NOW - timedelta(hours=12),
+        "KXBTC15M-M02": NOW - timedelta(hours=11),
+        "KXBTC15M-M03": NOW - timedelta(hours=10),
+        "KXBTC15M-M04": NOW - timedelta(hours=9),
+        "KXBTC15M-M05": NOW - timedelta(hours=8),
+        "KXBTC15M-M06": NOW - timedelta(hours=7),
+        "KXBTC15M-M07": NOW - timedelta(hours=6),
+        "KXBTC15M-M08": NOW - timedelta(hours=5),
+        # M09 is OPEN at build A, SETTLES at build B (label None -> settled).
+        "KXBTC15M-M09": NOW - timedelta(hours=2),
+        # M10 is brand-new at build B.
+        "KXBTC15M-M10": NOW - timedelta(hours=1),
+    }
+
+
+def _result_for(idx: int) -> str:
+    return "yes" if idx % 2 == 0 else "no"
+
+
+@pytest.mark.asyncio
+async def test_incremental_refresh_zone_byte_for_byte_parity(tmp_path) -> None:
+    markets = _parity_market_set()
+    closes = list(markets.items())
+
+    # ---- Reference FULL rebuild (incremental disabled) on its own DB ----
+    full_settings = _parity_settings(tmp_path, "parity_full")
+    full_settings = full_settings.model_copy(
+        update={"crypto_train_incremental_materialize_enabled": False}
+    )
+    full_factory = await _factory(full_settings)
+    await _seed(full_factory, _spot_rows())
+    full_records: list = []
+    for idx, (ticker, close) in enumerate(closes):
+        full_records.extend(_settled_market(ticker, close_time=close, result=_result_for(idx)))
+    await _seed(full_factory, full_records)
+    full_service = _service(full_settings, full_factory)
+    await full_service._materialize_once(
+        frequency="15m",
+        asset_symbols=["BTC"],
+        materialize_microstructure=False,
+        materialize_settlement_windows=False,
+    )
+    FULL = await _store_map(full_factory, full_settings)
+
+    # ---- Incremental path: build A (cold full) then build B (incremental) ----
+    inc_settings = _parity_settings(tmp_path, "parity_inc")
+    inc_factory = await _factory(inc_settings)
+    await _seed(inc_factory, _spot_rows())
+
+    # Build A: everything EXCEPT M09's settlement and M10 entirely. M09 is open.
+    build_a_records: list = []
+    open_idx = list(markets).index("KXBTC15M-M09")
+    new_idx = list(markets).index("KXBTC15M-M10")
+    for idx, (ticker, close) in enumerate(closes):
+        if idx == new_idx:
+            continue  # M10 not present yet
+        if idx == open_idx:
+            # M09 only has its pre-close (open) snapshot at build A.
+            build_a_records.append(
+                _make_snapshot(
+                    ticker,
+                    observed_at=close - timedelta(minutes=10),
+                    settlement_result=None,
+                    close_time=close,
+                )
+            )
+            continue
+        build_a_records.extend(_settled_market(ticker, close_time=close, result=_result_for(idx)))
+    await _seed(inc_factory, build_a_records)
+    inc_service = _service(inc_settings, inc_factory)
+    await inc_service._materialize_once(
+        frequency="15m",
+        asset_symbols=["BTC"],
+        materialize_microstructure=False,
+        materialize_settlement_windows=False,
+    )
+    store_a = await _store_map(inc_factory, inc_settings)
+
+    # Watermark after build A = max decision_ts persisted (M09's open decision row,
+    # observed 10 min before its close at NOW-2h, is the newest).
+    async with inc_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=inc_settings.kalshi_env)
+        watermark_b = await repo.get_crypto_training_feature_watermark(
+            frequency="15m",
+            kalshi_env=inc_settings.kalshi_env,
+            feature_schema_version=crypto_services.CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+        )
+    assert watermark_b is not None
+    if watermark_b.tzinfo is None:
+        watermark_b = watermark_b.replace(tzinfo=UTC)
+    upsert_floor_b = watermark_b - timedelta(hours=PARITY_LABEL_REFRESH_HOURS)
+
+    # Build B: settle M09 + add brand-new M10 (incremental ON).
+    m09_ticker, m09_close = closes[open_idx]
+    m10_ticker, m10_close = closes[new_idx]
+    build_b_records: list = [
+        _make_snapshot(
+            m09_ticker,
+            observed_at=m09_close,
+            settlement_result=_result_for(open_idx),
+            close_time=m09_close,
+        ),
+        *_settled_market(m10_ticker, close_time=m10_close, result=_result_for(new_idx)),
+    ]
+    await _seed(inc_factory, build_b_records)
+    await inc_service._materialize_once(
+        frequency="15m",
+        asset_symbols=["BTC"],
+        materialize_microstructure=False,
+        materialize_settlement_windows=False,
+    )
+    store_b = await _store_map(inc_factory, inc_settings)
+
+    # Identify which rows build B re-upserted: decision_ts > upsert_floor.
+    def _decision_ts(row_id: str) -> datetime:
+        return datetime.fromisoformat(row_id.split(":", 1)[1]).replace(tzinfo=UTC)
+
+    refreshed_ids = [rid for rid in store_b if _decision_ts(rid) > upsert_floor_b]
+    assert refreshed_ids, "expected at least one re-upserted row in the refresh zone"
+
+    # PARITY: every re-upserted row equals the from-scratch full rebuild
+    # byte-for-byte on both feature_hash AND label_yes.
+    for rid in refreshed_ids:
+        assert rid in FULL, f"re-upserted row {rid} missing from full rebuild"
+        assert store_b[rid] == FULL[rid], (
+            f"refresh-zone parity violated for {rid}: "
+            f"incremental={store_b[rid]} full={FULL[rid]}"
+        )
+
+    # At least one re-upserted row had its label refreshed None -> settled (M09).
+    m09_key = next(rid for rid in refreshed_ids if rid.startswith(f"{m09_ticker}:"))
+    assert store_a.get(m09_key, (None, None))[1] is None
+    assert store_b[m09_key][1] in {0, 1}
+
+    # Rows OLDER than the upsert floor were NOT modified by build B (preserved
+    # exactly from build A).
+    preserved_ids = [rid for rid in store_a if _decision_ts(rid) <= upsert_floor_b]
+    assert preserved_ids, "expected at least one preserved row below the upsert floor"
+    for rid in preserved_ids:
+        assert store_b[rid] == store_a[rid], (
+            f"row {rid} below upsert floor was modified by incremental build B"
+        )

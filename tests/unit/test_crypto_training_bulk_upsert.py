@@ -121,3 +121,4 @@ def test_incremental_materialize_defaults() -> None:
     assert s.crypto_train_incremental_materialize_enabled is True
     assert s.crypto_train_incremental_warmup_hours == 72
     assert s.crypto_train_incremental_max_gap_hours == 168
+    assert s.crypto_train_incremental_label_refresh_hours == 24
