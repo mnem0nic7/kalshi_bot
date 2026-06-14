@@ -146,6 +146,28 @@ def _settled_label_matches_requested_duration(market: CryptoMarket, frequency: s
 
 
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
+
+
+def _resolve_crypto_shadow_evidence_mode(
+    *,
+    production_mode: bool,
+    quote_evidence_enabled: bool,
+    production_autonomy_enabled: bool,
+    shadow_evidence_always: bool,
+) -> bool:
+    """Whether the shadow-evidence decision path should run this cycle.
+
+    Historically shadow-evidence only ran when production autonomy was OFF
+    (``not production_autonomy_enabled``). With ``shadow_evidence_always`` set,
+    it runs alongside production autonomy so SHADOW-mode assets keep emitting
+    exploratory shadow decisions for pre-promotion evaluation. This gates only
+    decision LOGGING — live execution stays blocked by asset_mode==LIVE checks.
+    """
+    return bool(
+        production_mode
+        and quote_evidence_enabled
+        and (shadow_evidence_always or not production_autonomy_enabled)
+    )
 CRYPTO_CROSS_ASSET_FEATURE_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE")
 CRYPTO_ENTRY_OPTIMIZER_GRID = {
     "min_fee_adjusted_edge_bps": (750, 1000, 1500, 2500, 5000),
@@ -6489,10 +6511,11 @@ class CryptoAutonomyService:
             raise
         runtime_autonomy_enabled = bool(crypto_policy.production_autonomy_enabled)
         production_autonomy_enabled = self.settings.crypto_production_autonomy_enabled or crypto_policy.production_autonomy_enabled
-        shadow_evidence_mode = bool(
-            production_mode
-            and self.settings.crypto_quote_evidence_enabled
-            and not production_autonomy_enabled
+        shadow_evidence_mode = _resolve_crypto_shadow_evidence_mode(
+            production_mode=production_mode,
+            quote_evidence_enabled=self.settings.crypto_quote_evidence_enabled,
+            production_autonomy_enabled=production_autonomy_enabled,
+            shadow_evidence_always=self.settings.crypto_shadow_evidence_always_enabled,
         )
         if not self.settings.crypto_autonomy_enabled and not runtime_autonomy_enabled and not force and not shadow_evidence_mode:
             return {

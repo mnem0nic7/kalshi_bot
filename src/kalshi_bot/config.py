@@ -307,6 +307,13 @@ class Settings(BaseSettings):
     crypto_replay_min_spot_coverage_pct: float = 0.95
     crypto_autonomy_enabled: bool = False
     crypto_production_autonomy_enabled: bool = False
+    # When true, the shadow-evidence decision path runs ALONGSIDE production
+    # autonomy (instead of only when production autonomy is off). This lets
+    # SHADOW-mode assets (e.g. HYPE/ETH/SOL/XRP) keep emitting exploratory
+    # shadow decisions for ongoing pre-promotion evaluation while the live
+    # assets trade. It NEVER enables live orders — execution stays gated by
+    # asset_mode==LIVE / live-eligibility checks. Default off (safe).
+    crypto_shadow_evidence_always_enabled: bool = False
     # Sleep interval for idle/inactive-color states only. The active-color loop
     # runs continuously (asyncio.sleep(0) between iterations) so this value has
     # no effect on trading cadence.
