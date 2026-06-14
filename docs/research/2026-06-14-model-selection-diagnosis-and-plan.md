@@ -64,6 +64,27 @@ The real models are **well-calibrated** (Brier ~0.17, vs 0.28 for the baseline-d
 
 **P3 — Investigate HYPE's 0 post-retrain decisions** (decision-flow / volume gap).
 
+## Execution update (2026-06-14, multi-agent workflow `wf_87c229de`)
+
+**P0 — DONE & shipped (commit 971e3c0).** Per-candidate `candidate_selection_table` + `champion_model_type` projected into artifact `metrics`, plus one INFO log line per asset/freq. Pure read-side projection; `_crypto_select_champion` untouched (unit-tested; correctness + safety reviewed). A fallback is now self-explaining from the artifact/logs.
+
+**Real OOS margins (now read directly from artifact `metrics` — an earlier "metrics holds only fees_dollars" claim was a SQL bug):**
+
+| asset | champion | `champion_selection_reason` | oos_net | oos_selected_count |
+|---|---|---|---|---|
+| HYPE | spot_distance_residual | `selected_positive_oos_pnl_non_market_candidate` | +1.60 | 3 |
+| BNB | spot_distance_residual | `selected_positive_oos_pnl_non_market_candidate` | +0.86 | 3 |
+| DOGE | spot_distance_residual | `diagnostic_only_best_non_market_oos_pnl` | −1.47 | 10 |
+| BTC/ETH/SOL/XRP | market_mid_baseline | `fallback_market_mid_no_non_market_candidate` | 0.00 | 0 |
+
+Two things stand out: the majors produced **0 OOS trade candidates** (nothing cleared net>0 after fee), and the "winners" were chosen on **3 trades** — selection is running on single-digit OOS counts (statistically noisy).
+
+**P1 — refined root cause (no code change; trainer experiments next).** Feature coverage is **ruled out** (all 7 assets have real Coinbase spot: `spot_feature_status=available`, `spot_proxy_only=0` for 100% of rows). The binding constraint is the **flat cent-ceiling taker fee × market efficiency**: `estimate_kalshi_taker_fee_dollars` rounds `0.07·p·(1−p)` **up to a whole cent**, so any contract priced 0.20–0.80 pays a flat ~2¢; on ultra-efficient majors (BTC ~20 bps spread) the mid is near-fair, so no trade clears net>0 → 0 candidates → baseline. DOGE/HYPE trade at ~400 bps where the mid is exploitable. Caveat: SOL/XRP have wide spreads yet still fail → wide spread is necessary-not-sufficient (weaker fit / fewer real-quote rows). **Trainer-side experiments (run in the mem-capped trainer, not the host):** (H1) re-run BTC/ETH OOS with fee `round_up_to_cent=False` and with fee_rate halved — if net/advantage flip positive, the cent ceiling is the binding constraint; (H2) log per-asset `model_net` vs `market_mid_net` separately; (H3) report `oos_trade_candidate_count` per asset post bucket-gating. Most promising lever if action is wanted: a **fee-aware per-asset edge floor** so efficient majors aren't structurally excluded — but that is gate-threshold territory (`autonomous_gate_tuning` authority, validated against realized fills), not a manual edit.
+
+**P2 — root cause found; fix gated to next retrain (no hot change).** `spot_distance_residual` and `sklearn_logistic` fit isotonic **in-sample on all rows** ([services.py:11133](../../src/kalshi_bot/crypto/services.py#L11133)), unlike the tree models which hold out the most-recent 15% (`_cal_split_idx = int(len*0.85)` when `len>=2000`) to fit calibration out-of-sample. In-sample isotonic on the lowest-density mid band (0.25–0.65) leaves the observed ~0.1–0.2 overconfidence. The genuine fix is **holdout parity** for the residual/logistic calibration — but it changes how the *only live models* (HYPE/DOGE) are calibrated, so it belongs in a reviewed change validated through the backtest/replay-gate flow, **not** a hot edit. Decision: let the next nightly regenerate calibration, watch the residual via P0 observability + a re-audit, and make the holdout-parity edit only if it persists.
+
+**P3 — not a defect; needs an operator intent decision.** HYPE is **intentionally shadowed**; with `PRODUCTION_CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true`, `shadow_evidence_mode` is False ([services.py:6470](../../src/kalshi_bot/crypto/services.py#L6470)), so shadow-mode assets are skipped with `not_live_eligible` before any room/decision is created. This is why ETH/SOL/XRP/HYPE all went silent ~2026-06-10 when the 3 live assets were promoted. Options: **(a)** decouple `shadow_evidence_mode` from `production_autonomy_enabled` (small code change) so shadowed assets resume emitting *shadow* decisions (evidence for promotion, **no live orders** — live execution still gated by `asset_mode==LIVE`); **(b)** promote HYPE to live `asset_mode` (deployment-control metadata) to actually trade it; **(c)** leave as-is. Awaiting operator direction.
+
 ### Explicitly NOT doing
 - **No recalibration layer on `market_mid_baseline`** — nothing to calibrate; it echoes the market.
 - **No fading of the market's near-expiry overconfidence** as an edge — favorite-longshot / NO-side taker edge was REFUTED in the external research; only act via an OOS-replay-validated, fee-net strategy.
