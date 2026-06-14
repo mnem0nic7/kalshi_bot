@@ -112,3 +112,12 @@ async def test_watermark_is_max_decision_time_for_schema(tmp_path) -> None:
             frequency="1h", kalshi_env="production", feature_schema_version="crypto-rich-v10"
         )
         assert none_wm is None
+
+
+def test_incremental_materialize_defaults() -> None:
+    from kalshi_bot.config import Settings
+
+    s = Settings(database_url="sqlite+aiosqlite:///:memory:")
+    assert s.crypto_train_incremental_materialize_enabled is True
+    assert s.crypto_train_incremental_warmup_hours == 72
+    assert s.crypto_train_incremental_max_gap_hours == 168

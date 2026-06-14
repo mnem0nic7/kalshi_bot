@@ -216,6 +216,9 @@ class Settings(BaseSettings):
     crypto_train_max_snapshots: int = 500_000
     crypto_train_max_candlesticks: int = 500_000
     crypto_train_max_spot_rows: int = 600_000
+    crypto_train_incremental_materialize_enabled: bool = True
+    crypto_train_incremental_warmup_hours: int = 72
+    crypto_train_incremental_max_gap_hours: int = 168
     # Balance training sample weights so each market contributes equally
     # regardless of how many 15s snapshot rows it produced (~60 rows/market).
     crypto_train_market_balanced_weights: bool = True
