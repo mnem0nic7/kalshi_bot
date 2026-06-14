@@ -2,7 +2,7 @@
 
 ## Runtime shape
 
-The platform is one async Python service with four main layers:
+The platform is one async Python codebase deployed as several async service roles. The main application layers are:
 
 1. Integrations
    - Kalshi REST signing and order submission
@@ -10,7 +10,7 @@ The platform is one async Python service with four main layers:
    - NOAA/NWS weather ingestion
 2. Deterministic engines
    - Weather fair-value estimation
-   - Crypto 15-minute signal selection and replay-gated calibration
+   - Crypto 15-minute and 1-hour signal selection with replay-gated calibration
    - Shadow-first Gumbel/KDE/climatology probability primitives
    - Adapter-first ensemble fusion primitives
    - Shadow-first uncertainty, fee-aware Kelly, survival, and exit-risk primitives
@@ -34,6 +34,24 @@ The platform is one async Python service with four main layers:
    - server-rendered UI
    - SSE transcript stream
    - kill-switch and promotion controls
+
+## Deployment topology
+
+Docker Compose runs the same image in role-specific containers:
+
+| Role | Services | Notes |
+| --- | --- | --- |
+| Databases | `postgres_demo`, `postgres_production` | Separate pgvector Postgres instances with independent migrations |
+| Migrations | `migrate_demo`, `migrate_production` | Alembic upgrade jobs used before app/daemon startup |
+| Blue/green runtime | `app_<env>_<color>`, `daemon_<env>_<color>` | Both colors run; only `deployment_control.active_color` can execute live orders |
+| Web surfaces | `web_demo`, `web_production`, `web_strategies` | Caddy-facing FastAPI surfaces; `sync-web-color.sh` aligns their `APP_COLOR` with the DB active color |
+| Current crypto evidence | `crypto_current_production`, `crypto_current_1h_production` | Singleton collectors for open-market quote and spot evidence |
+| Crypto model daemon | `daemon_production_crypto_1h_<color>` | Optional blue/green 1h model-path worker with heartbeat role `crypto_1h` |
+| Non-model Touch20 | `crypto_non_model_btc15m_touch20_production`, `crypto_non_model_1h_touch20_production` | Independent Touch20 entry/exit workers controlled by explicit rule and trading flags |
+| Training node | `trainer_production` | Dedicated singleton running `daemon --training-node`; owns the trainer CPU set/GPU and is forced shadow/kill-switch/trading-off |
+| Reverse proxy | `caddy` | Checked-in route proxies localhost and `home.kb-trade.trade` to `web_production` |
+
+`infra/scripts/start-stack.sh` is the runtime recovery entry point. It starts the app, daemon, web, Caddy, and enabled crypto utility services, then records boot success through the watchdog CLI. The dedicated `trainer_production` container is managed separately so training deploys do not disturb live daemons.
 
 ## Workflow
 
@@ -89,7 +107,7 @@ Postgres stores:
 
 ## Live stream path
 
-The websocket ingest path is separate from room execution:
+The websocket ingest path is separate from room execution and runs inside the daemon containers:
 
 1. Connect to authenticated Kalshi WS
 2. Subscribe to `market_lifecycle_v2`, `orderbook_delta`, `user_orders`, and `fill`
@@ -101,13 +119,23 @@ The websocket ingest path is separate from room execution:
 
 ## Auto-trigger path
 
-When auto-triggering is enabled:
+When auto-triggering is enabled, the active-color daemon owns room launch decisions:
 
 1. Streamed orderbook updates refresh `market_state`
 2. The auto-trigger coordinator checks whether the market is configured and actionable
 3. It enforces cooldown and single-active-room rules per market
 4. It creates a new room and launches the existing supervisor workflow
 5. Trigger metadata is stored in checkpoints under `auto_trigger:<market>`
+
+## Training node path
+
+`trainer_production` is a daemon-mode process with `CRYPTO_TRAINING_NODE=true`.
+It bypasses active-color gating for model refresh work, but it cannot trade:
+`APP_SHADOW_MODE=true`, `APP_ENABLE_KILL_SWITCH=true`,
+`CRYPTO_AUTONOMY_ENABLED=false`, and `CRYPTO_TRADING_ENABLED=false` are forced
+inside the service definition. It writes model artifacts, feature-store rows,
+data-quality runs, and replay gates to production Postgres for the live daemons
+to consume.
 
 ## Autonomous Gate Tuning
 

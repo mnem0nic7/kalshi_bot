@@ -3,17 +3,20 @@
 ## Blue/green model
 
 - `app_<env>_blue` and `app_<env>_green` run simultaneously for each environment.
-- Both can observe rooms and render the UI.
+- `daemon_<env>_blue` and `daemon_<env>_green` run the long-lived workers for the same colors.
+- Both colors can observe rooms and render the UI.
 - Only the DB’s `active_color` may take the execution lock and place orders.
+- The web containers and crypto collector/Touch20 workers are singleton services. They should be recreated or color-synced separately from the blue/green app and daemon flip.
 
 ## Promotion flow
 
-1. Deploy the inactive color.
+1. Deploy the inactive color with `infra/scripts/restart-color.sh <demo|production> <blue|green>` or the zero-downtime helper in `scripts/blue_green_redeploy.sh`.
 2. Confirm it starts, reconnects to Postgres, and can run room workflows in shadow mode.
 3. Enable the kill switch if you want a quiet handoff.
 4. Run `infra/scripts/promote.sh <demo|production> <blue|green>`.
-5. Verify the new color acquires the execution lock on its next trade attempt.
-6. Disable the kill switch when satisfied.
+5. Run `infra/scripts/sync-web-color.sh <demo|production|all>` if you promoted manually.
+6. Verify the new color acquires the execution lock on its next trade attempt.
+7. Disable the kill switch when satisfied.
 
 ## Migrations
 
@@ -21,15 +24,17 @@ Demo and production each have their own Postgres instance (`postgres_demo` on ho
 
 ```bash
 # Docker — demo
-docker compose -f infra/docker-compose.yml up -d postgres_demo
-docker compose -f infra/docker-compose.yml run --rm --build --no-deps migrate_demo
+docker compose --env-file .env -f infra/docker-compose.yml up -d postgres_demo
+docker compose --env-file .env -f infra/docker-compose.yml run --rm --build --no-deps migrate_demo
 
 # Docker — production
-docker compose -f infra/docker-compose.yml up -d postgres_production
-docker compose -f infra/docker-compose.yml run --rm --build --no-deps migrate_production
+docker compose --env-file .env -f infra/docker-compose.yml up -d postgres_production
+docker compose --env-file .env -f infra/docker-compose.yml run --rm --build --no-deps migrate_production
 ```
 
-`start-stack.sh` runs both automatically. For local Python development (targets demo by default via `.env`):
+`start-stack.sh` runs both automatically. Always pass `--env-file .env` when running Compose manually; Docker Compose otherwise interpolates from `infra/.env` instead of the repo-root `.env`.
+
+For local Python development (targets demo by default via `.env`):
 
 ```bash
 alembic upgrade head
@@ -44,6 +49,41 @@ Always migrate before live promotion.
 Use `infra/scripts/restart-color.sh <demo|production> <blue|green>` for the normal app deploy path. It builds the shared Python image once, recreates only the requested env/color app and daemon, recreates the matching production 1h crypto daemon when `ENABLE_CRYPTO_1H_DAEMON=true`, refreshes the matching web surface plus `web_strategies`, and leaves Caddy alone.
 
 Use `infra/scripts/restart-color.sh --refresh-caddy <demo|production|all> <blue|green>` only when Caddy routing/config also changed. Use `infra/scripts/start-stack.sh` for full host recovery; it still brings up both environments and runs both migration services.
+
+For a true one-command inactive-color rebuild plus DB cutover, use `scripts/blue_green_redeploy.sh --env production` after a dry run. It now matches the compose default that the optional 1h crypto daemon is off unless `ENABLE_CRYPTO_1H_DAEMON=true`.
+
+## Compose topology
+
+Core services:
+
+| Service | Role |
+| --- | --- |
+| `postgres_demo`, `postgres_production` | Separate pgvector Postgres instances for demo and production |
+| `migrate_demo`, `migrate_production` | Alembic schema upgrades, one per environment |
+| `app_<env>_<color>` | FastAPI app/control room process for a fixed blue/green color |
+| `daemon_<env>_<color>` | Long-running Kalshi stream, reconciliation, room, and autonomy worker for a fixed color |
+| `web_demo`, `web_production`, `web_strategies` | Caddy-facing web surfaces with colors synced from `deployment_control` |
+| `caddy` | Reverse proxy for localhost and the configured public production host |
+
+Production singleton services:
+
+| Service | Helper-script inclusion | Purpose |
+| --- | --- | --- |
+| `crypto_current_production` | `ENABLE_CRYPTO_CURRENT_CONTAINER=true` | Continuous 15m current quote, spot, and bounded settlement-label collection |
+| `crypto_current_1h_production` | `ENABLE_CRYPTO_CURRENT_1H_CONTAINER=false` | 1h current quote and spot evidence, optional settled-label and replay/gate refresh |
+| `crypto_non_model_btc15m_touch20_production` | `ENABLE_BTC15M_TOUCH20_CONTAINER=true` | Independent non-model 15m Touch20 entry/exit worker |
+| `crypto_non_model_1h_touch20_production` | `ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false` | Independent non-model 1h Touch20 worker, disabled until explicitly approved |
+| `daemon_production_crypto_1h_<color>` | `ENABLE_CRYPTO_1H_DAEMON=false` | Optional blue/green 1h model-path daemon with heartbeat role `crypto_1h` |
+| `crypto_1h_production` | `ENABLE_CRYPTO_1H_CONTAINER=false` and `CRYPTO_LIVE_PATH_REFRESH_ENABLED=false` | Legacy daily 1h live-path refresh loop, kept opt-in |
+| `trainer_production` | Manual service management | Dedicated training-node singleton. It owns the trainer CPU set/GPU, runs `daemon --training-node`, and is triple-guarded against trading. |
+
+`infra/scripts/start-stack.sh` is the host recovery path for runtime services. It intentionally does not start or recreate `trainer_production`; deploy training-node changes with:
+
+```bash
+docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --build trainer_production
+```
+
+The `ENABLE_*` service-inclusion flags above are shell flags consumed by the helper scripts before Compose starts containers. Set them in the command environment or systemd environment when you want `start-stack.sh` or `restart-color.sh` to include optional services. Compose still reads `.env` for container environment and interpolation.
 
 Always migrate before enabling the watchdog timer on an already-running deployment, because the runtime now depends on the newer agent-pack tables and checkpoints.
 
@@ -128,9 +168,11 @@ scripts/crypto_live_path_refresh.sh \
 ```
 
 After a clean manual catch-up, `ENABLE_CRYPTO_1H_CONTAINER=true` starts the
-dedicated daily 1h refresh container. `ENABLE_CRYPTO_1H_DAEMON=true` starts the
-blue/green crypto-only 1h daemon pair with `CRYPTO_AUTO_FREQUENCIES=1h`. The
-1h daemon writes heartbeat checkpoints such as
+legacy daily 1h refresh container, but it still exits unless
+`CRYPTO_LIVE_PATH_REFRESH_ENABLED=true`. The preferred live 1h model runtime is
+`ENABLE_CRYPTO_1H_DAEMON=true`, which starts the blue/green crypto-only 1h
+daemon pair with `CRYPTO_AUTO_FREQUENCIES=1h`. The 1h daemon writes heartbeat
+checkpoints such as
 `daemon_heartbeat:production:blue:crypto_1h`, separate from the main daemon.
 Fast color redeploys recreate the matching crypto-only daemon when
 `ENABLE_CRYPTO_1H_DAEMON=true`; use `start-stack.sh` after first enabling the
@@ -483,8 +525,14 @@ Additional compose env vars added in the April 2026 architecture refactor:
 - `DEMO_APP_SHADOW_MODE` / `PRODUCTION_APP_SHADOW_MODE` — environment-scoped shadow switches used by Compose so demo can be live without making production live on its next restart
 - `DEMO_STRATEGY_C_ENABLED` / `PRODUCTION_STRATEGY_C_ENABLED` — environment-scoped Strategy C master switches
 - `DEMO_STRATEGY_C_SHADOW_ONLY` / `PRODUCTION_STRATEGY_C_SHADOW_ONLY` — environment-scoped Strategy C live/shadow switches
+- `WEB_PUBLIC_HOST` (default `home.kb-trade.trade`) — public Caddy host for the checked-in production route
+- `ENABLE_DEMO_DAEMON` / `ENABLE_PRODUCTION_DAEMON` — include or skip the main daemon pair during host recovery
+- `ENABLE_CRYPTO_CURRENT_CONTAINER` / `ENABLE_CRYPTO_CURRENT_1H_CONTAINER` — include the 15m and 1h current-data collectors
+- `ENABLE_BTC15M_TOUCH20_CONTAINER` / `ENABLE_CRYPTO_1H_TOUCH20_CONTAINER` — include the non-model Touch20 workers
+- `ENABLE_CRYPTO_1H_DAEMON` — include the blue/green 1h model-path daemon pair
+- `PRODUCTION_CRYPTO_TRAIN_BUILD_WORKERS` — baseline production training worker count; `trainer_production` overrides this to `4` for the dedicated trainer process
 
-The `infra/docker-compose.yml` file uses YAML anchors to define shared service templates. Add new per-env settings to `x-demo-env` / `x-production-env` and shared settings to `x-common-env-base`. The Dockerfile uses a two-stage pip install so dependency layers are cached independently of source changes.
+The `infra/docker-compose.yml` file uses YAML anchors to define shared service templates. Add new per-env settings to `x-demo-env` / `x-production-env` and shared settings to `x-common-env-base`. The Dockerfile is single-stage, but it installs Python dependencies before copying the full source tree so dependency layers are cached independently of source changes.
 
 ## Backups
 

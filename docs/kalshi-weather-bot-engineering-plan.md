@@ -237,7 +237,7 @@ Each daily weather contract has a unique ticker (e.g., `KXHIGHTBOS-26APR21-T55`)
 | HTTP | `httpx` async | All outbound calls |
 | Metrics | `prometheus_client` | Scraped at `/metrics` |
 | Logging | Structured JSON | All services |
-| Deploy | Docker Compose blue/green | Caddy reverse proxy routes per-host to `web_demo`, `web_production`, `web_strategies`; watchdog handles failover |
+| Deploy | Docker Compose blue/green | Caddy's checked-in route proxies localhost and `home.kb-trade.trade` to `web_production`; `web_demo` and `web_strategies` are available for custom routes; watchdog handles failover |
 | Secrets | Environment / mounted key files | RSA PEM paths configured per env |
 
 ---
@@ -545,9 +545,9 @@ postgres_production ←─┤
                       │
           ┌───────────┴──────────────────────────────────┐
           │  Caddy  :80/:443                              │
-          │  demo.ai-al.site      → web_demo             │
-          │  prod.ai-al.site      → web_production       │
-          │  strategy.ai-al.site  → web_strategies       │
+          │  localhost           -> web_production        │
+          │  home.kb-trade.trade -> web_production        │
+          │  custom routes can expose web_demo/strategies │
           └──────────────────────────────────────────────┘
 ```
 
@@ -557,7 +557,7 @@ postgres_production ←─┤
 
 Both colors run simultaneously. Only the active color holds the execution lock. Switching is atomic via `DeploymentControl.active_color` in the database.
 
-The three web containers (`web_demo`, `web_production`, `web_strategies`) each run a FastAPI app scoped to their environment (`KALSHI_ENV`) and site kind (`WEB_SITE_KIND`). `WEB_APP_COLOR` controls which color's data the web containers read from (default `blue`); update it alongside `active_color` when promoting.
+The three web containers (`web_demo`, `web_production`, `web_strategies`) each run a FastAPI app scoped to their environment (`KALSHI_ENV`) and site kind (`WEB_SITE_KIND`). `infra/scripts/sync-web-color.sh` recreates the web containers with `APP_COLOR` values derived from the DB active colors after promotion or rollback.
 
 ### Watchdog
 
@@ -606,10 +606,9 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 | `LIVE_KALSHI_READ_PRIVATE_KEY_PATH` | — | Production RSA key path |
 | `POSTGRES_DEMO_PORT` | `5432` | Host port for `postgres_demo` container |
 | `POSTGRES_PRODUCTION_PORT` | `5433` | Host port for `postgres_production` container |
-| `WEB_APP_COLOR` | `blue` | Color badge shown in the dashboard header for web containers; update alongside `active_color` on promotion |
-| `WEB_DEMO_HOST` | `demo.ai-al.site` | Caddy hostname for demo control room |
-| `WEB_PRODUCTION_HOST` | `prod.ai-al.site` | Caddy hostname for production control room |
-| `WEB_STRATEGIES_HOST` | `strategy.ai-al.site` | Caddy hostname for strategies dashboard |
+| `WEB_APP_COLOR` | `blue` | Fallback color for web containers; helper scripts normally set site-specific web colors from `deployment_control` |
+| `WEB_PUBLIC_HOST` | `home.kb-trade.trade` | Public host used by the checked-in Caddy route |
+| `WEB_DEMO_HOST` / `WEB_PRODUCTION_HOST` / `WEB_STRATEGIES_HOST` | legacy host defaults | App-level host metadata and custom-route inputs; not wired into the checked-in Caddyfile unless you customize it |
 
 ### Risk parameters
 
@@ -716,10 +715,10 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 - [x] Alembic migrations (16 applied)
 - [x] Reconciliation daemon (positions, orders, market prices)
 - [x] Split Postgres per environment (`postgres_demo` / `postgres_production` with isolated volumes)
-- [x] Caddy reverse proxy replacing nginx (per-host routing to `web_demo`, `web_production`, `web_strategies`)
+- [x] Caddy reverse proxy replacing nginx (checked-in localhost / `home.kb-trade.trade` route to `web_production`; custom routes can expose `web_demo` and `web_strategies`)
 - [x] Three-way web container split: demo control room, production control room, strategies dashboard
 - [x] Per-environment migrate services with `service_completed_successfully` gating on all app/daemon containers
-- [x] `.dockerignore` and two-stage Dockerfile pip layer caching (source-only rebuilds ~2s vs 25s)
+- [x] `.dockerignore` and Dockerfile pip layer caching before the source copy (source-only rebuilds keep dependency install cached)
 
 ### Known gaps and future work
 
@@ -747,7 +746,7 @@ All settings in `config.py` (`Settings`), loaded from `.env`.
 - [ ] `RISK_MIN_PROBABILITY_EXTREMITY_PCT=25.0` set in production env (guard #7b — blocks near-50% coin-flip trades; intentionally 0.0 in demo)
 - [ ] `APP_SHADOW_MODE=false` and `APP_ENABLE_KILL_SWITCH=false` confirmed in production env
 - [ ] `KALSHI_ENV=production` set
-- [ ] Auth cookie domain verified: `WEB_AUTH_COOKIE_DOMAIN` set to the correct shared domain (e.g., `.ai-al.site`) so sessions are valid across `web_demo`, `web_production`, and `web_strategies` — confirm in browser devtools that the `Set-Cookie` domain matches before exposing `web_production` externally
+- [ ] Auth cookie domain verified if custom multi-host routing is enabled: `WEB_AUTH_COOKIE_DOMAIN` must match the shared parent domain so sessions are valid across `web_demo`, `web_production`, and `web_strategies`; confirm in browser devtools that the `Set-Cookie` domain matches before exposing `web_production` externally
 - [ ] Daily review ritual established for first 2 weeks post-launch
 
 ---

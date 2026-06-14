@@ -62,7 +62,7 @@ color_services() {
     if [[ "${ENABLE_PRODUCTION_DAEMON:-true}" == "true" ]]; then
       services+=("daemon_${ENV}_${color}")
     fi
-    if [[ "${ENABLE_CRYPTO_1H_DAEMON:-true}" == "true" ]]; then
+    if [[ "${ENABLE_CRYPTO_1H_DAEMON:-false}" == "true" ]]; then
       services+=("daemon_${ENV}_crypto_1h_${color}")
     fi
   else

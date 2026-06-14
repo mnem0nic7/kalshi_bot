@@ -27,11 +27,22 @@ Key properties:
 
 ## Colored vs singleton services
 
-Per-color (participate in the flip): `app_{env}_{color}`, `daemon_{env}_{color}`,
-`daemon_{env}_crypto_1h_{color}`.
+Per-color services that participate in the flip:
 
-Singletons (NOT color-scoped — recreate separately if a deploy changed them):
-`crypto_1h_{env}`, `web_{env}`, `caddy`, `web_strategies`.
+- `app_{env}_{color}`
+- `daemon_{env}_{color}`
+- `daemon_production_crypto_1h_{color}` when `ENABLE_CRYPTO_1H_DAEMON=true`
+
+Singletons that are not color-scoped and should be recreated separately if a deploy changed them:
+
+- `web_demo`, `web_production`, `web_strategies`
+- `caddy`
+- `crypto_current_production`
+- `crypto_current_1h_production`
+- `crypto_non_model_btc15m_touch20_production`
+- `crypto_non_model_1h_touch20_production`
+- `crypto_1h_production`
+- `trainer_production`
 
 ## Automated path (preferred)
 
@@ -50,7 +61,12 @@ Flags: `--target blue|green` (force incoming color), `--no-build` (reuse current
 `--yes` (skip the promote confirmation), `--recreate-old`, `--dry-run`.
 
 The script aborts **before** the promote if the inactive color fails to go healthy, so a
-bad build never takes down live trading — the active color is untouched until cutover.
+bad build never takes down live trading. The active color is untouched until cutover.
+
+The helper passes `--env-file .env` to Compose and mirrors the compose default
+that the optional 1h model daemon is off unless `ENABLE_CRYPTO_1H_DAEMON=true`.
+It recreates production current-data and Touch20 singleton workers when their
+enable flags are true, but `trainer_production` remains manual by design.
 
 ## Manual path (what the script automates)
 
@@ -69,10 +85,14 @@ COMPOSE_BAKE=false docker compose --env-file .env -f infra/docker-compose.yml bu
 
 # 2. recreate the INACTIVE color only (blue keeps trading)
 docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --force-recreate \
-  app_production_green daemon_production_green daemon_production_crypto_1h_green
+  app_production_green daemon_production_green
+
+# If this deployment intentionally uses the 1h model daemon, recreate the matching color too.
+docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --force-recreate \
+  daemon_production_crypto_1h_green
 
 # 3. verify green is healthy
-docker compose -f infra/docker-compose.yml ps | grep green
+docker compose --env-file .env -f infra/docker-compose.yml ps | grep green
 
 # 4. hand off the execution lock (the cutover)
 docker exec infra-app_production_green-1 kalshi-bot-cli promote green
@@ -80,7 +100,10 @@ docker exec infra-app_production_green-1 kalshi-bot-cli status   # expect active
 
 # 5. (optional) recreate the now-idle old color
 docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --force-recreate \
-  app_production_blue daemon_production_blue daemon_production_crypto_1h_blue
+  app_production_blue daemon_production_blue
+
+# 6. sync Caddy-facing web containers to the newly active color
+infra/scripts/sync-web-color.sh production
 ```
 
 ## Rollback
@@ -92,7 +115,9 @@ docker exec infra-app_production_blue-1 kalshi-bot-cli promote blue
 ```
 
 If the new image itself is bad, roll the lock back first (above), then rebuild/fix on the
-inactive color and retry the flip.
+inactive color and retry the flip. After a manual rollback, run
+`infra/scripts/sync-web-color.sh production` so the Caddy-facing web process
+reports the restored active color.
 
 ## Current state (as of 2026-05-20)
 

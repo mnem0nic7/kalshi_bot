@@ -1,11 +1,11 @@
 # Kalshi Bot
 
-Multi-agent Kalshi weather trading platform with a visible control room, deterministic risk and execution gates, Postgres-backed memory, and blue/green Docker deployment support.
+Multi-agent Kalshi weather and crypto trading platform with a visible control room, deterministic risk and execution gates, Postgres-backed memory, replay-gated model training, and blue/green Docker deployment support.
 
 ## What’s here
 
 - `src/kalshi_bot`: application code for agents, orchestration, Kalshi and NOAA integrations, FastAPI UI, and persistence.
-- `infra`: Docker, reverse proxy, scripts, and systemd assets for VPS deployment.
+- `infra`: Docker Compose, Caddy, deploy scripts, and systemd assets for VPS deployment.
 - `docs`: architecture, agent protocol, strategy, security, database, and operations guides.
 
 For training prep and dataset exports, use [docs/training.md](docs/training.md).
@@ -24,28 +24,38 @@ For strict as-of historical replay and Gemini-first fine-tune exports, use [docs
 7. Start Postgres:
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build -d postgres_demo postgres_production
+docker compose --env-file .env -f infra/docker-compose.yml up --build -d postgres_demo postgres_production
 ```
 
 8. Run migrations:
 
 ```bash
-docker compose -f infra/docker-compose.yml build migrate_demo migrate_production
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_demo
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_production
+docker compose --env-file .env -f infra/docker-compose.yml build migrate_demo migrate_production
+docker compose --env-file .env -f infra/docker-compose.yml run --rm --no-deps migrate_demo
+docker compose --env-file .env -f infra/docker-compose.yml run --rm --no-deps migrate_production
 ```
 
-9. Start the app stack:
+9. Start the runtime stack. The helper validates compose config, builds the shared app image, runs both migrations, starts the default runtime services, syncs web colors to the DB active colors, and recreates Caddy:
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build -d \
-  app_demo_blue app_demo_green app_production_blue app_production_green \
-  daemon_demo_blue daemon_demo_green daemon_production_blue daemon_production_green \
-  web_demo web_production web_strategies caddy
+infra/scripts/start-stack.sh manual_start
 ```
 
-10. Open `http://localhost` for the local fallback route, or point DNS at the server and use:
-   `https://demo.ai-al.site`, `https://prod.ai-al.site`, and `https://strategy.ai-al.site`.
+10. Open `http://localhost` for the local fallback route. The checked-in Caddyfile also exposes the production web surface at `https://home.kb-trade.trade` when DNS and TLS are configured for the host.
+
+The compose project also defines `web_demo` and `web_strategies`. They are started and color-synced for internal/direct routing, but the checked-in Caddyfile currently routes only localhost and `home.kb-trade.trade` to `web_production`.
+
+## Docker topology
+
+The compose stack separates trading runtime, web surfaces, data collectors, and training:
+
+- `postgres_demo` / `postgres_production` plus matching `migrate_*` services keep demo and production schemas isolated.
+- `app_<env>_<color>` and `daemon_<env>_<color>` are the blue/green runtime pair for each environment.
+- `web_demo`, `web_production`, and `web_strategies` are Caddy-facing FastAPI surfaces whose `APP_COLOR` is refreshed by `infra/scripts/sync-web-color.sh`.
+- `crypto_current_production` collects current 15m quote and spot evidence; `crypto_current_1h_production` does the same for 1h when enabled.
+- `crypto_non_model_btc15m_touch20_production` and `crypto_non_model_1h_touch20_production` are singleton Touch20 workers controlled by explicit enable flags.
+- `daemon_production_crypto_1h_<color>` is the optional blue/green 1h model daemon, separate from the main production daemon.
+- `trainer_production` is a dedicated training-node singleton for model refreshes. It is shadow-mode and kill-switch guarded, uses the trainer CPU set/GPU, and is managed separately from `start-stack.sh`.
 
 ## Local Python workflow
 
@@ -202,6 +212,8 @@ LLM calls are disabled by default with `LLM_CALLS_ENABLED=false`. `Sync Gemini R
 - Optional auto-room launching from streamed books via `kalshi-bot-cli stream --auto-trigger`
 - Long-running daemon mode via `kalshi-bot-cli daemon`
 - Training-first corpus engine with research-health scoring, reproducible dataset builds, and readiness gates
+- Dedicated production training node for crypto model refreshes, isolated from live daemon CPU cores
+- Continuous crypto current-data collectors and optional 1h / Touch20 workers controlled by compose enable flags
 - Optional structured-weather shadow campaigns via `kalshi-bot-cli shadow-campaign run`
 - Deterministic `builtin-deterministic-v1` agent pack with provider `none` roles by default
 - Versioned agent packs, GitHub Actions self-improvement loop, and deterministic autonomous gate tuning for weather plus per-asset crypto policy
@@ -237,7 +249,7 @@ sudo systemctl enable --now kalshi-bot-watchdog.timer
 If you are upgrading an already-running stack, run migrations before using the new watchdog CLI or timer:
 
 ```bash
-docker compose -f infra/docker-compose.yml build migrate_demo migrate_production
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_demo
-docker compose -f infra/docker-compose.yml run --rm --no-deps migrate_production
+docker compose --env-file .env -f infra/docker-compose.yml build migrate_demo migrate_production
+docker compose --env-file .env -f infra/docker-compose.yml run --rm --no-deps migrate_demo
+docker compose --env-file .env -f infra/docker-compose.yml run --rm --no-deps migrate_production
 ```

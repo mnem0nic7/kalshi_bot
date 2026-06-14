@@ -26,5 +26,37 @@
 1. Enable the kill switch.
 2. Promote the previously healthy color.
 3. Confirm the new active color reacquires the execution lock.
-4. Disable the kill switch when stable.
+4. Run `infra/scripts/sync-web-color.sh <demo|production|all>` if the rollback was manual.
+5. Disable the kill switch when stable.
 
+## Crypto current collector stale
+
+1. Leave live trading posture unchanged; do not promote assets to live while current evidence is stale.
+2. Check the relevant singleton container: `crypto_current_production` for 15m or `crypto_current_1h_production` for 1h.
+3. Inspect recent logs for Kalshi pagination, Coinbase spot, settlement-label, or replay-gate errors.
+4. Recreate only the affected singleton with `docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --force-recreate <service>`.
+5. Confirm `crypto-live-path status --kalshi-env production --frequency <15m|1h> --assets all --json` shows fresh quote and spot evidence before changing any asset mode.
+
+## Training node stalled
+
+1. Confirm live app and daemon colors are healthy before touching training.
+2. Inspect `trainer_production` logs and the latest `crypto_data_quality_runs` / `crypto_model_artifacts`.
+3. Recreate only the trainer when needed:
+
+```bash
+docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --build trainer_production
+```
+
+4. Do not restart the live production daemons to fix trainer-only failures unless the model artifact or replay-gate reader path is also failing.
+
+## Web route mismatch
+
+1. Check the active colors with `kalshi-bot-cli status` for demo and production.
+2. Run `infra/scripts/sync-web-color.sh all` to recreate `web_demo`, `web_production`, and `web_strategies` with the DB active colors.
+3. Recreate Caddy only if the Caddyfile, hostnames, or ports changed:
+
+```bash
+docker compose --env-file .env -f infra/docker-compose.yml up -d --no-deps --force-recreate caddy
+```
+
+4. The checked-in Caddyfile routes localhost and `home.kb-trade.trade` to `web_production`; custom demo or strategy host routing requires a Caddyfile change.
