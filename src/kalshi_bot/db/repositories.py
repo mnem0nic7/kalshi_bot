@@ -2789,6 +2789,58 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         )
         await self.session.flush()
 
+    async def bulk_upsert_crypto_training_feature_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        chunk_size: int = 2000,
+    ) -> int:
+        """Upsert many training feature rows per statement (idempotent on
+        (kalshi_env, frequency, row_id)). Re-upserting an existing row_id
+        refreshes its columns (e.g. a label that settled since first build)."""
+        if not rows:
+            return 0
+        prepared: list[dict[str, Any]] = []
+        for values in rows:
+            payload = dict(values)
+            payload["kalshi_env"] = self._resolved_kalshi_env(payload.get("kalshi_env"))
+            payload.pop("id", None)
+            payload.pop("created_at", None)
+            prepared.append(payload)
+
+        dialect = self.session.bind.dialect.name if self.session.bind is not None else ""
+        written = 0
+        conflict_keys = {"kalshi_env", "frequency", "row_id"}
+        for start in range(0, len(prepared), chunk_size):
+            chunk = prepared[start : start + chunk_size]
+            if dialect == "postgresql":
+                stmt = pg_insert(CryptoTrainingFeatureRowRecord).values(chunk)
+            elif dialect == "sqlite":
+                stmt = sqlite_insert(CryptoTrainingFeatureRowRecord).values(chunk)
+            else:
+                for payload in chunk:
+                    self.session.add(CryptoTrainingFeatureRowRecord(**payload))
+                await self.session.flush()
+                written += len(chunk)
+                continue
+            update_cols = {
+                col: getattr(stmt.excluded, col)
+                for col in chunk[0].keys()
+                if col not in conflict_keys
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    CryptoTrainingFeatureRowRecord.kalshi_env,
+                    CryptoTrainingFeatureRowRecord.frequency,
+                    CryptoTrainingFeatureRowRecord.row_id,
+                ],
+                set_=update_cols,
+            )
+            await self.session.execute(stmt)
+            await self.session.flush()
+            written += len(chunk)
+        return written
+
     async def list_crypto_training_feature_rows(
         self,
         *,
