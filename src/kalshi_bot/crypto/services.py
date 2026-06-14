@@ -157,16 +157,26 @@ def _resolve_crypto_shadow_evidence_mode(
 ) -> bool:
     """Whether the shadow-evidence decision path should run this cycle.
 
-    Historically shadow-evidence only ran when production autonomy was OFF
-    (``not production_autonomy_enabled``). With ``shadow_evidence_always`` set,
-    it runs alongside production autonomy so SHADOW-mode assets keep emitting
-    exploratory shadow decisions for pre-promotion evaluation. This gates only
-    decision LOGGING — live execution stays blocked by asset_mode==LIVE checks.
+    Historically shadow-evidence only ran when production autonomy was OFF and
+    quote-evidence collection was ON (``quote_evidence_enabled and not
+    production_autonomy_enabled``). That legacy branch is preserved exactly.
+
+    ``shadow_evidence_always`` is an INDEPENDENT switch: when set (in production)
+    it enables the shadow-evidence DECISION path regardless of the production
+    autonomy state or the quote-evidence COLLECTION flag. This is deliberate —
+    the live daemons disable quote-evidence collection (offloaded to dedicated
+    collectors), but we still want SHADOW-mode assets to emit exploratory shadow
+    decisions for pre-promotion evaluation. shadow_evidence_mode only gates which
+    assets are evaluated; the decision uses normal market snapshots, so it does
+    not depend on the collection loop. It NEVER enables live orders — execution
+    stays blocked by asset_mode==LIVE / live-eligibility checks.
     """
     return bool(
         production_mode
-        and quote_evidence_enabled
-        and (shadow_evidence_always or not production_autonomy_enabled)
+        and (
+            shadow_evidence_always
+            or (quote_evidence_enabled and not production_autonomy_enabled)
+        )
     )
 CRYPTO_CROSS_ASSET_FEATURE_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE")
 CRYPTO_ENTRY_OPTIMIZER_GRID = {

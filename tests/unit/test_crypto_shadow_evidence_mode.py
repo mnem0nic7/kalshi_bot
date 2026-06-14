@@ -54,22 +54,41 @@ def test_legacy_path_still_on_when_autonomy_off() -> None:
         )
 
 
-def test_requires_production_mode_and_quote_evidence() -> None:
-    # Never engages in demo mode or when quote-evidence collection is disabled,
-    # even with the flag set.
-    assert (
-        _resolve_crypto_shadow_evidence_mode(
-            production_mode=False,
-            quote_evidence_enabled=True,
-            production_autonomy_enabled=True,
-            shadow_evidence_always=True,
-        )
-        is False
-    )
+def test_flag_bypasses_quote_evidence_collection_flag() -> None:
+    # The live daemons disable quote-evidence COLLECTION; the flag must still
+    # enable shadow DECISIONS (the collection flag and the decision gate are
+    # decoupled). This is the real-world precondition the fix targets.
     assert (
         _resolve_crypto_shadow_evidence_mode(
             production_mode=True,
             quote_evidence_enabled=False,
+            production_autonomy_enabled=True,
+            shadow_evidence_always=True,
+        )
+        is True
+    )
+
+
+def test_legacy_branch_still_requires_quote_evidence() -> None:
+    # With the flag OFF, legacy behavior is preserved exactly: quote-evidence
+    # collection must be on (and autonomy off) for shadow-evidence to engage.
+    assert (
+        _resolve_crypto_shadow_evidence_mode(
+            production_mode=True,
+            quote_evidence_enabled=False,
+            production_autonomy_enabled=False,
+            shadow_evidence_always=False,
+        )
+        is False
+    )
+
+
+def test_requires_production_mode() -> None:
+    # Never engages in demo mode, even with the flag set.
+    assert (
+        _resolve_crypto_shadow_evidence_mode(
+            production_mode=False,
+            quote_evidence_enabled=True,
             production_autonomy_enabled=True,
             shadow_evidence_always=True,
         )
