@@ -3917,6 +3917,28 @@ class CryptoForecastService:
                 trained_at=datetime.now(UTC),
             )
             await session.commit()
+        # Observability-only: one INFO line summarizing the per-asset model
+        # selection table so a market_mid_baseline fallback is self-explaining
+        # in logs. Pure projection of already-computed metrics; no recompute.
+        logger.info(
+            "crypto model selection freq=%s assets=%s champion=%s reason=%s oos_net=%s oos_adv=%s candidates=%s",
+            freq,
+            requested_assets,
+            metrics.get("champion_model"),
+            metrics.get("champion_selection_reason"),
+            metrics.get("champion_oos_net_pnl"),
+            metrics.get("champion_oos_pnl_advantage_vs_market_mid"),
+            [
+                (
+                    row.get("name"),
+                    row.get("policy_net"),
+                    row.get("policy_advantage"),
+                    row.get("selected_count"),
+                    row.get("profit_deployable"),
+                )
+                for row in metrics.get("candidate_selection_table", [])
+            ],
+        )
         return {
             "status": status,
             "kalshi_env": self.settings.kalshi_env,
@@ -12557,6 +12579,52 @@ def _crypto_model_metrics(
                 "validation_scope": candidate_report.get("selection_scope"),
             }
         )
+        # Additive, observability-only: project the per-candidate OOS selection
+        # table into flat metrics so a market_mid_baseline fallback is
+        # self-explaining (which losing candidates existed and why none won).
+        # No selection logic runs here; this is a read-side projection of data
+        # already computed by the candidate report. Guard every accessor.
+        guardrails = candidate_report.get("guardrails") if isinstance(candidate_report.get("guardrails"), dict) else {}
+        sel_min_selected_count = candidate_report.get("min_policy_selected_count")
+        try:
+            sel_min_selected_count = max(1, int(sel_min_selected_count))
+        except (TypeError, ValueError):
+            sel_min_selected_count = 1
+        sel_allow_guardrail_failed = bool(guardrails.get("allow_guardrail_failed_profit_candidates"))
+        selection_table: list[dict[str, Any]] = []
+        for entry in candidate_report.get("candidates") or []:
+            if not isinstance(entry, dict):
+                continue
+            entry_metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+            entry_policy = entry.get("policy_metrics") if isinstance(entry.get("policy_metrics"), dict) else None
+            brier_value = entry_metrics.get("brier") if isinstance(entry_metrics, dict) else None
+            profit_deployable = _crypto_candidate_is_profit_deployable(
+                entry,
+                min_selected_count=sel_min_selected_count,
+                allow_guardrail_failed=sel_allow_guardrail_failed,
+            )
+            probability_deployable = _crypto_model_selection_usable(
+                entry,
+                allow_guardrail_failed=sel_allow_guardrail_failed,
+            ) and _crypto_candidate_has_min_policy_support(
+                entry,
+                min_selected_count=sel_min_selected_count,
+            )
+            selection_table.append(
+                {
+                    "name": entry.get("name"),
+                    "brier": float(brier_value) if brier_value is not None else None,
+                    "policy_net": float(_candidate_policy_net(entry_policy)) if entry_policy is not None else None,
+                    "policy_advantage": float(_candidate_policy_advantage(entry_policy)) if entry_policy is not None else None,
+                    "selected_count": _candidate_policy_selected_count(entry_policy) if entry_policy is not None else None,
+                    "profit_deployable": bool(profit_deployable),
+                    "probability_deployable": bool(probability_deployable),
+                    "status": entry.get("status"),
+                    "reason": entry.get("reason"),
+                }
+            )
+        metrics["champion_model_type"] = model.get("model_type")
+        metrics["candidate_selection_table"] = selection_table
     return metrics
 
 
