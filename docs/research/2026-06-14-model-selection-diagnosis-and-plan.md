@@ -85,6 +85,24 @@ Two things stand out: the majors produced **0 OOS trade candidates** (nothing cl
 
 **P3 — not a defect; needs an operator intent decision.** HYPE is **intentionally shadowed**; with `PRODUCTION_CRYPTO_PRODUCTION_AUTONOMY_ENABLED=true`, `shadow_evidence_mode` is False ([services.py:6470](../../src/kalshi_bot/crypto/services.py#L6470)), so shadow-mode assets are skipped with `not_live_eligible` before any room/decision is created. This is why ETH/SOL/XRP/HYPE all went silent ~2026-06-10 when the 3 live assets were promoted. Options: **(a)** decouple `shadow_evidence_mode` from `production_autonomy_enabled` (small code change) so shadowed assets resume emitting *shadow* decisions (evidence for promotion, **no live orders** — live execution still gated by `asset_mode==LIVE`); **(b)** promote HYPE to live `asset_mode` (deployment-control metadata) to actually trade it; **(c)** leave as-is. Awaiting operator direction.
 
+## P1 DEFINITIVE root cause (2026-06-14, from artifact candidate_report — fee hypothesis H1 is MOOT)
+
+Reading the existing 2026-06-13 artifacts' `payload.candidate_report.candidates` (no replay re-run needed) settles it. For **BTC and ETH the only `available` candidate is `market_mid_baseline`** — every trained model is `guardrail_failed`:
+
+| asset | trained candidates | status |
+|---|---|---|
+| BTC, ETH | xgboost, lightgbm, sklearn_logistic, spot_distance_residual, … | **all `guardrail_failed`: `ece_regressed_vs_market_mid` / `log_loss_regressed_vs_market_mid`** |
+| DOGE | current_heuristic, xgboost, spot_distance_residual, market_mid | available (pass guardrail); champion = spot_distance_residual |
+
+The gate is `_crypto_candidate_guardrail_failures` ([services.py:11863](../../src/kalshi_bot/crypto/services.py#L11863)): a non-baseline candidate is rejected if its `log_loss` or `ece` exceeds the market-mid reference (plus a small tolerance). **On the efficient majors the market mid is so well-calibrated that our trained models' calibration *regresses against it* → rejected before the profit/fee stage ever runs.**
+
+**Consequences:**
+- **H1 (cent-ceiling fee) is moot** — candidates die at the calibration guardrail, never reaching the fee/profit simulation. No fee experiment needed (a bounded BTC replay was started in the mem-capped trainer to confirm, then stopped once the artifact gave the answer directly — the guardrail did its job: trainer peaked 18.5/32 G, host never at risk).
+- **P1 and P2 are the same root cause.** The lever for putting real models live on the majors is **better model calibration** (lower ECE/log-loss than the market mid) — exactly P2's out-of-sample-isotonic fix plus genuinely better probability estimates. Fix calibration → models may clear `ece_regressed_vs_market_mid` → majors get real models.
+- DOGE's live champion (`spot_distance_residual`) passed the calibration guardrail but had **negative OOS net P&L (−1.47 over 10 trades, `diagnostic_only`)** — well-calibrated (Brier 0.175) yet not demonstrably profitable; worth watching via P0.
+
+**Revised priority:** elevate **P2 (calibration)** — out-of-sample isotonic holdout parity for residual/logistic, and a calibration-method improvement validated through the gate — since it is the shared lever for P1 (majors) and P2 (DOGE residual). The fee-aware edge-floor idea is deferred (not the binding constraint).
+
 ### Explicitly NOT doing
 - **No recalibration layer on `market_mid_baseline`** — nothing to calibrate; it echoes the market.
 - **No fading of the market's near-expiry overconfidence** as an edge — favorite-longshot / NO-side taker edge was REFUTED in the external research; only act via an OOS-replay-validated, fee-net strategy.
