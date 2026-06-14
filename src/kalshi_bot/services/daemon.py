@@ -489,6 +489,15 @@ class DaemonService:
         dedicated trainer always trains, writing artifacts/gates to the shared DB
         that the live daemons read. Continuous data collection also stays on the
         live daemons; the nightly refreshes its own training window inline.
+
+        Production path (run_seconds is None): supervised loop — if any
+        background task exits unexpectedly (return or unhandled raise) it is
+        logged loudly and restarted rather than bringing down the whole daemon.
+        This prevents a transient heartbeat DB error from stranding an in-progress
+        7.5-hour training run.
+
+        Test/CLI one-off path (run_seconds is not None): a timer task is added;
+        when it fires the method returns normally (original behaviour preserved).
         """
         tasks: dict[str, asyncio.Task] = {}
         try:
@@ -515,21 +524,51 @@ class DaemonService:
                 logger.warning(
                     "training-node started but crypto_model_nightly_auto_enabled=false — nothing to train"
                 )
+
+            timer_task: asyncio.Task | None = None
             if run_seconds is not None:
-                tasks["timer"] = asyncio.create_task(asyncio.sleep(run_seconds))
+                timer_task = asyncio.create_task(asyncio.sleep(run_seconds))
+                tasks["timer"] = timer_task
 
-            done, pending = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
-            completed_name = next(name for name, task in tasks.items() if task in done)
-            done_task = tasks[completed_name]
-            exc = None if done_task.cancelled() else done_task.exception()
-            if exc is not None:
-                raise exc
+            # --- supervised wait loop ---
+            # Production (timer_task is None): restart any background task that
+            # exits; never return unless cancelled externally.
+            # Test/CLI (timer_task is not None): return as soon as the timer fires.
+            while True:
+                done, _pending = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
 
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+                # Timer fired → clean one-off exit (test / CLI path).
+                if timer_task is not None and timer_task in done:
+                    break
+
+                # Inspect every completed task (there may be more than one).
+                for name, task in list(tasks.items()):
+                    if task not in done:
+                        continue
+                    if name == "timer":
+                        # Only reachable if timer_task is not None but we
+                        # entered this branch via another task completing first;
+                        # the outer check above handles the timer-first case.
+                        break
+
+                    exc = None if task.cancelled() else task.exception()
+                    if exc is not None:
+                        logger.error(
+                            "training-node background loop %r raised unexpectedly; restarting in 5s",
+                            name,
+                            exc_info=exc,
+                        )
+                    else:
+                        logger.error(
+                            "training-node background loop %r returned unexpectedly; restarting in 5s",
+                            name,
+                        )
+                    # Brief backoff so a tight crash-loop doesn't spin the CPU.
+                    await asyncio.sleep(5)
+                    tasks[name] = asyncio.create_task(self._make_training_node_task(name))
+
             return {
-                "completed": completed_name,
+                "completed": "timer" if run_seconds is not None else "supervised",
                 "mode": "training_node",
                 "daemon_role": self._heartbeat_role,
             }
@@ -539,6 +578,19 @@ class DaemonService:
                     task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
             self._stop_threaded_liveness_heartbeat()
+
+    def _make_training_node_task(self, name: str):
+        """Return the coroutine for the named training-node background loop.
+
+        Used by _run_training_node's supervision loop to restart a task that
+        exited unexpectedly.  Raises ValueError for any name not managed by the
+        training node so a typo fails loudly.
+        """
+        if name == "heartbeat":
+            return self._periodic_heartbeat_loop()
+        if name == "crypto_model_nightly":
+            return self._periodic_crypto_model_nightly_loop()
+        raise ValueError(f"unknown training-node task {name!r}")
 
     async def _run_crypto_only(self, *, run_seconds: float | None = None) -> dict[str, Any]:
         tasks: dict[str, asyncio.Task] = {}
