@@ -3272,7 +3272,9 @@ class CryptoTrainingBackfillService:
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
         lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
-        since = datetime.now(UTC) - timedelta(days=lookback_days)
+        now_utc = datetime.now(UTC)
+        full_since = now_utc - timedelta(days=lookback_days)
+        since = full_since  # may be narrowed to the incremental tail below
         build_id = _crypto_training_build_id(
             {
                 "kalshi_env": self.settings.kalshi_env,
@@ -3286,6 +3288,28 @@ class CryptoTrainingBackfillService:
         # connection is not held idle during the multi-hour compute phase.
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+            watermark = None
+            if self.settings.crypto_train_incremental_materialize_enabled:
+                watermark = await repo.get_crypto_training_feature_watermark(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    feature_schema_version=CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+                )
+            since, since_reason = _resolve_incremental_materialize_since(
+                full_since=full_since,
+                now=now_utc,
+                watermark=watermark,
+                enabled=self.settings.crypto_train_incremental_materialize_enabled,
+                warmup_hours=self.settings.crypto_train_incremental_warmup_hours,
+                max_gap_hours=self.settings.crypto_train_incremental_max_gap_hours,
+            )
+            logger.info(
+                "crypto_materialize window freq=%s mode=%s since=%s watermark=%s",
+                freq,
+                since_reason,
+                since.isoformat(),
+                watermark.isoformat() if watermark else None,
+            )
             snapshots = await repo.list_crypto_settled_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
