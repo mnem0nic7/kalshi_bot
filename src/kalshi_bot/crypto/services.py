@@ -607,6 +607,39 @@ def _crypto_spot_feature_asset_scope(asset_symbols: list[str] | None) -> list[st
     return sorted(symbols)
 
 
+def _resolve_incremental_materialize_since(
+    *,
+    full_since: datetime,
+    now: datetime,
+    watermark: datetime | None,
+    enabled: bool,
+    warmup_hours: int,
+    max_gap_hours: int,
+) -> tuple[datetime, str]:
+    """Decide the effective READ-phase ``since`` for ``_materialize_once``.
+
+    Returns ``(effective_since, reason)`` where ``reason`` is one of
+    ``'full_disabled'``, ``'full_cold_cache'``, ``'full_gap_exceeds_max'``, or
+    ``'incremental'``. The incremental tail reads from ``watermark - warmup`` but
+    is clamped so it never reads earlier than ``full_since`` (never more than the
+    configured lookback window).
+    """
+    if not enabled:
+        return full_since, "full_disabled"
+    if watermark is None:
+        # Cold cache or a feature-schema bump invalidated all persisted rows.
+        return full_since, "full_cold_cache"
+    if watermark.tzinfo is None:
+        watermark = watermark.replace(tzinfo=UTC)
+    else:
+        watermark = watermark.astimezone(UTC)
+    if now - watermark > timedelta(hours=max_gap_hours):
+        return full_since, "full_gap_exceeds_max"
+    candidate = watermark - timedelta(hours=max(1, warmup_hours))
+    effective_since = max(full_since, candidate)
+    return effective_since, "incremental"
+
+
 async def _list_crypto_spot_rows_with_cross_assets(
     repo: PlatformRepository,
     *,
