@@ -607,6 +607,14 @@ def _crypto_spot_feature_asset_scope(asset_symbols: list[str] | None) -> list[st
     return sorted(symbols)
 
 
+# A re-upserted row's recency features look back over the last 20 prior settled
+# markets (see _crypto_add_recent_asset_features). The read window must extend at
+# least this far BEFORE the upsert floor so every re-upserted row's look-back is
+# fully loaded and recomputes identically to a full rebuild. 24h comfortably holds
+# 20 markets for both 15m (~192/24h) and 1h (~24/24h) frequencies.
+_INCREMENTAL_MIN_RECENCY_CONTEXT_HOURS = 24
+
+
 def _resolve_incremental_materialize_since(
     *,
     full_since: datetime,
@@ -620,9 +628,10 @@ def _resolve_incremental_materialize_since(
     """Return ``(effective_since, upsert_floor, reason)``.
 
     ``reason`` is one of ``'full_disabled'``, ``'full_cold_cache'``,
-    ``'full_gap_exceeds_max'``, or ``'incremental'``. The incremental tail reads
-    from ``watermark - warmup`` but is clamped so it never reads earlier than
-    ``full_since`` (never more than the configured lookback window).
+    ``'full_gap_exceeds_max'``, ``'full_insufficient_recency_margin'``, or
+    ``'incremental'``. The incremental tail reads from ``watermark - warmup`` but
+    is clamped so it never reads earlier than ``full_since`` (never more than the
+    configured lookback window).
 
     ``upsert_floor`` is ``None`` for full rebuilds (upsert everything); for
     incremental it is ``watermark - label_refresh_hours`` (only rows newer than
@@ -630,6 +639,13 @@ def _resolve_incremental_materialize_since(
     look-back contained in the read window and recompute identically to a full
     rebuild). Because ``warmup_hours >> label_refresh_hours`` every re-upserted
     row has many hours of prior settled markets loaded ahead of it.
+
+    Guard: if the read window does not extend at least
+    ``_INCREMENTAL_MIN_RECENCY_CONTEXT_HOURS`` before the upsert floor (e.g. a
+    misconfigured ``warmup_hours`` too close to / smaller than
+    ``label_refresh_hours``), a partial incremental would re-upsert rows with a
+    truncated recency look-back, silently corrupting features. In that case fall
+    back to a full rebuild.
     """
     if not enabled:
         return full_since, None, "full_disabled"
@@ -645,6 +661,11 @@ def _resolve_incremental_materialize_since(
     candidate = watermark - timedelta(hours=max(1, warmup_hours))
     effective_since = max(full_since, candidate)
     upsert_floor = watermark - timedelta(hours=max(1, label_refresh_hours))
+    # The read window must hold a full recency look-back ahead of every
+    # re-upserted row. If it does not, a partial incremental would corrupt
+    # recency features — fall back to a full rebuild instead.
+    if upsert_floor - effective_since < timedelta(hours=_INCREMENTAL_MIN_RECENCY_CONTEXT_HOURS):
+        return full_since, None, "full_insufficient_recency_margin"
     return effective_since, upsert_floor, "incremental"
 
 
@@ -3320,6 +3341,17 @@ class CryptoTrainingBackfillService:
                 watermark.isoformat() if watermark else None,
                 upsert_floor.isoformat() if upsert_floor else None,
             )
+            if since_reason == "full_insufficient_recency_margin":
+                logger.warning(
+                    "crypto_materialize falling back to full rebuild: warmup_hours=%s is too "
+                    "close to label_refresh_hours=%s (need >= %sh of recency context between "
+                    "the read window and the upsert floor). Increase crypto_train_incremental_"
+                    "warmup_hours or lower crypto_train_incremental_label_refresh_hours to "
+                    "re-enable partial incremental materialize.",
+                    self.settings.crypto_train_incremental_warmup_hours,
+                    self.settings.crypto_train_incremental_label_refresh_hours,
+                    _INCREMENTAL_MIN_RECENCY_CONTEXT_HOURS,
+                )
             snapshots = await repo.list_crypto_settled_market_snapshots(
                 frequency=freq,
                 kalshi_env=self.settings.kalshi_env,
@@ -3381,10 +3413,8 @@ class CryptoTrainingBackfillService:
                 )
             feature_row_values: list[dict[str, Any]] = []
             for row in decision_rows:
-                if upsert_floor is not None:
-                    row_dt = _as_utc_datetime(row.get("decision_ts"))
-                    if row_dt is not None and row_dt <= upsert_floor:
-                        continue
+                if upsert_floor is not None and _as_utc_datetime(row.get("decision_ts")) <= upsert_floor:
+                    continue
                 payload = _crypto_training_json_ready(row)
                 feature_hash = _crypto_training_build_id(payload)
                 feature_row_values.append(
@@ -3429,6 +3459,8 @@ class CryptoTrainingBackfillService:
                 asset_symbols=requested_assets,
             )
             quality_status = "ok" if not blockers else "blocked"
+            # NOTE: on incremental runs rows_materialized = rows actually upserted (the tail),
+            # while the quality/coverage metrics below intentionally evaluate the full read window's health.
             quality = await repo.record_crypto_data_quality_run(
                 kalshi_env=self.settings.kalshi_env,
                 frequency=freq,

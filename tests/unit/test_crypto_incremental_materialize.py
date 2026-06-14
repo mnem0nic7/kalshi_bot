@@ -40,8 +40,12 @@ from kalshi_bot.db.session import create_engine, create_session_factory, init_mo
 from tests.unit.test_crypto_training_data import _snapshot
 
 
+# warmup must exceed label_refresh (default 24h) by at least the
+# 24h min recency-context margin enforced by the resolver, else the run falls
+# back to a full rebuild. 48h keeps OLD (10d) outside the incremental read tail
+# while still leaving >= 24h of recency context ahead of the upsert floor.
 NOW = datetime(2026, 6, 13, 0, 0, tzinfo=UTC)
-WARMUP_HOURS = 24
+WARMUP_HOURS = 48
 LOOKBACK_DAYS = 30
 
 

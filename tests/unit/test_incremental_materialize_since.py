@@ -116,11 +116,13 @@ def test_incremental_read_window_strictly_wider_than_upsert_zone() -> None:
 def test_incremental_clamped_to_full_since() -> None:
     """When watermark - warmup is older than full_since, clamp to full_since.
 
-    This guards against ever reading MORE than the lookback window. Here the
-    watermark sits right at the edge of the lookback window, so subtracting the
-    warmup would reach before full_since.
+    This guards against ever reading MORE than the lookback window. The watermark
+    sits inside the lookback window but close enough to its start that subtracting
+    the warmup would reach before full_since. It is still far enough in (50h) that
+    the upsert floor stays >= 24h ahead of full_since, so the recency-margin guard
+    does not trip and the run proceeds as a clamped incremental.
     """
-    watermark = FULL_SINCE + timedelta(hours=1)
+    watermark = FULL_SINCE + timedelta(hours=50)
     since, upsert_floor, reason = _resolve_incremental_materialize_since(
         full_since=FULL_SINCE,
         now=NOW,
@@ -133,6 +135,8 @@ def test_incremental_clamped_to_full_since() -> None:
     assert reason == "incremental"
     assert since == FULL_SINCE
     assert upsert_floor == watermark - timedelta(hours=LABEL_REFRESH_HOURS)
+    # Clamped, yet still >= 24h of recency context ahead of the upsert floor.
+    assert (upsert_floor - since) >= timedelta(hours=24)
 
 
 def test_naive_watermark_is_normalized_and_does_not_crash() -> None:
@@ -158,7 +162,13 @@ def test_naive_watermark_is_normalized_and_does_not_crash() -> None:
 
 
 def test_warmup_hours_floored_at_one() -> None:
-    """warmup_hours <= 0 is floored to 1 hour, never zero or negative."""
+    """warmup_hours <= 0 is floored to 1 hour.
+
+    With label_refresh=24 this leaves the read window (watermark-1h) NEWER than
+    the upsert floor (watermark-24h) — an inverted, corrupting configuration —
+    so the recency-margin guard forces a full rebuild rather than emitting a
+    1-hour incremental tail.
+    """
     watermark = NOW - timedelta(hours=2)
     since, upsert_floor, reason = _resolve_incremental_materialize_since(
         full_since=FULL_SINCE,
@@ -169,9 +179,9 @@ def test_warmup_hours_floored_at_one() -> None:
         max_gap_hours=168,
         label_refresh_hours=LABEL_REFRESH_HOURS,
     )
-    assert reason == "incremental"
-    assert since == watermark - timedelta(hours=1)
-    assert upsert_floor == watermark - timedelta(hours=LABEL_REFRESH_HOURS)
+    assert reason == "full_insufficient_recency_margin"
+    assert since == FULL_SINCE
+    assert upsert_floor is None
 
 
 def test_label_refresh_hours_floored_at_one() -> None:
@@ -188,6 +198,68 @@ def test_label_refresh_hours_floored_at_one() -> None:
     )
     assert reason == "incremental"
     assert upsert_floor == watermark - timedelta(hours=1)
+
+
+def test_inverted_warmup_smaller_than_label_refresh_forces_full_rebuild() -> None:
+    """warmup_hours=24 < label_refresh_hours=48 is inverted misconfig.
+
+    The read window (watermark-24h) sits NEWER than the upsert floor
+    (watermark-48h), so a partial incremental would re-upsert rows with a
+    truncated recency look-back. The guard forces a full rebuild.
+    """
+    watermark = NOW - timedelta(hours=2)
+    since, upsert_floor, reason = _resolve_incremental_materialize_since(
+        full_since=FULL_SINCE,
+        now=NOW,
+        watermark=watermark,
+        enabled=True,
+        warmup_hours=24,
+        max_gap_hours=168,
+        label_refresh_hours=48,
+    )
+    assert reason == "full_insufficient_recency_margin"
+    assert since == FULL_SINCE
+    assert upsert_floor is None
+
+
+def test_thin_margin_below_min_context_forces_full_rebuild() -> None:
+    """warmup=30, label_refresh=24 => margin 6h < 24h min context => full rebuild.
+
+    Even though warmup > label_refresh (not inverted), the 6h of recency context
+    between the read window and the upsert floor is too thin to hold a full
+    20-market look-back, so the guard falls back to a full rebuild.
+    """
+    watermark = NOW - timedelta(hours=2)  # fresh watermark, not clamped to full_since
+    since, upsert_floor, reason = _resolve_incremental_materialize_since(
+        full_since=FULL_SINCE,
+        now=NOW,
+        watermark=watermark,
+        enabled=True,
+        warmup_hours=30,
+        max_gap_hours=168,
+        label_refresh_hours=24,
+    )
+    assert reason == "full_insufficient_recency_margin"
+    assert since == FULL_SINCE
+    assert upsert_floor is None
+
+
+def test_default_config_has_sufficient_recency_margin() -> None:
+    """warmup=72, label_refresh=24, recent watermark => incremental (margin 48h >= 24h)."""
+    watermark = NOW - timedelta(hours=2)
+    since, upsert_floor, reason = _resolve_incremental_materialize_since(
+        full_since=FULL_SINCE,
+        now=NOW,
+        watermark=watermark,
+        enabled=True,
+        warmup_hours=72,
+        max_gap_hours=168,
+        label_refresh_hours=24,
+    )
+    assert reason == "incremental"
+    assert upsert_floor is not None
+    # 72h read window minus 24h upsert tail = 48h of recency context.
+    assert (upsert_floor - since) >= timedelta(hours=24)
 
 
 def test_gap_exactly_at_max_is_incremental() -> None:
