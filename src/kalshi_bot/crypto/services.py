@@ -3393,10 +3393,23 @@ class CryptoTrainingBackfillService:
         # COMPUTE PHASE — pure in-memory; no DB connection held. Run in a thread
         # so the asyncio event loop is not blocked during the multi-hour CPU pass.
         loop = asyncio.get_event_loop()
-        decision_rows = await loop.run_in_executor(
-            None,
-            lambda: _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings),
-        )
+        _build_workers = int(self.settings.crypto_train_build_workers)
+        if _build_workers > 1:
+            decision_rows = await loop.run_in_executor(
+                None,
+                lambda: _crypto_decision_rows_parallel(
+                    snapshots,
+                    candles,
+                    spot_rows,
+                    settings=self.settings,
+                    workers=_build_workers,
+                ),
+            )
+        else:
+            decision_rows = await loop.run_in_executor(
+                None,
+                lambda: _crypto_decision_rows(snapshots, candles, spot_rows, settings=self.settings),
+            )
 
         # WRITE PHASE — fresh session after compute so there is no stale connection.
         async with self.session_factory() as session:
@@ -9474,6 +9487,75 @@ def _crypto_decision_rows(
                 }
             )
     return _crypto_add_recent_asset_features(rows)
+
+
+def _crypto_decision_rows_parallel(
+    snapshots: list[CryptoMarketSnapshotRecord],
+    candles: list[CryptoMarketCandlestickRecord],
+    spot_rows: list[CryptoSpotOHLCRecord] | None = None,
+    *,
+    settings: Settings | None = None,
+    workers: int,
+    funding_rate_rows: list[CryptoFundingRateRecord] | None = None,
+) -> list[dict[str, Any]]:
+    """Asset-partitioned parallel build.
+
+    workers<=1 (or a single asset in the dataset) delegates to the serial
+    `_crypto_decision_rows` unchanged. Otherwise: split snapshots and candles by
+    asset_symbol, broadcast ALL spot_rows + funding_rate_rows to each worker
+    (cross-asset spot features require the full set), run each asset's build in a
+    separate process, then concatenate. The output row set is identical to the
+    serial path (asserted by the parity test).
+
+    NOTE on memory: ProcessPoolExecutor pickles every argument per submitted task,
+    so the full spot_rows + funding_rate_rows are copied into each worker (~N
+    copies for N concurrent assets). On the dense 60s spot dataset this broadcast
+    is the dominant memory cost; the operator bounds it via
+    `crypto_train_build_workers`. The win holds because per-asset COMPUTE
+    dominates the pickle/transfer overhead.
+    """
+    assets = sorted({str(s.asset_symbol) for s in snapshots})
+    if workers <= 1 or len(assets) <= 1:
+        return _crypto_decision_rows(
+            snapshots,
+            candles,
+            spot_rows,
+            settings=settings,
+            funding_rate_rows=funding_rate_rows,
+        )
+
+    max_workers = min(workers, len(assets))
+    logger.info(
+        "crypto.parallel_build: assets=%d workers=%d spot_rows=%d funding_rows=%d",
+        len(assets),
+        max_workers,
+        len(spot_rows or []),
+        len(funding_rate_rows or []),
+    )
+
+    snapshots_by_asset: dict[str, list[CryptoMarketSnapshotRecord]] = defaultdict(list)
+    for snap in snapshots:
+        snapshots_by_asset[str(snap.asset_symbol)].append(snap)
+    candles_by_asset: dict[str, list[CryptoMarketCandlestickRecord]] = defaultdict(list)
+    for candle in candles:
+        candles_by_asset[str(candle.asset_symbol)].append(candle)
+
+    rows: list[dict[str, Any]] = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _crypto_decision_rows,
+                snapshots_by_asset.get(asset, []),
+                candles_by_asset.get(asset, []),
+                spot_rows,
+                settings=settings,
+                funding_rate_rows=funding_rate_rows,
+            ): asset
+            for asset in assets
+        }
+        for future in concurrent.futures.as_completed(futures):
+            rows.extend(future.result())
+    return rows
 
 
 def _crypto_settlement_snapshots_by_market(

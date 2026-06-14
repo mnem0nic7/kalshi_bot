@@ -220,6 +220,7 @@ class Settings(BaseSettings):
     crypto_train_incremental_warmup_hours: int = 72
     crypto_train_incremental_max_gap_hours: int = 168
     crypto_train_incremental_label_refresh_hours: int = 24
+    crypto_train_build_workers: int = 1  # 1 = serial (today); >1 = ProcessPool over assets (trainer only)
     # Balance training sample weights so each market contributes equally
     # regardless of how many 15s snapshot rows it produced (~60 rows/market).
     crypto_train_market_balanced_weights: bool = True
