@@ -2866,6 +2866,27 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoTrainingFeatureRowRecord.decision_time.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def get_crypto_training_feature_watermark(
+        self,
+        *,
+        frequency: str,
+        kalshi_env: str | None = None,
+        feature_schema_version: str,
+    ) -> datetime | None:
+        """Max persisted decision_time for (env, frequency) at a given schema
+        version, or None if no schema-matched rows exist (cold cache)."""
+        stmt = select(func.max(CryptoTrainingFeatureRowRecord.decision_time)).where(
+            CryptoTrainingFeatureRowRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+            CryptoTrainingFeatureRowRecord.frequency == frequency,
+            CryptoTrainingFeatureRowRecord.feature_schema_version == feature_schema_version,
+        )
+        value = (await self.session.execute(stmt)).scalar_one_or_none()
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
     async def upsert_crypto_decision_outcome(self, **values: Any) -> None:
         values["kalshi_env"] = self._resolved_kalshi_env(values.get("kalshi_env"))
         update_values = {key: value for key, value in values.items() if key not in {"id", "created_at"}}

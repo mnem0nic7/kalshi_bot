@@ -87,3 +87,28 @@ async def test_bulk_upsert_multi_chunk_accumulation(tmp_path) -> None:
         repo = PlatformRepository(session, kalshi_env="production")
         rows = await repo.list_crypto_training_feature_rows(frequency="15m", kalshi_env="production", limit=100)
         assert {r.row_id for r in rows} == {"x", "y", "z"}
+
+
+@pytest.mark.asyncio
+async def test_watermark_is_max_decision_time_for_schema(tmp_path) -> None:
+    from datetime import timedelta
+
+    session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        r_old = _row("old"); r_old["decision_time"] = NOW - timedelta(hours=3)
+        r_new = _row("new"); r_new["decision_time"] = NOW
+        r_v9 = _row("v9"); r_v9["decision_time"] = NOW + timedelta(hours=1); r_v9["feature_schema_version"] = "crypto-rich-v9"
+        await repo.bulk_upsert_crypto_training_feature_rows([r_old, r_new, r_v9])
+        await session.commit()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env="production")
+        wm = await repo.get_crypto_training_feature_watermark(
+            frequency="15m", kalshi_env="production", feature_schema_version="crypto-rich-v10"
+        )
+        assert wm == NOW  # ignores the newer v9 row (different schema)
+        none_wm = await repo.get_crypto_training_feature_watermark(
+            frequency="1h", kalshi_env="production", feature_schema_version="crypto-rich-v10"
+        )
+        assert none_wm is None
