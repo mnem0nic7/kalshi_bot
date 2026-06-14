@@ -8,6 +8,7 @@ import importlib.metadata as importlib_metadata
 import json
 import logging
 import math
+import multiprocessing
 import os
 import time
 from bisect import bisect_left, bisect_right
@@ -9541,7 +9542,8 @@ def _crypto_decision_rows_parallel(
         candles_by_asset[str(candle.asset_symbol)].append(candle)
 
     rows: list[dict[str, Any]] = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+    _ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=_ctx) as pool:
         futures = {
             pool.submit(
                 _crypto_decision_rows,
