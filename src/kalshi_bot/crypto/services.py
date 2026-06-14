@@ -3312,28 +3312,32 @@ class CryptoTrainingBackfillService:
                     spot_rows=spot_rows,
                     frequency=freq,
                 )
+            feature_row_values: list[dict[str, Any]] = []
             for row in decision_rows:
                 payload = _crypto_training_json_ready(row)
                 feature_hash = _crypto_training_build_id(payload)
-                await repo.upsert_crypto_training_feature_row(
-                    kalshi_env=self.settings.kalshi_env,
-                    frequency=freq,
-                    market_ticker=str(row.get("market_ticker") or ""),
-                    asset_symbol=normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
-                    row_id=str(row.get("row_id") or feature_hash),
-                    decision_time=_as_utc_datetime(row.get("decision_ts")),
-                    settlement_time=_as_utc_datetime(row.get("settlement_ts")) if row.get("settlement_ts") else None,
-                    label_yes=int(row["label_yes"]) if row.get("label_yes") in {0, 1} else None,
-                    strict_trade_eligible=bool(row.get("strict_trade_eligible")),
-                    feature_schema_version=CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
-                    feature_hash=feature_hash,
-                    source_build_id=build_id,
-                    quality_score=_crypto_training_row_quality_score(row),
-                    payload={
-                        "schema_version": "crypto-training-feature-row-v1",
-                        "decision_row": payload,
-                    },
+                feature_row_values.append(
+                    dict(
+                        kalshi_env=self.settings.kalshi_env,
+                        frequency=freq,
+                        market_ticker=str(row.get("market_ticker") or ""),
+                        asset_symbol=normalize_asset_symbol(str(row.get("asset_symbol") or "UNKNOWN")),
+                        row_id=str(row.get("row_id") or feature_hash),
+                        decision_time=_as_utc_datetime(row.get("decision_ts")),
+                        settlement_time=_as_utc_datetime(row.get("settlement_ts")) if row.get("settlement_ts") else None,
+                        label_yes=int(row["label_yes"]) if row.get("label_yes") in {0, 1} else None,
+                        strict_trade_eligible=bool(row.get("strict_trade_eligible")),
+                        feature_schema_version=CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+                        feature_hash=feature_hash,
+                        source_build_id=build_id,
+                        quality_score=_crypto_training_row_quality_score(row),
+                        payload={
+                            "schema_version": "crypto-training-feature-row-v1",
+                            "decision_row": payload,
+                        },
+                    )
                 )
+            await repo.bulk_upsert_crypto_training_feature_rows(feature_row_values)
             outcome_count = await self._materialize_decision_outcomes(
                 session,
                 repo,
