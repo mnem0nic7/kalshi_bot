@@ -1348,8 +1348,15 @@ class CryptoMarketService:
                 artifact_type="replay_gate",
                 kalshi_env=self.settings.kalshi_env,
             )
+            active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            note_modes = self.asset_control_service.modes_from_notes(control.notes)
             replay_gates_by_asset: dict[str, Any | None] = {}
-            for asset_symbol in asset_symbols:
+            for asset_symbol in _crypto_asset_symbols_for_mode_resolution(
+                asset_symbols=asset_symbols,
+                note_modes=note_modes,
+                crypto_policy=crypto_policy,
+            ):
                 replay_gates_by_asset[asset_symbol] = await _latest_crypto_artifact_for_asset(
                     repo,
                     frequency=dashboard_frequency,
@@ -1357,8 +1364,6 @@ class CryptoMarketService:
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbol=asset_symbol,
                 )
-            active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
-            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
             active_rooms: dict[str, dict[str, str]] = {}
             for market in markets:
                 room = await repo.get_latest_active_room_for_market(
@@ -1387,7 +1392,7 @@ class CryptoMarketService:
             asset_symbols=asset_symbols,
             modes=_resolved_crypto_asset_modes(
                 asset_symbols=asset_symbols,
-                note_modes=self.asset_control_service.modes_from_notes(control.notes),
+                note_modes=note_modes,
                 crypto_policy=crypto_policy,
                 replay_gates_by_asset=replay_gates_by_asset,
                 generic_replay_gate=generic_gate,
@@ -1661,11 +1666,17 @@ class CryptoMarketService:
                             break
                     await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
+        note_modes = self.asset_control_service.modes_from_notes(control.notes)
+        mode_asset_symbols = _crypto_asset_symbols_for_mode_resolution(
+            asset_symbols=asset_symbols,
+            note_modes=note_modes,
+            crypto_policy=crypto_policy,
+        )
         replay_gates_by_asset: dict[str, Any | None] = {}
-        if asset_symbols:
+        if mode_asset_symbols:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session)
-                for asset_symbol in asset_symbols:
+                for asset_symbol in mode_asset_symbols:
                     asset_key = normalize_asset_symbol(asset_symbol)
                     replay_gates_by_asset[asset_key] = await _latest_crypto_artifact_for_asset(
                         repo,
@@ -1679,7 +1690,7 @@ class CryptoMarketService:
             asset_symbols=asset_symbols,
             modes=_resolved_crypto_asset_modes(
                 asset_symbols=asset_symbols,
-                note_modes=self.asset_control_service.modes_from_notes(control.notes),
+                note_modes=note_modes,
                 crypto_policy=crypto_policy,
                 replay_gates_by_asset=replay_gates_by_asset,
                 generic_replay_gate=gate,
@@ -7300,6 +7311,21 @@ def _runtime_crypto_policy_payload(
             "asset_mode": crypto_policy.asset_modes.get(normalize_asset_symbol(asset_symbol or "UNKNOWN")),
         },
     }
+
+
+def _crypto_asset_symbols_for_mode_resolution(
+    *,
+    asset_symbols: list[str],
+    note_modes: dict[str, str],
+    crypto_policy: RuntimeCryptoPolicy,
+) -> list[str]:
+    symbols = {normalize_asset_symbol(symbol) for symbol in asset_symbols}
+    for key in list(note_modes) + list(crypto_policy.asset_modes):
+        try:
+            symbols.add(normalize_asset_symbol(str(key).split(":", 1)[0]))
+        except ValueError:
+            continue
+    return sorted(symbols)
 
 
 def _resolved_crypto_asset_modes(
