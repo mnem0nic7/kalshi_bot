@@ -1356,6 +1356,7 @@ class CryptoMarketService:
                 asset_symbols=asset_symbols,
                 note_modes=note_modes,
                 crypto_policy=crypto_policy,
+                frequency=dashboard_frequency,
             ):
                 replay_gates_by_asset[asset_symbol] = await _latest_crypto_artifact_for_asset(
                     repo,
@@ -1671,6 +1672,7 @@ class CryptoMarketService:
             asset_symbols=asset_symbols,
             note_modes=note_modes,
             crypto_policy=crypto_policy,
+            frequency=frequency,
         )
         replay_gates_by_asset: dict[str, Any | None] = {}
         if mode_asset_symbols:
@@ -7318,14 +7320,26 @@ def _crypto_asset_symbols_for_mode_resolution(
     asset_symbols: list[str],
     note_modes: dict[str, str],
     crypto_policy: RuntimeCryptoPolicy,
+    frequency: str | None = None,
 ) -> list[str]:
+    normalized_frequency = normalize_frequency(frequency) if frequency else None
     symbols = {normalize_asset_symbol(symbol) for symbol in asset_symbols}
     for key in list(note_modes) + list(crypto_policy.asset_modes):
+        if not _crypto_mode_key_matches_frequency(key, normalized_frequency):
+            continue
         try:
             symbols.add(normalize_asset_symbol(str(key).split(":", 1)[0]))
         except ValueError:
             continue
     return sorted(symbols)
+
+
+def _crypto_mode_key_matches_frequency(key: str, normalized_frequency: str | None) -> bool:
+    if not normalized_frequency or ":" not in str(key):
+        return True
+    _, raw_frequency = str(key).split(":", 1)
+    key_frequency = normalize_frequency(raw_frequency) or raw_frequency.strip().lower()
+    return key_frequency == normalized_frequency
 
 
 def _resolved_crypto_asset_modes(
@@ -7338,10 +7352,14 @@ def _resolved_crypto_asset_modes(
     frequency: str | None = None,
 ) -> dict[str, str]:
     symbols = {normalize_asset_symbol(symbol) for symbol in asset_symbols}
-    symbols.update(note_modes)
-    symbols.update(crypto_policy.asset_modes)
-    resolved: dict[str, str] = {}
     normalized_frequency = normalize_frequency(frequency) if frequency else None
+    symbols.update(
+        key for key in note_modes if _crypto_mode_key_matches_frequency(key, normalized_frequency)
+    )
+    symbols.update(
+        key for key in crypto_policy.asset_modes if _crypto_mode_key_matches_frequency(key, normalized_frequency)
+    )
+    resolved: dict[str, str] = {}
     use_gate_modes = replay_gates_by_asset is not None or generic_replay_gate is not None
     for symbol in sorted(symbols):
         if ":" in symbol:

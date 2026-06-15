@@ -8,13 +8,20 @@ import pytest
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.enums import ContractSide, TradeAction
-from kalshi_bot.core.schemas import ExecReceiptPayload, TradeTicket
+from kalshi_bot.core.schemas import (
+    AgentPackCryptoLivePolicy,
+    AgentPackCryptoPolicy,
+    ExecReceiptPayload,
+    TradeTicket,
+)
 from kalshi_bot.crypto.models import CryptoMarket
 from kalshi_bot.crypto.services import (
     CRYPTO_LIVE_QUALITY,
     CryptoAssetControlService,
     CryptoExecutionService,
+    _resolved_crypto_asset_modes,
 )
+from kalshi_bot.services.agent_packs import AgentPackService
 from kalshi_bot.services.signal import StrategySignal
 
 
@@ -166,6 +173,40 @@ def test_off_control_note_overrides_passed_gate(tmp_path) -> None:
     assert status["control_asset_mode"] == "off"
     assert status["live_eligible"] is False
     assert status["live_blockers"] == ["Asset BTC mode is off."]
+
+
+def test_resolved_asset_modes_filter_cross_frequency_keys(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    agent_pack_service = AgentPackService(settings)
+    policy = agent_pack_service.runtime_crypto_policy(
+        agent_pack_service.default_pack().model_copy(
+            update={
+                "crypto_policy": AgentPackCryptoPolicy(
+                    live=AgentPackCryptoLivePolicy(
+                        asset_modes={
+                            "BTC:15m": "live",
+                            "BTC:1h": "shadow",
+                            "ETH:1h": "live",
+                        }
+                    )
+                )
+            }
+        )
+    )
+
+    modes = _resolved_crypto_asset_modes(
+        asset_symbols=[],
+        note_modes={
+            "BTC:15m": "live",
+            "BTC:1h": "shadow",
+            "ETH:1h": "live",
+        },
+        crypto_policy=policy,
+        replay_gates_by_asset={"BTC": _gate("passed"), "ETH": _gate("blocked")},
+        frequency="15m",
+    )
+
+    assert modes == {"BTC:15m": "live"}
 
 
 @pytest.mark.asyncio

@@ -614,7 +614,7 @@ class AgentPackService:
                 value_or_settings(live.production_autonomy_enabled, self.settings.crypto_production_autonomy_enabled)
             ),
             asset_modes={
-                _normalize_crypto_asset_symbol(symbol): _normalize_crypto_asset_mode(mode)
+                _normalize_crypto_entry_override_key(symbol): _normalize_crypto_asset_mode(mode)
                 for symbol, mode in (live.asset_modes or {}).items()
             },
             asset_entry_overrides=overrides,
@@ -698,7 +698,7 @@ class AgentPackService:
             trading_enabled=crypto_policy.live.trading_enabled,
             production_autonomy_enabled=crypto_policy.live.production_autonomy_enabled,
             asset_modes={
-                _normalize_crypto_asset_symbol(symbol): _normalize_crypto_asset_mode(mode)
+                _normalize_crypto_entry_override_key(symbol): _normalize_crypto_asset_mode(mode)
                 for symbol, mode in (crypto_policy.live.asset_modes or {}).items()
             },
         )
