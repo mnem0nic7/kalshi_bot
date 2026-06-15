@@ -43,6 +43,16 @@ def _snapshot(
         target_price_dollars=Decimal("70000"),
         yes_bid_dollars=Decimal("0.3000"),
         yes_ask_dollars=Decimal("0.3100"),
+        # Real Kalshi ingestion (crypto/parsing.py) populates the no-side bid as
+        # a first-class column. The fixture previously omitted it, which forced
+        # _snapshot_price() into its payload fallback during the materialize
+        # COMPUTE PHASE — and because _materialize_once() loads snapshots with
+        # defer_payload=True and then closes the session before computing, that
+        # fallback raised DetachedInstanceError on the deferred `payload` column.
+        # Populating no_bid_dollars (as production does) keeps the snapshot's
+        # prices fully column-resident so the deferred payload is never touched
+        # outside the session, matching the invariant in commit 2c78ac1.
+        no_bid_dollars=Decimal("0.6900"),
         no_ask_dollars=Decimal("0.7000"),
         settlement_result=settlement_result,
         observed_at=observed_at,

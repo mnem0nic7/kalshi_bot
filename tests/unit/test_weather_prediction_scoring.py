@@ -213,7 +213,12 @@ def test_stale_intraday_model_falls_back_to_baseline() -> None:
         "active": True,
         "model_type": "weather_intraday_logistic_v1",
         "version": "test",
-        "created_at": (datetime.now(UTC) - timedelta(days=30)).isoformat(),
+        # Staleness is measured against the scoring as-of clock (max of the
+        # observation/forecast timestamps), NOT wall-clock now(). The fixtures
+        # pin asof_ts to 2026-05-09T14:00Z, so anchor created_at well before
+        # that instead of `now() - 30d` (which, as wall-clock advanced past the
+        # fixture date, ended up NEWER than asof_ts and was treated as fresh).
+        "created_at": (datetime(2026, 5, 9, 14, 0, tzinfo=UTC) - timedelta(days=30)).isoformat(),
         "feature_names": ["forecast_delta_f"],
         "feature_means": {"forecast_delta_f": 0.0},
         "feature_scales": {"forecast_delta_f": 1.0},

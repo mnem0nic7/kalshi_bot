@@ -63,6 +63,9 @@ class FakePlatformRepository:
     async def update_room_runtime(self, *args, **kwargs) -> None:
         return None
 
+    async def update_room_stage(self, *args, **kwargs) -> None:
+        return None
+
     async def get_city_strategy_assignment(self, *args, **kwargs):
         return None
 
@@ -100,6 +103,33 @@ class FakeAgentPackService:
             trigger_cooldown_seconds=0,
             strategy_quality_edge_buffer_bps=0,
             strategy_min_remaining_payout_bps=100,
+        )
+
+    def resolve_weather_policy(self, pack, context, fallback_thresholds=None):
+        thresholds = fallback_thresholds or self.runtime_thresholds(pack)
+        return SimpleNamespace(
+            thresholds=thresholds,
+            policy=None,
+            policy_key="flat",
+            fallback_policy_key_used="flat",
+            mode="flat",
+            action="trade",
+            lane="entry_gate",
+            binding_policy_lane="entry_gate",
+            policy_disagreement=False,
+            reason_codes=(),
+            deterministic_summary="",
+            provenance=lambda: {
+                "policy_key": "flat",
+                "fallback_policy_key_used": "flat",
+                "lane": "entry_gate",
+                "mode": "flat",
+                "action": "trade",
+                "binding_policy_lane": "entry_gate",
+                "policy_disagreement": False,
+                "reason_codes": [],
+                "deterministic_summary": "",
+            },
         )
 
 

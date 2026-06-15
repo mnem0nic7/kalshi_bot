@@ -483,7 +483,12 @@ def test_crypto_time_to_close_bucket_is_frequency_aware() -> None:
     assert _crypto_time_to_close_bucket(901, "15m") == "15m_plus"
 
 
-def test_crypto_empirical_bucket_gate_uses_broad_fallback_for_sparse_hourly_bucket(tmp_path) -> None:
+def test_crypto_empirical_bucket_gate_blocks_sparse_hourly_bucket_with_no_exact_match(tmp_path) -> None:
+    # The broad/any-time bucket fallback was removed from the empirical bucket
+    # gate (commit 73169e8); the gate now requires an exact bucket-key match.
+    # A sparse hourly bucket no longer borrows evidence from a broader scope, so
+    # the gate blocks it on its own thin sample count (the safer, stricter
+    # direction — fewer candidates clear the gate).
     settings = _settings(
         tmp_path,
         crypto_empirical_bucket_gate_assets="BTC",
@@ -531,9 +536,9 @@ def test_crypto_empirical_bucket_gate_uses_broad_fallback_for_sparse_hourly_buck
         enforce=True,
     )
 
-    assert gate["allowed"] is True
-    assert gate["reason"] == "empirical_bucket_fallback_allowed"
-    assert gate["matched_bucket_scope"] == "asset_side_price_spread_any_time"
+    assert gate["allowed"] is False
+    assert gate["reason"] in {"empirical_bucket_under_sampled", "empirical_bucket_missing"}
+    assert "matched_bucket_scope" not in gate
 
 
 def test_crypto_dynamic_sizing_live_quality_yes_uses_position_budget(tmp_path) -> None:
@@ -698,22 +703,17 @@ def test_crypto_dynamic_sizing_subtracts_current_and_pending_notional(tmp_path) 
     assert diagnostics["available_notional_dollars"] == "4.0000"
 
 
-def test_crypto_dynamic_sizing_uses_policy_target_with_hard_15_pct_cap(tmp_path) -> None:
+def test_crypto_dynamic_sizing_uses_settings_target_capped_by_risk_position_pct(tmp_path) -> None:
+    # Current sizing derives the target position pct from settings only
+    # (effective = min(crypto_dynamic_order_target_position_pct, risk_position_pct));
+    # the agent-pack policy target + hard 15% cap path was removed from
+    # _crypto_dynamic_order_count_fp (see commit 73169e8). With a 5% settings
+    # target and 100% risk cap, effective target stays 5% → $5 notional → 10 contracts.
     settings = _settings(
         tmp_path,
         risk_position_pct=1.0,
         crypto_dynamic_order_target_position_pct=0.05,
         crypto_dynamic_order_max_position_pct=0.50,
-    )
-    service = AgentPackService(settings)
-    policy = service.runtime_crypto_policy(
-        service.default_pack().model_copy(
-            update={
-                "crypto_policy": AgentPackCryptoPolicy(
-                    entry=AgentPackCryptoEntryPolicy(target_position_pct=0.20),
-                )
-            }
-        )
     )
 
     count, diagnostics = _crypto_dynamic_order_count_fp(
@@ -721,14 +721,11 @@ def test_crypto_dynamic_sizing_uses_policy_target_with_hard_15_pct_cap(tmp_path)
         ticket=_sizing_ticket(side=ContractSide.YES, yes_price_dollars=Decimal("0.5000")),
         signal=_live_quality_signal(),
         context=_risk_context_for_sizing(total_capital_dollars=Decimal("100.00")),
-        crypto_policy=policy,
-        asset_symbol="BTC",
     )
 
-    assert count == Decimal("30.00")
-    assert diagnostics["target_position_pct_source"] == "agent_pack"
-    assert diagnostics["effective_target_position_pct"] == 0.15
-    assert diagnostics["target_notional_dollars"] == "15.0000"
+    assert count == Decimal("10.00")
+    assert diagnostics["effective_target_position_pct"] == 0.05
+    assert diagnostics["target_notional_dollars"] == "5.0000"
 
 
 def test_crypto_pnl_sizing_target_pct_scales_per_candidate_and_caps(tmp_path) -> None:
@@ -1125,7 +1122,10 @@ def test_crypto_candidate_demotes_coingecko_proxy_spot(tmp_path) -> None:
 
 
 async def _seed_crypto_training_rows(session_factory, settings: Settings, *, days: int = 4) -> None:
-    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    # Anchor the seed window relative to "now" so the rows stay inside recency
+    # cutoffs (e.g. CryptoHistoryService.status(days=30)); a fixed calendar base
+    # silently ages out of the lookback window over time.
+    base = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=days + 1)
     async with session_factory() as session:
         repo = PlatformRepository(session)
         for idx in range(days):
@@ -1570,6 +1570,9 @@ async def test_crypto_history_captures_candles_with_configured_concurrency(tmp_p
         async def upsert_crypto_market_candlestick(self, **kwargs) -> None:
             self.candles.append(kwargs)
 
+        async def map_crypto_candlestick_coverage(self, **kwargs) -> dict[str, datetime]:
+            return {}
+
     class _FakeSession:
         def __init__(self) -> None:
             self.commit_count = 0
@@ -1692,8 +1695,8 @@ async def test_crypto_history_collect_settled_appends_terminal_label_snapshot(tm
         market_service=_FakeMarketService(),  # type: ignore[arg-type]
     )
 
-    async def fake_capture_candles_for_markets(session, repo, markets: list[CryptoMarket], *, cutoff: datetime, commit_batch_size: int):
-        del session, repo, cutoff, commit_batch_size
+    async def fake_capture_candles_for_markets(session, repo, markets: list[CryptoMarket], *, cutoff: datetime, commit_batch_size: int, frequency: str | None = None):
+        del session, repo, cutoff, commit_batch_size, frequency
         return [
             (market, {"status": "error", "stored": 0, "source": "live", "error": "temporary candle gap"})
             for market in markets
@@ -2482,8 +2485,8 @@ async def test_crypto_history_collect_settled_reports_zero_counts_for_requested_
         market_service=_FakeMarketService(),  # type: ignore[arg-type]
     )
 
-    async def fake_capture_candles_for_markets(session, repo, markets: list[CryptoMarket], *, cutoff: datetime, commit_batch_size: int):
-        del session, repo, cutoff, commit_batch_size
+    async def fake_capture_candles_for_markets(session, repo, markets: list[CryptoMarket], *, cutoff: datetime, commit_batch_size: int, frequency: str | None = None):
+        del session, repo, cutoff, commit_batch_size, frequency
         return [(market, {"status": "ok", "stored": 0, "source": "live"}) for market in markets]
 
     service._capture_candles_for_markets = fake_capture_candles_for_markets  # type: ignore[method-assign]
@@ -3620,7 +3623,7 @@ def test_crypto_feature_vector_is_deterministic_and_point_in_time(tmp_path) -> N
     first = _crypto_raw_feature_vector(rows[0], schema)
     second = _crypto_raw_feature_vector(rows[0], schema)
 
-    assert schema["feature_schema_version"] == "crypto-rich-v5"
+    assert schema["feature_schema_version"] == "crypto-rich-v10"
     assert schema["asset_categories"] == ["BTC", "ETH"]
     assert "spot_return_3_pct" in schema["feature_names"]
     assert "time_to_close_bucket_0_5m" in schema["feature_names"]
@@ -3678,7 +3681,7 @@ def test_crypto_serialized_logistic_prediction_is_stable(tmp_path) -> None:
         "calibrated_weighted_ensemble",
         "market_mid_baseline",
     }
-    assert model["feature_schema_version"] == "crypto-rich-v5"
+    assert model["feature_schema_version"] == "crypto-rich-v10"
     assert model["candidate_report"]["primary_metric"] == "oos_candidate_net_pnl"
     assert first == second
     assert Decimal("0.0100") <= first <= Decimal("0.9900")
@@ -4290,6 +4293,7 @@ def test_crypto_candidate_quality_uses_1h_close_window_override(tmp_path) -> Non
 def test_crypto_candidate_quality_blocks_late_high_confidence_below_edge_floor(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=120,
         crypto_late_sure_thing_max_seconds_to_close=120,
@@ -4356,6 +4360,7 @@ def test_crypto_late_high_confidence_does_not_trade_after_close(tmp_path) -> Non
 def test_crypto_late_high_confidence_default_probability_floor_is_85(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=120,
         crypto_late_sure_thing_max_seconds_to_close=300,
@@ -4424,6 +4429,7 @@ def test_crypto_late_high_confidence_requires_90_probability_from_180_to_300_sec
 def test_crypto_late_high_confidence_requires_edge_floor_from_180_to_300_seconds(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_late_sure_thing_max_seconds_to_close=300,
         crypto_late_sure_thing_standard_max_seconds_to_close=180,
@@ -4459,6 +4465,7 @@ def test_crypto_late_high_confidence_requires_edge_floor_from_180_to_300_seconds
 def test_crypto_late_high_confidence_blocks_extended_window_adverse_momentum(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_late_sure_thing_max_seconds_to_close=300,
         crypto_late_sure_thing_standard_max_seconds_to_close=180,
@@ -4499,6 +4506,7 @@ def test_crypto_late_high_confidence_blocks_extended_window_adverse_momentum(tmp
 def test_crypto_late_high_confidence_blocks_target_distance_below_margin(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=0,
         crypto_late_sure_thing_max_seconds_to_close=300,
@@ -4538,6 +4546,7 @@ def test_crypto_late_high_confidence_blocks_target_distance_below_margin(tmp_pat
 def test_crypto_late_high_confidence_blocks_near_strike_adverse_momentum_below_90(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=0,
         crypto_late_sure_thing_standard_max_seconds_to_close=180,
@@ -4579,6 +4588,7 @@ def test_crypto_late_high_confidence_blocks_near_strike_adverse_momentum_below_9
 def test_crypto_late_high_confidence_allows_near_strike_adverse_momentum_at_90(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=0,
         crypto_late_sure_thing_standard_max_seconds_to_close=180,
@@ -4619,6 +4629,7 @@ def test_crypto_late_high_confidence_allows_near_strike_adverse_momentum_at_90(t
 def test_crypto_candidate_quality_blocks_late_market_confirmed_below_edge_before_no_entry_cutoff(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_autonomy_min_seconds_to_close=120,
         crypto_late_sure_thing_max_seconds_to_close=300,
@@ -5398,6 +5409,7 @@ def test_crypto_last_minute_passive_stays_inside_final_60_seconds(tmp_path) -> N
 def test_late_high_confidence_candidate_hits_edge_floor_before_empirical_bucket(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_empirical_bucket_gate_assets="BTC",
         crypto_empirical_late_override_enabled=False,
@@ -5438,6 +5450,7 @@ def test_late_high_confidence_candidate_hits_edge_floor_before_empirical_bucket(
 def test_late_high_confidence_does_not_override_missing_empirical_bucket_below_edge_floor(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_empirical_bucket_gate_assets="BTC",
         crypto_autonomy_min_seconds_to_close=120,
@@ -5486,6 +5499,7 @@ def test_late_high_confidence_does_not_override_missing_empirical_bucket_below_e
 def test_late_high_confidence_does_not_override_low_win_rate_bucket_below_edge_floor(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_empirical_bucket_gate_assets="BTC",
         crypto_autonomy_min_seconds_to_close=120,
@@ -5526,6 +5540,7 @@ def test_late_high_confidence_does_not_override_low_win_rate_bucket_below_edge_f
 def test_late_high_confidence_does_not_override_negative_pnl_bucket_by_default(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_empirical_bucket_gate_assets="BTC",
         crypto_autonomy_min_seconds_to_close=120,
@@ -5566,6 +5581,7 @@ def test_late_high_confidence_does_not_override_negative_pnl_bucket_by_default(t
 def test_late_high_confidence_bucket_override_stays_inside_180_seconds(tmp_path) -> None:
     settings = _settings(
         tmp_path,
+        crypto_late_sure_thing_enabled=True,
         risk_min_edge_bps=500,
         crypto_empirical_bucket_gate_assets="BTC",
         crypto_autonomy_min_seconds_to_close=120,
@@ -5873,7 +5889,16 @@ def test_crypto_recommendation_selects_market_anchored_winner_not_low_price_valu
 
 
 def test_crypto_candidate_quality_uses_runtime_crypto_policy(tmp_path) -> None:
-    settings = _settings(tmp_path, risk_min_edge_bps=50, trigger_max_spread_bps=1000)
+    # The contract-price floor applied to the resolved entry policy is
+    # settings.risk_min_contract_price_dollars (hermetic default 0.35 once .env is
+    # neutralized); pin it explicitly so the policy's 0.03 request gets floored to
+    # the value this test asserts (max(0.03, floor)).
+    settings = _settings(
+        tmp_path,
+        risk_min_edge_bps=50,
+        trigger_max_spread_bps=1000,
+        risk_min_contract_price_dollars=0.5,
+    )
     service = AgentPackService(settings)
     pack = service.default_pack().model_copy(
         update={

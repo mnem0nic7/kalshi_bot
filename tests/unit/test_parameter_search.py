@@ -26,7 +26,7 @@ def _passing_holdout() -> dict[str, object]:
         "brier": 0.19,
         "ece": 0.04,
         "sharpe": 1.01,
-        "max_drawdown": 0.09,
+        "max_drawdown": 0.04,
         "resolved_trades": 100,
         "city_win_rates": {"NY": 0.57},
         "hard_cap_touches": 0,

@@ -160,7 +160,9 @@ def test_spot_distance_contrarian_gated_falls_back_when_quote_context_not_live_q
     proxy["quote_source"] = "candlestick_close_proxy"
     wide = _clean_quote_row()
     wide["spread_bps"] = 1501
-    too_cheap = _clean_quote_row(no_ask=Decimal("0.3400"))
+    # Activation floor is 25¢ (commit 6d4c1f8 tightened the band to 25-65¢);
+    # a 24¢ side ask is below the floor and must fall back to the neutral 0.5.
+    too_cheap = _clean_quote_row(no_ask=Decimal("0.2400"))
     missing_spot = _clean_quote_row()
     missing_spot.pop("spot_feature_status")
 
