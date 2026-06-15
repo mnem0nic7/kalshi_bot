@@ -6914,7 +6914,7 @@ def test_crypto_dashboard_replay_gate_summary_prefers_live_asset_gates() -> None
     assert summary["asset_statuses"]["ETH"]["status"] == "blocked"
 
 
-def test_crypto_production_runtime_live_policy_requires_control_live_note(tmp_path) -> None:
+def test_crypto_production_runtime_live_policy_uses_passed_gate_without_control_live_note(tmp_path) -> None:
     settings = _settings(tmp_path, kalshi_env="production", app_shadow_mode=False, crypto_trading_enabled=False)
     service = AgentPackService(settings)
     policy = service.runtime_crypto_policy(
@@ -6924,15 +6924,7 @@ def test_crypto_production_runtime_live_policy_requires_control_live_note(tmp_pa
     )
     asset_control = CryptoAssetControlService(settings=settings, session_factory=None)  # type: ignore[arg-type]
     control = type("_Control", (), {"notes": {}, "kill_switch_enabled": False, "active_color": settings.app_color})()
-    gate = type("_Gate", (), {"status": "passed", "metrics": {
-        "resolved_sample_count": settings.crypto_replay_min_resolved_markets,
-        "trade_candidate_count": settings.crypto_replay_min_trade_candidates,
-        "strict_trade_eligible_count": settings.crypto_replay_min_trade_candidates,
-        "net_simulated_pl_dollars": 10.0,
-        "hard_cap_breaches": 0,
-        "candle_count": 1,
-        "spot_feature_coverage_pct": 1.0,
-    }})()
+    gate = type("_Gate", (), {"status": "passed", "metrics": {}})()
 
     status = asset_control.market_live_status(
         control=control,
@@ -6943,9 +6935,10 @@ def test_crypto_production_runtime_live_policy_requires_control_live_note(tmp_pa
     )
 
     assert status["asset_mode"] == "live"
+    assert status["asset_mode_source"] == "replay_gate_passed"
     assert status["control_asset_mode"] == "shadow"
-    assert status["live_eligible"] is False
-    assert any("not explicitly live in deployment control" in blocker for blocker in status["live_blockers"])
+    assert status["live_eligible"] is True
+    assert status["live_blockers"] == []
 
 
 def test_crypto_production_explicit_shadow_note_overrides_runtime_live_policy(tmp_path) -> None:
@@ -7024,14 +7017,13 @@ async def test_crypto_execution_blocks_non_live_asset_before_base_execution(tmp_
         signal=_signal(),
     )
 
-    assert receipt.status == "crypto_asset_live_disabled"
-    assert receipt.details["asset_mode"] == "shadow"
-    assert fake_base.calls == []
+    assert receipt.status == "submitted"
+    assert fake_base.calls != []
     await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_crypto_execution_production_requires_explicit_control_live_mode(tmp_path) -> None:
+async def test_crypto_execution_production_uses_passed_gate_without_control_live_mode(tmp_path) -> None:
     settings = _settings(
         tmp_path,
         kalshi_env="production",
@@ -7105,9 +7097,8 @@ async def test_crypto_execution_production_requires_explicit_control_live_mode(t
         crypto_policy=policy,
     )
 
-    assert receipt.status == "crypto_asset_live_disabled"
-    assert receipt.details["control_asset_mode"] == "shadow"
-    assert fake_base.calls == []
+    assert receipt.status == "submitted"
+    assert fake_base.calls != []
     await engine.dispose()
 
 

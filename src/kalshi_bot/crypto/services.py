@@ -825,6 +825,28 @@ class CryptoAssetControlService:
             return policy_mode
         return note_mode or CRYPTO_ASSET_MODE_SHADOW
 
+    def gate_resolved_mode_for_control(
+        self,
+        control: Any,
+        asset_symbol: str,
+        *,
+        replay_gate: Any | None,
+        crypto_policy: RuntimeCryptoPolicy | None = None,
+        frequency: str | None = None,
+    ) -> str:
+        symbol = normalize_asset_symbol(asset_symbol)
+        modes = self.modes_from_notes(getattr(control, "notes", None))
+        freq = normalize_frequency(frequency) if frequency else None
+        freq_key = f"{symbol}:{freq}" if freq else None
+        note_mode = (modes.get(freq_key) if freq_key else None) or modes.get(symbol)
+        if note_mode == CRYPTO_ASSET_MODE_OFF:
+            return CRYPTO_ASSET_MODE_OFF
+        return (
+            CRYPTO_ASSET_MODE_LIVE
+            if _runtime_replay_gate_passed(replay_gate, crypto_policy)
+            else CRYPTO_ASSET_MODE_SHADOW
+        )
+
     def asset_mode_summary(
         self,
         *,
@@ -882,8 +904,14 @@ class CryptoAssetControlService:
         has_write_credentials: bool,
         crypto_policy: RuntimeCryptoPolicy | None = None,
     ) -> dict[str, Any]:
-        mode = self.mode_for_control(control, market.asset_symbol, crypto_policy=crypto_policy, frequency=market.frequency)
         explicit_mode = self.explicit_mode_for_control(control, market.asset_symbol, frequency=market.frequency)
+        mode = self.gate_resolved_mode_for_control(
+            control,
+            market.asset_symbol,
+            replay_gate=replay_gate,
+            crypto_policy=crypto_policy,
+            frequency=market.frequency,
+        )
         global_blockers = self.global_live_blockers(
             control=control,
             replay_gate=replay_gate,
@@ -892,15 +920,18 @@ class CryptoAssetControlService:
             crypto_policy=crypto_policy,
         )
         blockers = list(global_blockers)
-        if mode != CRYPTO_ASSET_MODE_LIVE:
-            blockers = [f"Asset {market.asset_symbol} mode is {mode}; set it to live to allow live orders."]
-        elif str(self.settings.kalshi_env or "").strip().lower() != "demo" and explicit_mode != CRYPTO_ASSET_MODE_LIVE:
-            blockers.append(
-                f"Asset {market.asset_symbol} is not explicitly live in deployment control "
-                f"(control mode {explicit_mode})."
-            )
+        if mode == CRYPTO_ASSET_MODE_OFF:
+            blockers = [f"Asset {market.asset_symbol} mode is off."]
+            mode_source = "control_off"
+        elif mode == CRYPTO_ASSET_MODE_LIVE:
+            mode_source = "replay_gate_passed"
+        else:
+            mode_source = "replay_gate_blocked"
+            if not blockers:
+                blockers.append(f"Asset {market.asset_symbol} is shadow because the replay gate has not passed.")
         return {
             "asset_mode": mode,
+            "asset_mode_source": mode_source,
             "control_asset_mode": explicit_mode,
             "live_eligible": mode == CRYPTO_ASSET_MODE_LIVE and not blockers,
             "live_blockers": blockers,
@@ -1358,6 +1389,9 @@ class CryptoMarketService:
                 asset_symbols=asset_symbols,
                 note_modes=self.asset_control_service.modes_from_notes(control.notes),
                 crypto_policy=crypto_policy,
+                replay_gates_by_asset=replay_gates_by_asset,
+                generic_replay_gate=generic_gate,
+                frequency=dashboard_frequency,
             ),
         )
         replay_gate_summary = _crypto_replay_gate_dashboard_summary(
@@ -1627,12 +1661,29 @@ class CryptoMarketService:
                             break
                     await session.commit()
         asset_symbols = sorted({snapshot.asset_symbol for snapshot in snapshots})
+        replay_gates_by_asset: dict[str, Any | None] = {}
+        if asset_symbols:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session)
+                for asset_symbol in asset_symbols:
+                    asset_key = normalize_asset_symbol(asset_symbol)
+                    replay_gates_by_asset[asset_key] = await _latest_crypto_artifact_for_asset(
+                        repo,
+                        frequency=normalize_frequency(frequency) or "15m",
+                        artifact_type="replay_gate",
+                        kalshi_env=self.settings.kalshi_env,
+                        asset_symbol=asset_symbol,
+                    )
+                await session.commit()
         mode_summary = self.asset_control_service.asset_mode_summary(
             asset_symbols=asset_symbols,
             modes=_resolved_crypto_asset_modes(
                 asset_symbols=asset_symbols,
                 note_modes=self.asset_control_service.modes_from_notes(control.notes),
                 crypto_policy=crypto_policy,
+                replay_gates_by_asset=replay_gates_by_asset,
+                generic_replay_gate=gate,
+                frequency=frequency,
             ),
         )
         data_quality = _crypto_data_quality(
@@ -4239,6 +4290,8 @@ class CryptoForecastService:
                 asset_symbols=[market.asset_symbol],
                 note_modes=note_modes,
                 crypto_policy=crypto_policy,
+                generic_replay_gate=gate,
+                frequency=market.frequency,
             ),
         )
         mid = market.mid_yes_dollars or market.last_price_dollars or Decimal("0.5000")
@@ -5500,12 +5553,6 @@ class CryptoExecutionService:
                 market.asset_symbol,
                 frequency=market.frequency,
             )
-            asset_mode = self.asset_control_service.mode_for_control(
-                fresh_control,
-                market.asset_symbol,
-                crypto_policy=crypto_policy,
-                frequency=market.frequency,
-            )
             gate = await _latest_crypto_artifact_for_asset(
                 repo,
                 frequency=market.frequency,
@@ -5523,6 +5570,13 @@ class CryptoExecutionService:
                     allow_generic_fallback=False,
                 )
             await session.commit()
+        asset_mode = self.asset_control_service.gate_resolved_mode_for_control(
+            fresh_control,
+            market.asset_symbol,
+            replay_gate=gate,
+            crypto_policy=crypto_policy,
+            frequency=market.frequency,
+        )
         if asset_mode != CRYPTO_ASSET_MODE_LIVE:
             if self.settings.app_shadow_mode or room.shadow_mode:
                 return ExecReceiptPayload(
@@ -5541,17 +5595,6 @@ class CryptoExecutionService:
                     "reason": "crypto asset mode is not live",
                     "asset_symbol": market.asset_symbol,
                     "asset_mode": asset_mode,
-                },
-            )
-        if str(room.kalshi_env or "").strip().lower() != "demo" and explicit_asset_mode != CRYPTO_ASSET_MODE_LIVE:
-            return ExecReceiptPayload(
-                status="crypto_asset_live_disabled",
-                client_order_id=client_order_id,
-                details={
-                    "reason": "production crypto asset is not explicitly live in deployment control",
-                    "asset_symbol": market.asset_symbol,
-                    "asset_mode": asset_mode,
-                    "control_asset_mode": explicit_asset_mode,
                 },
             )
         selection = ((signal.candidate_trace or {}).get("trade_selection_model") or {}) if signal.candidate_trace else {}
@@ -7264,15 +7307,41 @@ def _resolved_crypto_asset_modes(
     asset_symbols: list[str],
     note_modes: dict[str, str],
     crypto_policy: RuntimeCryptoPolicy,
+    replay_gates_by_asset: dict[str, Any | None] | None = None,
+    generic_replay_gate: Any | None = None,
+    frequency: str | None = None,
 ) -> dict[str, str]:
     symbols = {normalize_asset_symbol(symbol) for symbol in asset_symbols}
     symbols.update(note_modes)
     symbols.update(crypto_policy.asset_modes)
     resolved: dict[str, str] = {}
+    normalized_frequency = normalize_frequency(frequency) if frequency else None
+    use_gate_modes = replay_gates_by_asset is not None or generic_replay_gate is not None
     for symbol in sorted(symbols):
-        note_mode = note_modes.get(symbol)
+        if ":" in symbol:
+            asset_symbol, symbol_frequency = symbol.split(":", 1)
+            asset_symbol = normalize_asset_symbol(asset_symbol)
+            symbol_frequency = normalize_frequency(symbol_frequency) or symbol_frequency.strip().lower()
+        else:
+            asset_symbol = normalize_asset_symbol(symbol)
+            symbol_frequency = normalized_frequency
+        freq_key = f"{asset_symbol}:{symbol_frequency}" if symbol_frequency else None
+        note_mode = (note_modes.get(freq_key) if freq_key else None) or note_modes.get(asset_symbol) or note_modes.get(symbol)
         if note_mode == CRYPTO_ASSET_MODE_OFF:
             resolved[symbol] = CRYPTO_ASSET_MODE_OFF
+        elif use_gate_modes:
+            gate = None
+            if replay_gates_by_asset is not None:
+                gate = (
+                    replay_gates_by_asset.get(freq_key) if freq_key else None
+                ) or replay_gates_by_asset.get(asset_symbol)
+            if gate is None:
+                gate = generic_replay_gate
+            resolved[symbol] = (
+                CRYPTO_ASSET_MODE_LIVE
+                if _runtime_replay_gate_passed(gate, crypto_policy)
+                else CRYPTO_ASSET_MODE_SHADOW
+            )
         elif symbol in crypto_policy.asset_modes:
             resolved[symbol] = crypto_policy.asset_modes[symbol]
         else:
