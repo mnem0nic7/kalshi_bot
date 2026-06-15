@@ -151,8 +151,6 @@ run "docker exec $(container "app_${ENV}_${TARGET}") kalshi-bot-cli status | pyt
 if [[ "${ENV}" == "production" ]]; then
   export CRYPTO_CURRENT_APP_COLOR="${TARGET}"
   export CRYPTO_1H_CURRENT_APP_COLOR="${TARGET}"
-  export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${TARGET}"
-  export CRYPTO_1H_TOUCH20_APP_COLOR="${TARGET}"
 fi
 
 if [[ "${ENV}" == "production" && "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
@@ -162,14 +160,6 @@ fi
 if [[ "${ENV}" == "production" && "${ENABLE_CRYPTO_CURRENT_1H_CONTAINER:-false}" == "true" ]]; then
   log "recreating production 1h crypto current collector"
   run "compose up -d --no-deps --force-recreate crypto_current_1h_production"
-fi
-if [[ "${ENV}" == "production" && "${ENABLE_BTC15M_TOUCH20_CONTAINER:-true}" == "true" ]]; then
-  log "recreating production BTC 15m Touch20 process"
-  run "compose up -d --no-deps --force-recreate crypto_non_model_btc15m_touch20_production"
-fi
-if [[ "${ENV}" == "production" && "${ENABLE_CRYPTO_1H_TOUCH20_CONTAINER:-false}" == "true" ]]; then
-  log "recreating production 1h Touch20 process"
-  run "compose up -d --no-deps --force-recreate crypto_non_model_1h_touch20_production"
 fi
 
 # --- 5. optionally recreate the now-idle old color -------------------------
