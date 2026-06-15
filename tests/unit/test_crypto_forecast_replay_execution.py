@@ -8577,6 +8577,90 @@ async def test_crypto_autonomy_reevaluates_existing_live_room(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_crypto_autonomy_ignores_existing_room_on_inactive_color(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_color="green",
+        app_shadow_mode=True,
+        crypto_autonomy_enabled=True,
+        crypto_autonomy_min_seconds_to_close=120,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    now = datetime.now(UTC)
+    market = _market(
+        market_ticker="KXETH15M-COLOR-SWITCH",
+        asset_symbol="ETH",
+        open_time=now - timedelta(minutes=5),
+        close_time=now + timedelta(minutes=10),
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await repo.create_room(
+            RoomCreate(name="ETH old color", market_ticker=market.market_ticker),
+            active_color="blue",
+            shadow_mode=True,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.SHADOW.value,
+        )
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.created: list[str] = []
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return [market]
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append(market_ticker)
+            return {
+                "room_id": f"room-{market_ticker}",
+                "market_ticker": market_ticker,
+                "asset_symbol": market.asset_symbol,
+                "asset_mode": "shadow",
+                "live_eligible": False,
+                "live_blockers": ["shadow"],
+            }
+
+    class _FakeWorkflowService:
+        def __init__(self) -> None:
+            self.runs: list[tuple[str, str]] = []
+
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            self.runs.append((room_id, reason))
+
+    market_service = _FakeMarketService()
+    workflow_service = _FakeWorkflowService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=workflow_service,  # type: ignore[arg-type]
+    ).run_once()
+
+    assert result["status"] == "ok"
+    assert market_service.created == [market.market_ticker]
+    assert workflow_service.runs == [(f"room-{market.market_ticker}", "crypto_autonomy")]
+    assert not any(item.get("reason") == "room_already_exists" for item in result["skipped"])
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crypto_autonomy_replaces_stale_initial_researching_room(tmp_path) -> None:
     settings = _settings(
         tmp_path,

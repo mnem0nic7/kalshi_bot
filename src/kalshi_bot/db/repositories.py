@@ -843,10 +843,13 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         market_ticker: str,
         *,
         kalshi_env: str | None = None,
+        active_color: str | None = None,
     ) -> Room | None:
         stmt = select(Room).where(Room.market_ticker == market_ticker).order_by(Room.updated_at.desc()).limit(1)
         if kalshi_env is not None:
             stmt = stmt.where(Room.kalshi_env == kalshi_env)
+        if active_color is not None:
+            stmt = stmt.where(Room.active_color == active_color)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def reap_orphaned_rooms(self, *, color: str, kalshi_env: str | None = None) -> list[str]:

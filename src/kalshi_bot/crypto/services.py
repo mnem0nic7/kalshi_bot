@@ -6734,6 +6734,7 @@ class CryptoAutonomyService:
                     existing = await repo.get_latest_room_for_market(
                         market.market_ticker,
                         kalshi_env=self.settings.kalshi_env,
+                        active_color=control.active_color,
                     )
                     recovered_room_id: str | None = None
                     if existing is not None and await _crypto_initial_researching_room_is_stale(
