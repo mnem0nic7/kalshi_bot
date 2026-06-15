@@ -63,6 +63,7 @@ class _TrainingNodeStub:
     ):
         self.settings = SimpleNamespace(
             crypto_model_nightly_auto_enabled=nightly_enabled,
+            crypto_continuous_train_enabled=False,
             kalshi_env="demo",
             app_color="blue",
         )

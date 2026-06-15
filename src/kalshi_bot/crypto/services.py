@@ -20,6 +20,7 @@ from typing import Any, Callable
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 from kalshi_bot.config import Settings
 from kalshi_bot.core.constants import (
@@ -8129,7 +8130,16 @@ def _row_mid(row: CryptoMarketSnapshotRecord) -> Decimal | None:
 
 
 def _snapshot_payload_sources(row: CryptoMarketSnapshotRecord) -> list[dict[str, Any]]:
-    payload = row.payload if isinstance(getattr(row, "payload", None), dict) else {}
+    # The payload column is loaded with defer_payload=True during materialize and
+    # accessed in the compute phase after the session has closed. Accessing a
+    # deferred attribute on a detached instance raises DetachedInstanceError (not
+    # AttributeError, so getattr(..., None) won't catch it). Treat an unavailable
+    # payload as "no payload" rather than crashing the whole materialize.
+    try:
+        raw_payload = row.payload
+    except DetachedInstanceError:
+        return []
+    payload = raw_payload if isinstance(raw_payload, dict) else {}
     sources: list[dict[str, Any]] = []
     for source in (
         payload,

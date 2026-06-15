@@ -516,13 +516,18 @@ class DaemonService:
                 )
                 await asyncio.sleep(startup_delay)
 
-            if self.settings.crypto_model_nightly_auto_enabled:
+            if self.settings.crypto_continuous_train_enabled:
+                tasks["crypto_continuous_train"] = asyncio.create_task(
+                    self._continuous_crypto_train_loop()
+                )
+            elif self.settings.crypto_model_nightly_auto_enabled:
                 tasks["crypto_model_nightly"] = asyncio.create_task(
                     self._periodic_crypto_model_nightly_loop()
                 )
             else:
                 logger.warning(
-                    "training-node started but crypto_model_nightly_auto_enabled=false — nothing to train"
+                    "training-node started but crypto_continuous_train_enabled=false and "
+                    "crypto_model_nightly_auto_enabled=false — nothing to train"
                 )
 
             timer_task: asyncio.Task | None = None
@@ -590,6 +595,8 @@ class DaemonService:
             return self._periodic_heartbeat_loop()
         if name == "crypto_model_nightly":
             return self._periodic_crypto_model_nightly_loop()
+        if name == "crypto_continuous_train":
+            return self._continuous_crypto_train_loop()
         raise ValueError(f"unknown training-node task {name!r}")
 
     async def _run_crypto_only(self, *, run_seconds: float | None = None) -> dict[str, Any]:
@@ -1356,6 +1363,161 @@ class DaemonService:
                 result.get("refreshed_count"),
             )
         return result
+
+    async def _train_one_crypto_asset(self, *, frequency: str, asset: str) -> str:
+        """Train + gate a single crypto asset via the feature-store path.
+
+        One asset at a time keeps peak memory at a single asset's footprint (the
+        pooled all-asset load OOMs on densified data). With preflight enabled the
+        feature store is refreshed inline (prepare) and training reads the
+        pre-materialized rows (feature_store_only) rather than loading raw
+        snapshots + cross-asset spot into memory. Returns a per-asset status.
+        """
+        preflight: dict[str, Any] | None = None
+        if self.settings.crypto_training_preflight_enabled and self.crypto_training_backfill_service is not None:
+            preflight = await self.crypto_training_backfill_service.prepare(
+                frequency=frequency,
+                asset_symbols=[asset],
+                run_source_backfill=True,
+            )
+            if preflight.get("status") != "ok":
+                logger.warning(
+                    "crypto_continuous_train preflight blocked asset=%s freq=%s blockers=%s",
+                    asset,
+                    frequency,
+                    preflight.get("blockers"),
+                )
+                return "skipped_preflight_blocked"
+        else:
+            await self.crypto_history_service.collect_settled(frequency=frequency, asset_symbols=[asset])
+            await self.crypto_history_service.bootstrap(frequency=frequency, asset_symbols=[asset])
+            if self.crypto_spot_service is not None:
+                try:
+                    await self.crypto_spot_service.collect_current(frequency=frequency, asset_symbols=[asset])
+                except Exception:
+                    logger.warning(
+                        "crypto_continuous_train spot collect failed asset=%s freq=%s",
+                        asset,
+                        frequency,
+                        exc_info=True,
+                    )
+        await self.crypto_forecast_service.train(
+            frequency=frequency,
+            asset_symbols=[asset],
+            use_feature_store=bool(preflight),
+            feature_store_only=bool(preflight),
+        )
+        await self.crypto_replay_service.run(frequency=frequency, asset_symbols=[asset])
+        await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=[asset])
+        return "refreshed"
+
+    async def _run_one_crypto_train_cycle(
+        self,
+        *,
+        frequency: str,
+        assets: list[str],
+        now: datetime,
+    ) -> dict[str, str]:
+        """Train every asset once, one at a time, isolating per-asset failures.
+
+        After the pass, refresh the pooled per-asset gate and the sizing policy so
+        the live daemons pick up the freshly trained champions.
+        """
+        decisions: dict[str, str] = {}
+        refreshed: list[str] = []
+        for asset in assets:
+            try:
+                status = await self._train_one_crypto_asset(frequency=frequency, asset=asset)
+            except Exception:
+                status = "error"
+                logger.warning(
+                    "crypto_continuous_train error asset=%s freq=%s",
+                    asset,
+                    frequency,
+                    exc_info=True,
+                )
+            decisions[asset] = status
+            if status == "refreshed":
+                refreshed.append(asset)
+            logger.info("crypto_continuous_train asset=%s freq=%s status=%s", asset, frequency, status)
+
+        if refreshed:
+            try:
+                await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=list(assets))
+            except Exception:
+                logger.warning("crypto_continuous_train cycle gate error freq=%s", frequency, exc_info=True)
+            try:
+                await self._update_crypto_pnl_sizing_policy(
+                    frequency=frequency,
+                    assets=list(assets),
+                    evaluated_at=now,
+                )
+            except Exception:
+                logger.warning("crypto_continuous_train sizing policy error freq=%s", frequency, exc_info=True)
+        return decisions
+
+    async def _continuous_crypto_train_loop(self) -> None:
+        """Continuously train one market at a time (replaces the nightly).
+
+        No date/age gate: the trainer round-robins the configured assets forever,
+        training + gating each individually so peak memory stays bounded.
+        """
+        from kalshi_bot.crypto.services import normalize_frequency as _normalize_frequency
+
+        assets_csv = self.settings.crypto_continuous_train_assets or self.settings.crypto_model_nightly_assets
+        assets = [a.strip().upper() for a in assets_csv.split(",") if a.strip()]
+        frequencies = [
+            _normalize_frequency(f.strip())
+            for f in self.settings.crypto_continuous_train_frequencies.replace(";", ",").split(",")
+            if f.strip()
+        ]
+        frequencies = [f for f in frequencies if f]
+        idle = max(0, int(self.settings.crypto_continuous_train_idle_seconds))
+
+        if not assets or not frequencies:
+            logger.warning(
+                "crypto_continuous_train: no assets/frequencies configured (assets=%s freqs=%s); idling",
+                assets,
+                frequencies,
+            )
+            while True:
+                await asyncio.sleep(300)
+
+        logger.info(
+            "crypto_continuous_train loop starting assets=%s frequencies=%s idle_seconds=%d",
+            assets,
+            frequencies,
+            idle,
+        )
+        while True:
+            for frequency in frequencies:
+                for asset in assets:
+                    try:
+                        status = await self._train_one_crypto_asset(frequency=frequency, asset=asset)
+                    except Exception:
+                        status = "error"
+                        logger.warning(
+                            "crypto_continuous_train error asset=%s freq=%s",
+                            asset,
+                            frequency,
+                            exc_info=True,
+                        )
+                    logger.info("crypto_continuous_train asset=%s freq=%s status=%s", asset, frequency, status)
+                    if idle > 0:
+                        await asyncio.sleep(idle)
+                # Refresh the pooled gate + sizing policy after each full pass.
+                try:
+                    await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=list(assets))
+                except Exception:
+                    logger.warning("crypto_continuous_train cycle gate error freq=%s", frequency, exc_info=True)
+                try:
+                    await self._update_crypto_pnl_sizing_policy(
+                        frequency=frequency,
+                        assets=list(assets),
+                        evaluated_at=datetime.now(UTC),
+                    )
+                except Exception:
+                    logger.warning("crypto_continuous_train sizing policy error freq=%s", frequency, exc_info=True)
 
     async def _maybe_run_settlement_follow_up(self) -> dict[str, Any] | None:
         if self.training_corpus_service is None:

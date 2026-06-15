@@ -583,6 +583,17 @@ class Settings(BaseSettings):
     # large crypto_market_snapshots table; bounding it keeps a slow/hung query
     # from wedging the entire regen (it degrades to age-based refresh instead).
     crypto_model_nightly_status_timeout_seconds: float = 120.0
+    # Continuous one-asset-at-a-time training loop for the dedicated trainer node.
+    # When enabled it replaces the scheduled nightly: the trainer round-robins the
+    # configured assets, training + gating one at a time so peak memory stays at a
+    # single asset's footprint (vs the pooled all-asset load that OOMs on densified
+    # data). No date/age gate — it retrains continuously in rotation.
+    crypto_continuous_train_enabled: bool = False
+    # Empty -> fall back to crypto_model_nightly_assets.
+    crypto_continuous_train_assets: str = ""
+    crypto_continuous_train_frequencies: str = "15m"
+    # Optional pause between assets (0 = train back-to-back).
+    crypto_continuous_train_idle_seconds: int = 0
     risk_max_order_count_fp: float = 500.0
     risk_max_position_count_fp_per_ticker: float = 200.0
     risk_allow_position_add_ons: bool = False
