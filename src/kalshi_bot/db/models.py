@@ -690,6 +690,9 @@ class PositionRecord(Base, IdMixin, TimestampMixin):
 
 class OpsEvent(Base, IdMixin, TimestampMixin):
     __tablename__ = "ops_events"
+    __table_args__ = (
+        Index("ix_ops_events_env_updated", "kalshi_env", "updated_at"),
+    )
 
     room_id: Mapped[str | None] = mapped_column(ForeignKey("rooms.id", ondelete="SET NULL"), nullable=True, index=True)
     kalshi_env: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
