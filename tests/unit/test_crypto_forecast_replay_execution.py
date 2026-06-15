@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from kalshi_bot.config import Settings
-from kalshi_bot.core.enums import ContractSide, MessageKind, RiskStatus, RoomOrigin, StandDownReason, TradeAction
+from kalshi_bot.core.enums import ContractSide, MessageKind, RiskStatus, RoomOrigin, RoomStage, StandDownReason, TradeAction
 from kalshi_bot.core.schemas import (
     AgentPackCryptoEntryPolicy,
     AgentPackCryptoLivePolicy,
@@ -8573,6 +8573,131 @@ async def test_crypto_autonomy_reevaluates_existing_live_room(tmp_path) -> None:
     assert result["reevaluated"][0]["room_id"] == room.id
     assert result["reevaluated"][0]["market_ticker"] == market.market_ticker
     assert not any(item.get("reason") == "room_already_exists" for item in result["skipped"])
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_replaces_stale_initial_researching_room(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=False,
+        crypto_autonomy_enabled=True,
+        crypto_trading_enabled=True,
+        crypto_autonomy_min_seconds_to_close=120,
+        crypto_autonomy_stale_researching_room_seconds=60,
+        crypto_live_min_market_age_seconds=180,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    now = datetime.now(UTC)
+    market = _market(
+        market_ticker="KXBTC15M-STALE-ROOM",
+        asset_symbol="BTC",
+        open_time=now - timedelta(minutes=5),
+        close_time=now + timedelta(minutes=10),
+    )
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await AgentPackService(settings).ensure_initialized(repo)
+        room = await repo.create_room(
+            RoomCreate(name="BTC stale room", market_ticker=market.market_ticker),
+            active_color=settings.app_color,
+            shadow_mode=False,
+            kill_switch_enabled=False,
+            kalshi_env=settings.kalshi_env,
+            room_origin=RoomOrigin.LIVE.value,
+        )
+        room.stage = RoomStage.RESEARCHING.value
+        room.updated_at = now - timedelta(minutes=5)
+        await repo.record_crypto_model_artifact(
+            frequency="15m",
+            artifact_type="replay_gate",
+            version="passed-gate",
+            status="passed",
+            sample_count=1000,
+            metrics={},
+            payload={"passed": True},
+            kalshi_env=settings.kalshi_env,
+            trained_at=now,
+        )
+        await session.commit()
+    await asset_control.set_asset_mode("BTC", "live", actor="test")
+
+    class _FakeKalshi:
+        write_credentials = object()
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.created: list[tuple[str, str]] = []
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            return [market]
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            self.created.append((market_ticker, reason))
+            return {
+                "room_id": "replacement-room",
+                "market_ticker": market_ticker,
+                "asset_symbol": market.asset_symbol,
+                "asset_mode": "live",
+                "live_eligible": True,
+                "live_blockers": [],
+            }
+
+    class _FakeWorkflowService:
+        def __init__(self) -> None:
+            self.runs: list[tuple[str, str]] = []
+
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            self.runs.append((room_id, reason))
+
+    market_service = _FakeMarketService()
+    workflow_service = _FakeWorkflowService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=workflow_service,  # type: ignore[arg-type]
+    ).run_once()
+
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        stale_room = await repo.get_room(room.id)
+        messages = list(
+            (
+                await session.execute(
+                    select(RoomMessage).where(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc())
+                )
+            ).scalars()
+        )
+        await session.commit()
+
+    assert stale_room is not None
+    assert stale_room.stage == RoomStage.FAILED.value
+    assert messages[-1].payload["reason"] == "stale_researching_room_replaced"
+    assert market_service.created == [(market.market_ticker, "crypto_autonomy_stale_recovery")]
+    assert workflow_service.runs == [("replacement-room", "crypto_autonomy_stale_recovery")]
+    assert result["recovered"] == [
+        {
+            "room_id": room.id,
+            "replacement_room_id": "replacement-room",
+            "market_ticker": market.market_ticker,
+            "asset_symbol": market.asset_symbol,
+            "seconds_to_close": pytest.approx(600, abs=2),
+            "reason": "stale_researching_room_replaced",
+        }
+    ]
+    assert result["created"][0]["recovered_room_id"] == room.id
     await engine.dispose()
 
 

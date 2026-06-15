@@ -6006,6 +6006,9 @@ class CryptoWorkflowService:
                 room = await repo.get_room(room_id)
                 if room is None:
                     raise KeyError(room_id)
+                if room.stage == RoomStage.FAILED.value:
+                    await session.commit()
+                    return
                 control = await repo.ensure_deployment_control(self.settings.app_color)
                 active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
                 crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
@@ -6631,6 +6634,7 @@ class CryptoAutonomyService:
         max_per_asset = max(1, int(self.settings.crypto_autonomy_max_per_asset_per_run))
         markets, cap_skips = _cap_crypto_autonomy_markets(markets, max_rooms=max_rooms, max_per_asset=max_per_asset)
         reevaluated: list[dict[str, Any]] = []
+        recovered: list[dict[str, Any]] = []
         skipped.extend(ineligible)
         skipped.extend(cap_skips)
 
@@ -6731,6 +6735,43 @@ class CryptoAutonomyService:
                         market.market_ticker,
                         kalshi_env=self.settings.kalshi_env,
                     )
+                    recovered_room_id: str | None = None
+                    if existing is not None and await _crypto_initial_researching_room_is_stale(
+                        repo,
+                        existing,
+                        settings=self.settings,
+                        now=datetime.now(UTC),
+                    ):
+                        recovered_room_id = existing.id
+                        await repo.update_room_stage(existing.id, RoomStage.FAILED)
+                        await repo.append_message(
+                            existing.id,
+                            RoomMessageCreate(
+                                role=AgentRole.SYSTEM,
+                                kind=MessageKind.OPS_ALERT,
+                                stage=RoomStage.FAILED,
+                                content=(
+                                    "Crypto workflow was stale before signal generation; "
+                                    "autonomy will replace the room."
+                                ),
+                                payload={
+                                    "market_domain": "crypto",
+                                    "market_ticker": market.market_ticker,
+                                    "asset_symbol": market.asset_symbol,
+                                    "reason": "stale_researching_room_replaced",
+                                    "stale_seconds": int(
+                                        getattr(
+                                            self.settings,
+                                            "crypto_autonomy_stale_researching_room_seconds",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+                                    "no_order_submitted": True,
+                                },
+                            ),
+                        )
+                        existing = None
                     await session.commit()
                 if existing is not None:
                     if live_status["asset_mode"] == CRYPTO_ASSET_MODE_LIVE and live_status["live_eligible"]:
@@ -6755,14 +6796,27 @@ class CryptoAutonomyService:
                     )
                     continue
 
+                create_reason = "crypto_autonomy_stale_recovery" if recovered_room_id else "crypto_autonomy"
                 result = await self.market_service.create_room_for_market(
                     market.market_ticker,
-                    reason="crypto_autonomy",
+                    reason=create_reason,
                 )
-                await self.workflow_service.run_room(result["room_id"], reason="crypto_autonomy")
+                await self.workflow_service.run_room(result["room_id"], reason=create_reason)
+                if recovered_room_id:
+                    recovered.append(
+                        {
+                            "room_id": recovered_room_id,
+                            "replacement_room_id": result["room_id"],
+                            "market_ticker": market.market_ticker,
+                            "asset_symbol": market.asset_symbol,
+                            "seconds_to_close": seconds_to_close,
+                            "reason": "stale_researching_room_replaced",
+                        }
+                    )
                 created.append(
                     {
                         **result,
+                        "recovered_room_id": recovered_room_id,
                         "seconds_to_close": seconds_to_close,
                         "requested_asset_mode": live_status["asset_mode"],
                     }
@@ -6787,6 +6841,7 @@ class CryptoAutonomyService:
             "checked_markets": len(discovered),
             "eligible_markets": len(markets),
             "reevaluated": reevaluated,
+            "recovered": recovered,
             "caps": {
                 "max_rooms_per_run": max_rooms,
                 "max_per_asset_per_run": max_per_asset,
@@ -6836,6 +6891,31 @@ class CryptoAutonomyService:
             logger.warning("failed to log crypto autonomy cycle telemetry", exc_info=True)
 
 
+async def _crypto_initial_researching_room_is_stale(
+    repo: PlatformRepository,
+    room: Room,
+    *,
+    settings: Settings,
+    now: datetime,
+) -> bool:
+    stale_seconds = max(
+        0,
+        int(getattr(settings, "crypto_autonomy_stale_researching_room_seconds", 0) or 0),
+    )
+    if stale_seconds <= 0:
+        return False
+    if room.stage != RoomStage.RESEARCHING.value:
+        return False
+    updated_at = _as_utc_datetime(room.updated_at)
+    if (now - updated_at).total_seconds() < stale_seconds:
+        return False
+    if await repo.get_latest_signal_for_room(room.id) is not None:
+        return False
+    if await repo.get_latest_trade_ticket_for_room(room.id) is not None:
+        return False
+    return True
+
+
 def _crypto_autonomy_cycle_ops_payload(
     result: dict[str, Any],
     *,
@@ -6882,6 +6962,12 @@ def _crypto_autonomy_cycle_ops_payload(
         entry = asset_entry(item.get("asset_symbol"))
         _append_limited(entry["reevaluated"], _crypto_autonomy_compact_cycle_item(item))
 
+    for item in result.get("recovered") or []:
+        if not isinstance(item, dict):
+            continue
+        entry = asset_entry(item.get("asset_symbol"))
+        _append_limited(entry.setdefault("recovered", []), _crypto_autonomy_compact_cycle_item(item))
+
     reason_counts: Counter[str] = Counter()
     live_blocker_counts: Counter[str] = Counter()
     for item in result.get("skipped") or []:
@@ -6913,6 +6999,7 @@ def _crypto_autonomy_cycle_ops_payload(
         "eligible_markets": int(result.get("eligible_markets") or 0),
         "created_count": len(result.get("created") or []),
         "reevaluated_count": len(result.get("reevaluated") or []),
+        "recovered_count": len(result.get("recovered") or []),
         "skipped_count": len(result.get("skipped") or []),
         "error_count": len(result.get("errors") or []),
         "skip_reason_counts": dict(sorted(reason_counts.items())),
@@ -6934,6 +7021,7 @@ def _crypto_autonomy_cycle_ops_summary(payload: dict[str, Any]) -> str:
         f"Crypto autonomy cycle {payload.get('frequency')}: "
         f"created={payload.get('created_count', 0)} "
         f"reevaluated={payload.get('reevaluated_count', 0)} "
+        f"recovered={payload.get('recovered_count', 0)} "
         f"skipped={payload.get('skipped_count', 0)} "
         f"errors={payload.get('error_count', 0)}"
         f"{top_reason}"
@@ -6946,6 +7034,8 @@ def _crypto_autonomy_compact_cycle_item(item: dict[str, Any]) -> dict[str, Any]:
         "asset_symbol",
         "reason",
         "room_id",
+        "replacement_room_id",
+        "recovered_room_id",
         "seconds_to_close",
         "market_age_seconds",
         "min_market_age_seconds",

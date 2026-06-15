@@ -360,6 +360,7 @@ class Settings(BaseSettings):
     crypto_market_price_anchor_weight: float = 0.75
     crypto_autonomy_max_rooms_per_run: int = 7
     crypto_autonomy_max_per_asset_per_run: int = 1
+    crypto_autonomy_stale_researching_room_seconds: int = 180
     crypto_shadow_exploration_max_candidates_per_run: int = 12
     crypto_shadow_exploration_max_per_asset_per_run: int = 2
     crypto_shadow_exploration_min_expected_net_edge_dollars: float = -0.03
