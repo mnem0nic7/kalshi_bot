@@ -164,6 +164,10 @@ def _total_capital_dollars_from_balance_payload(balance_payload: dict[str, Any])
 
 
 _PENDING_BUY_ORDER_STATUSES = {"resting", "submitted", "accepted", "open", "pending"}
+# asyncpg rejects any query with more than 32767 bind parameters. ``id.in_(ids)``
+# expands to one bind param per id, so the second-stage snapshot lookup must be
+# chunked well under that ceiling once the distinct-market count grows large.
+_CRYPTO_ID_IN_CHUNK_SIZE = 30000
 _CRYPTO_MARKET_TICKER_RE = re.compile(r"^KX[A-Z0-9]+(?:15M|1H)-")
 _CRYPTO_MARKET_ID_RE = re.compile(r"^KX([A-Z0-9]+)(15M|1H)-")
 
@@ -1629,6 +1633,26 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
+    async def _load_crypto_snapshots_by_ids(
+        self,
+        ids: list,
+        *,
+        defer_payload: bool = False,
+    ) -> list[CryptoMarketSnapshotRecord]:
+        """Load snapshot rows by primary key, chunked under asyncpg's bind-param
+        ceiling. A single ``id.in_(ids)`` exceeds 32767 parameters once the
+        matched-market count grows large, which crashed the nightly retrain."""
+        records: list[CryptoMarketSnapshotRecord] = []
+        for start in range(0, len(ids), _CRYPTO_ID_IN_CHUNK_SIZE):
+            chunk = ids[start : start + _CRYPTO_ID_IN_CHUNK_SIZE]
+            stmt = select(CryptoMarketSnapshotRecord).where(
+                CryptoMarketSnapshotRecord.id.in_(chunk)
+            )
+            if defer_payload:
+                stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
+            records.extend((await self.session.execute(stmt)).scalars())
+        return records
+
     async def list_crypto_live_quote_snapshots(
         self,
         *,
@@ -1732,12 +1756,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if not rows:
             return []
         ids = [r[0] for r in rows]
-        stmt = select(CryptoMarketSnapshotRecord).where(
-            CryptoMarketSnapshotRecord.id.in_(ids)
-        )
-        if defer_payload:
-            stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
-        records = list((await self.session.execute(stmt)).scalars())
+        records = await self._load_crypto_snapshots_by_ids(ids, defer_payload=defer_payload)
         if duration_bounds is not None:
             records = [
                 record for record in records if _crypto_snapshot_matches_frequency_duration(record, frequency)
