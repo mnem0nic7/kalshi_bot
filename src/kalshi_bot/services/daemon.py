@@ -2401,7 +2401,7 @@ class DaemonService:
                     "allocation_scale": allocation_scale,
                     "max_market_target_pct": min(
                         max(float(self.settings.crypto_dynamic_order_max_position_pct), 0.0),
-                        0.15,
+                        0.20,
                     ),
                     "entry_policy_optimizer": {
                         "enabled": bool(self.settings.crypto_entry_policy_optimizer_auto_enabled),
