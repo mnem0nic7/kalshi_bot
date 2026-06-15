@@ -81,7 +81,11 @@ from kalshi_bot.integrations.okx_funding_rates import OKX_ASSET_INST_IDS, OkxFun
 from kalshi_bot.integrations.kalshi import KalshiClient
 from kalshi_bot.services.agent_packs import AgentPackService, RuntimeCryptoPolicy
 from kalshi_bot.services.execution import KALSHI_GTC_TIME_IN_FORCE, ExecutionService
-from kalshi_bot.services.fee_model import current_fee_model_version, estimate_kalshi_taker_fee_dollars
+from kalshi_bot.services.fee_model import (
+    current_fee_model_version,
+    estimate_kalshi_maker_fee_dollars,
+    estimate_kalshi_taker_fee_dollars,
+)
 from kalshi_bot.services.risk import DeterministicRiskEngine, RiskContext, approved_ticket_for_verdict
 from kalshi_bot.services.signal import StrategySignal, estimate_notional_dollars
 
@@ -11147,9 +11151,17 @@ def _market_mid_crypto_model(
     }
 
 
+def _crypto_calibration_training_and_holdout_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    if len(rows) >= 2000:
+        split_idx = max(1, min(len(rows) - 1, int(len(rows) * 0.85)))
+        return rows[:split_idx], rows[split_idx:], "chronological_holdout"
+    return rows, rows, "in_sample_small_sample"
+
+
 def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    fit_rows, calibration_rows, calibration_scope = _crypto_calibration_training_and_holdout_rows(rows)
     grouped: dict[str, list[Decimal]] = defaultdict(list)
-    for row in rows:
+    for row in fit_rows:
         key = "|".join([str(row.get("asset_symbol") or "unknown"), _crypto_spot_distance_band(row)])
         grouped[key].append(Decimal(int(row["label_yes"])) - _decimal(row.get("mid_yes_dollars")))
     adjustments = {
@@ -11161,11 +11173,14 @@ def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fall
         "model_type": "spot_distance_residual",
         "bucket_adjustments_bps": adjustments,
         "fallback_model": fallback,
+        "calibration_scope": calibration_scope,
+        "calibration_fit_rows": len(fit_rows),
+        "calibration_holdout_rows": len(calibration_rows) if calibration_scope == "chronological_holdout" else 0,
         "training_cutoff": _crypto_training_cutoff(rows),
     }
     model["probability_calibration"] = _fit_probability_calibration(
-        [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
-        [int(row["label_yes"]) for row in rows],
+        [_predict_crypto_probability(row, model, apply_calibration=False) for row in calibration_rows],
+        [int(row["label_yes"]) for row in calibration_rows],
     )
     return model
 
@@ -11233,7 +11248,17 @@ def _fit_crypto_logistic_model(
         return {"name": "sklearn_logistic", "status": "unavailable", "reason": f"sklearn_unavailable:{exc}", "dependency_version": None}
     try:
         scaler = StandardScaler()
-        scaled = scaler.fit_transform(raw_matrix)
+        fit_rows, calibration_rows, calibration_scope = _crypto_calibration_training_and_holdout_rows(rows)
+        fit_count = len(fit_rows)
+        fit_matrix = raw_matrix[:fit_count]
+        fit_labels = labels[:fit_count]
+        if len(set(fit_labels)) < 2:
+            fit_rows = rows
+            calibration_rows = rows
+            calibration_scope = "in_sample_holdout_single_class_fallback"
+            fit_matrix = raw_matrix
+            fit_labels = labels
+        scaled = scaler.fit_transform(fit_matrix)
         classifier = LogisticRegression(
             C=0.75,
             class_weight="balanced",
@@ -11241,7 +11266,7 @@ def _fit_crypto_logistic_model(
             random_state=17,
             solver="lbfgs",
         )
-        classifier.fit(scaled, labels)
+        classifier.fit(scaled, fit_labels)
         model = {
             "model_type": "sklearn_logistic",
             "feature_schema_version": CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
@@ -11264,11 +11289,14 @@ def _fit_crypto_logistic_model(
             },
             "feature_defaults": defaults,
             "fallback_model": fallback,
+            "calibration_scope": calibration_scope,
+            "calibration_fit_rows": len(fit_rows),
+            "calibration_holdout_rows": len(calibration_rows) if calibration_scope == "chronological_holdout" else 0,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
         model["probability_calibration"] = _fit_probability_calibration(
-            [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
-            labels,
+            [_predict_crypto_probability(row, model, apply_calibration=False) for row in calibration_rows],
+            [int(row["label_yes"]) for row in calibration_rows],
         )
         return {"name": "sklearn_logistic", "status": "available", "model": model, "dependency_version": sklearn.__version__}
     except Exception as exc:
@@ -12046,14 +12074,19 @@ def _crypto_select_champion(
     if deployable:
         deployable.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
         return str(deployable[0]["name"])
-    if supported_profit_candidates:
-        supported_profit_candidates.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
-        return str(supported_profit_candidates[0]["name"])
     deployable_by_probability = [
         candidate
         for candidate in candidates
         if _crypto_model_selection_usable(candidate)
         and _crypto_candidate_has_min_policy_support(candidate, min_selected_count=min_selected_count)
+        and (
+            not _crypto_candidate_has_profit_metrics(candidate)
+            or _crypto_candidate_is_profit_deployable(
+                candidate,
+                min_selected_count=min_selected_count,
+                allow_guardrail_failed=allow_guardrail_failed_profit_candidates,
+            )
+        )
     ]
     if deployable_by_probability:
         deployable_by_probability.sort(key=lambda item: (float((item.get("metrics") or {})["brier"]), str(item.get("name"))))
@@ -13087,7 +13120,7 @@ def _evaluate_crypto_walk_forward(
                 "candidate_counts_by_asset": diagnostic_quality["by_asset"],
                 "last_minute_passive_price_matrix": last_minute_passive_price_matrix,
                 "last_minute_passive_price_matrix_count": len(last_minute_passive_price_matrix),
-                **_crypto_passive_replay_metrics([], rows),
+                **_crypto_passive_replay_metrics([], rows, settings=settings),
             }
         )
         empty_metrics = _crypto_apply_empirical_bucket_gate_to_replay_metrics(
@@ -13284,7 +13317,7 @@ def _evaluate_crypto_walk_forward(
     _bucket_trades = model_candidate_trades_by_name.get(_winning_policy_name or "") or calibrated_trades
     bucket_matrix = _crypto_bucket_matrix(_bucket_trades, settings=settings)
     bucket_diagnostics = _crypto_bucket_diagnostics(selection_trades)
-    passive_replay_metrics = _crypto_passive_replay_metrics(selection_trades, rows)
+    passive_replay_metrics = _crypto_passive_replay_metrics(selection_trades, rows, settings=settings)
     oos_by_asset: dict[str, int] = {}
     for _trade in selection_trades:
         _asset = str(_trade.get("asset_symbol") or "unknown")
@@ -15251,12 +15284,13 @@ def _simulate_crypto_passive_trade(
     row: dict[str, Any],
     future_rows: list[dict[str, Any]],
     selected: dict[str, Any],
+    *,
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Passive-bid mirror of the taker settlement simulation.
 
-    Kalshi charges no maker fee, so passive fills are modeled fee-free; the
-    cost is adverse selection (orders fill mostly when the market moves
-    against the resting side), which this simulation surfaces.
+    Passive fills are modeled with maker fees where configured. Adverse
+    selection remains visible through the filled-vs-unfilled settlement split.
     """
     side = str(selected.get("side") or "yes")
     limit_price = _crypto_passive_entry_limit_price(row, side)
@@ -15298,13 +15332,24 @@ def _simulate_crypto_passive_trade(
     label_yes = int(row["label_yes"])
     payoff = Decimal(label_yes) if side == "yes" else Decimal(1 - label_yes)
     gross = payoff - limit_price
+    maker_fee_rate = Decimal(str(settings.kalshi_maker_fee_rate)) if settings is not None else Decimal("0.0175")
+    maker_fee_applies = bool(settings.kalshi_maker_fee_enabled) if settings is not None else True
+    fee = estimate_kalshi_maker_fee_dollars(
+        price_dollars=limit_price,
+        count=Decimal("1.00"),
+        fee_rate=maker_fee_rate,
+        maker_fee_applies=maker_fee_applies,
+    )
+    net = gross - fee
     result.update(
         {
             "fill_price_dollars": str(fill_ask.quantize(Decimal("0.0001"))),
             "fill_decision_ts": fill_row.get("decision_ts"),
             "gross_pnl": str(gross.quantize(Decimal("0.0001"))),
-            "fees": "0.0000",
-            "net_pnl": str(gross.quantize(Decimal("0.0001"))),
+            "fees": str(fee.quantize(Decimal("0.0001"))),
+            "fee_source": "estimated_maker" if maker_fee_applies else "maker_fee_disabled",
+            "fee_model_version": current_fee_model_version(),
+            "net_pnl": str(net.quantize(Decimal("0.0001"))),
         }
     )
     return result
@@ -15313,6 +15358,8 @@ def _simulate_crypto_passive_trade(
 def _crypto_passive_replay_metrics(
     selection_trades: list[dict[str, Any]],
     rows: list[dict[str, Any]],
+    *,
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Adverse-selection-aware passive simulation across replay candidates.
 
@@ -15331,6 +15378,8 @@ def _crypto_passive_replay_metrics(
     eligible_count = 0
     filled_count = 0
     passive_net = Decimal("0")
+    passive_gross = Decimal("0")
+    passive_fees = Decimal("0")
     taker_net = Decimal("0")
     filled_taker_pnls: list[Decimal] = []
     unfilled_taker_pnls: list[Decimal] = []
@@ -15348,13 +15397,15 @@ def _crypto_passive_replay_metrics(
             and isinstance(decision_ts, datetime)
             and future["decision_ts"] > decision_ts
         ]
-        passive = _simulate_crypto_passive_trade(trade, future_rows, simulation)
+        passive = _simulate_crypto_passive_trade(trade, future_rows, simulation, settings=settings)
         if passive["status"] != "simulated":
             continue
         eligible_count += 1
         if passive["filled"]:
             filled_count += 1
             passive_pnl = _decimal(passive["net_pnl"])
+            passive_gross += _decimal(passive.get("gross_pnl") or Decimal("0"))
+            passive_fees += _decimal(passive.get("fees") or Decimal("0"))
             passive_net += passive_pnl
             filled_passive_pnls.append(passive_pnl)
             filled_taker_pnls.append(taker_pnl)
@@ -15368,6 +15419,9 @@ def _crypto_passive_replay_metrics(
         "passive_eligible_candidate_count": eligible_count,
         "passive_filled_candidate_count": filled_count,
         "passive_fill_rate": _ratio(filled_count / eligible_count) if eligible_count else None,
+        "passive_gross_simulated_pl_dollars": float(passive_gross),
+        "passive_fees_dollars": float(passive_fees),
+        "passive_fee_model_version": current_fee_model_version(),
         "passive_net_simulated_pl_dollars": float(passive_net),
         "passive_avg_pnl_filled": _mean(filled_passive_pnls),
         "taker_vs_passive_pl_delta_dollars": float(taker_net - passive_net),

@@ -34,6 +34,7 @@ from kalshi_bot.services.market_snapshot_archive import (
     DECISION_SIGNAL_MARKET_SOURCE_KIND,
     TRADE_ANALYSIS_CANDLESTICK_BACKFILL_SOURCE_KIND,
 )
+from kalshi_bot.services.fee_model import extract_kalshi_raw_fee_dollars
 from kalshi_bot.services.trade_behavior import bucket_dimensions_from_key, bucket_key_for_fill
 
 
@@ -1380,12 +1381,15 @@ class TradingAuditService:
         open_lot_count = 0
         fee_total = Decimal("0")
         fee_seen = 0
+        fee_sources: Counter[str] = Counter()
 
         for fill in fills:
-            fee = _decimal_or_none((fill.raw or {}).get("fee_cost"))
-            if fee is not None:
-                fee_total += fee
+            role = None if fill.is_taker is None else ("taker" if fill.is_taker else "maker")
+            fee = extract_kalshi_raw_fee_dollars(fill.raw, role=role)
+            if not fee.missing:
+                fee_total += fee.amount_dollars
                 fee_seen += 1
+                fee_sources[fee.fee_source] += 1
 
             key = (fill.market_ticker, fill.side, _strategy_key(fill.strategy_code))
             count = Decimal(fill.count_fp)
@@ -1434,7 +1438,13 @@ class TradingAuditService:
             "settlement_pnl_dollars": _money(settlement_pnl),
             "fee_total_dollars": _money(fee_total) if fee_seen else None,
             "net_pnl_dollars": _money(gross_pnl - fee_total) if all_fees_present else None,
-            "fee_coverage": {"fills_with_fee": fee_seen, "total_fills": len(fills), "complete": all_fees_present},
+            "fee_coverage": {
+                "fills_with_fee": fee_seen,
+                "total_fills": len(fills),
+                "missing_fee_count": len(fills) - fee_seen,
+                "complete": all_fees_present,
+                "fee_sources": dict(sorted(fee_sources.items())),
+            },
             "realized_exit_matches": realized_trades,
             "settled_lots_scored": settled_trades,
             "open_lot_count": open_lot_count,
@@ -1481,7 +1491,8 @@ class TradingAuditService:
             key = (fill.market_ticker, fill.side, strategy)
             price = _side_price(fill)
             count = Decimal(fill.count_fp)
-            fee = _decimal_or_none((fill.raw or {}).get("fee_cost")) or Decimal("0")
+            role = None if fill.is_taker is None else ("taker" if fill.is_taker else "maker")
+            fee = extract_kalshi_raw_fee_dollars(fill.raw, role=role).amount_dollars
             if fill.action == "buy":
                 bucket = bucket_key_for_fill(fill, orders_by_id.get(str(fill.order_id)))
                 row = ensure(bucket, fill)

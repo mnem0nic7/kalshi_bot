@@ -587,6 +587,7 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `crypto-replay run --kalshi-env --days --limit --frequency --assets` | Runs strict replay/backtest; default days `30`, limit `0` means unbounded. |
 | `crypto-replay gate --kalshi-env --frequency --assets` | Persists replay gate result. |
 | `crypto-replay validate --kalshi-env --days --limit --frequency --assets` | Validates replay readiness. |
+| `crypto-maker-markout-report --kalshi-env --days --frequency --assets` | Read-only maker adverse-selection markout report; run from `trainer_production` for historical windows. |
 | `crypto-status --kalshi-env --frequency --assets` | Current crypto domain status. |
 | `crypto-autonomy run-once --kalshi-env --frequency --assets` | Runs one crypto autonomy pass. |
 | `crypto-asset-mode list --kalshi-env --frequency` | Lists per-asset modes. |

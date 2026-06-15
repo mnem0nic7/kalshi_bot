@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -76,6 +77,7 @@ from kalshi_bot.db.models import (
     WeatherBootstrapEventRecord,
     WeatherBootstrapHistoricalEvidenceRecord,
 )
+from kalshi_bot.services.fee_model import FeeEstimate, extract_kalshi_raw_fee_dollars
 
 _GENERIC_CRYPTO_STRATEGY_CODES = {"CRYPTO_15M", "CRYPTO_1H"}
 _CLIENT_ORDER_STRATEGY_PREFIXES = {
@@ -236,15 +238,12 @@ def _contract_price_from_yes_price(side: str | None, yes_price_dollars: Decimal)
 
 
 def _fill_fee_dollars_from_raw(raw: Any) -> Decimal:
-    payload = raw if isinstance(raw, dict) else {}
-    for key in ("fee_cost", "fee_dollars", "fee"):
-        value = payload.get(key)
-        if value not in (None, ""):
-            try:
-                return _quantize_money(value)
-            except Exception:
-                return Decimal("0")
-    return Decimal("0")
+    return _quantize_money(extract_kalshi_raw_fee_dollars(raw).amount_dollars)
+
+
+def _fill_fee_estimate_from_raw(raw: Any, *, is_taker: bool | None = None) -> FeeEstimate:
+    role = None if is_taker is None else ("taker" if is_taker else "maker")
+    return extract_kalshi_raw_fee_dollars(raw, role=role)
 
 
 def _fill_fee_for_count_from_raw(raw: Any, total_count_fp: Any, count_fp: Decimal) -> Decimal:
@@ -297,6 +296,53 @@ def _fill_fee_dollars(fill: FillRecord) -> Decimal:
     return _fill_fee_dollars_from_raw(fill.raw)
 
 
+def _gross_pnl_for_settled_buy(
+    *,
+    side: str | None,
+    action: str | None,
+    yes_price_dollars: Any,
+    count_fp: Any,
+    settlement_result: str | None,
+) -> Decimal | None:
+    if action != "buy" or settlement_result not in {"win", "loss"}:
+        return None
+    contract_price = _contract_price_from_yes_price(side, as_decimal(yes_price_dollars))
+    count = as_decimal(count_fp)
+    won = settlement_result == "win"
+    return ((Decimal("1.0000") if won else Decimal("0")) - contract_price) * count
+
+
+def _settled_buy_fill_economics_from_values(
+    *,
+    side: str | None,
+    action: str | None,
+    yes_price_dollars: Any,
+    count_fp: Any,
+    settlement_result: str | None,
+    raw: Any,
+    is_taker: bool | None = None,
+) -> dict[str, Decimal | str | bool] | None:
+    gross = _gross_pnl_for_settled_buy(
+        side=side,
+        action=action,
+        yes_price_dollars=yes_price_dollars,
+        count_fp=count_fp,
+        settlement_result=settlement_result,
+    )
+    if gross is None:
+        return None
+    fee = _fill_fee_estimate_from_raw(raw, is_taker=is_taker)
+    fees = _quantize_money(fee.amount_dollars)
+    return {
+        "gross_pnl_dollars": _quantize_money(gross),
+        "fees_dollars": fees,
+        "net_pnl_dollars": _quantize_money(gross - fees),
+        "fee_source": fee.fee_source,
+        "fee_missing": fee.missing,
+        "fee_estimated": fee.estimated,
+    }
+
+
 def _candidate_trade_ticket_client_order_ids(client_order_id: str) -> list[str]:
     candidates: list[str] = []
 
@@ -326,14 +372,20 @@ def _settled_buy_fill_pnl_from_values(
     count_fp: Any,
     settlement_result: str | None,
     raw: Any,
+    is_taker: bool | None = None,
 ) -> Decimal | None:
-    if action != "buy" or settlement_result not in {"win", "loss"}:
+    economics = _settled_buy_fill_economics_from_values(
+        side=side,
+        action=action,
+        yes_price_dollars=yes_price_dollars,
+        count_fp=count_fp,
+        settlement_result=settlement_result,
+        raw=raw,
+        is_taker=is_taker,
+    )
+    if economics is None:
         return None
-    contract_price = _contract_price_from_yes_price(side, as_decimal(yes_price_dollars))
-    count = as_decimal(count_fp)
-    won = settlement_result == "win"
-    gross = ((Decimal("1.0000") if won else Decimal("0")) - contract_price) * count
-    return _quantize_money(gross - _fill_fee_dollars_from_raw(raw))
+    return economics["net_pnl_dollars"]  # type: ignore[return-value]
 
 
 def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
@@ -344,6 +396,7 @@ def _settled_buy_fill_pnl(fill: FillRecord) -> Decimal | None:
         count_fp=fill.count_fp,
         settlement_result=fill.settlement_result,
         raw=fill.raw,
+        is_taker=fill.is_taker,
     )
 
 
@@ -359,6 +412,53 @@ def _raw_has_decision_lineage(raw: Any) -> bool:
         ("decision_time", "signal_created_at"),
     )
     return all(any(lineage.get(key) not in (None, "") for key in keys) for keys in required_groups)
+
+
+def _decision_time_from_raw(raw: Any) -> datetime | None:
+    payload = raw if isinstance(raw, dict) else {}
+    lineage = payload.get("decision_lineage")
+    if not isinstance(lineage, dict):
+        return None
+    value = lineage.get("decision_time") or lineage.get("signal_created_at")
+    if isinstance(value, datetime):
+        return _as_utc_datetime(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _as_utc_datetime(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _fill_latency_bucket(latency_seconds: float | None) -> str:
+    if latency_seconds is None:
+        return "unknown"
+    if latency_seconds <= 5:
+        return "0-5s"
+    if latency_seconds <= 30:
+        return "5-30s"
+    if latency_seconds <= 120:
+        return "30-120s"
+    if latency_seconds <= 300:
+        return "120-300s"
+    return "300s+"
+
+
+def _snapshot_side_bid_dollars(snapshot: dict[str, Any], side: str) -> Decimal | None:
+    normalized = str(side or "").lower()
+    if normalized == "yes":
+        value = snapshot.get("yes_bid_dollars")
+        if value is not None:
+            return _quantize_money(value)
+        opposite_ask = snapshot.get("no_ask_dollars")
+        return _quantize_money(Decimal("1.0000") - as_decimal(opposite_ask)) if opposite_ask is not None else None
+    if normalized == "no":
+        value = snapshot.get("no_bid_dollars")
+        if value is not None:
+            return _quantize_money(value)
+        opposite_ask = snapshot.get("yes_ask_dollars")
+        return _quantize_money(Decimal("1.0000") - as_decimal(opposite_ask)) if opposite_ask is not None else None
+    return None
 
 
 class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixin, StrategyRepositoryMixin, LearningRepositoryMixin):
@@ -4773,6 +4873,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             FillRecord.yes_price_dollars,
             FillRecord.count_fp,
             FillRecord.raw,
+            FillRecord.is_taker,
             FillRecord.settlement_result,
             FillRecord.created_at,
         )
@@ -4897,6 +4998,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             FillRecord.yes_price_dollars,
             FillRecord.count_fp,
             FillRecord.raw,
+            FillRecord.is_taker,
             FillRecord.settlement_result,
         ).where(
             FillRecord.kalshi_env == env,
@@ -4919,6 +5021,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 count_fp=fill["count_fp"],
                 settlement_result=fill["settlement_result"],
                 raw=fill["raw"],
+                is_taker=fill["is_taker"],
             )
             if fill_pnl is not None:
                 pnl += fill_pnl
@@ -4966,8 +5069,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         elif normalized_liquidity == "taker":
             stmt = stmt.where(FillRecord.is_taker.is_(True))
         fills = list((await self.session.execute(stmt)).mappings())
+        gross = Decimal("0")
         pnl = Decimal("0")
         fees = Decimal("0")
+        missing_fee_count = 0
+        estimated_fee_count = 0
+        fee_sources: Counter[str] = Counter()
         contracts = Decimal("0")
         fill_count = 0
         wins = 0
@@ -4983,20 +5090,27 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             )
             if _crypto_price_band(contract_price) != target_bucket:
                 continue
-            fill_pnl = _settled_buy_fill_pnl_from_values(
+            economics = _settled_buy_fill_economics_from_values(
                 side=fill["side"],
                 action=fill["action"],
                 yes_price_dollars=fill["yes_price_dollars"],
                 count_fp=fill["count_fp"],
                 settlement_result=fill["settlement_result"],
                 raw=fill["raw"],
+                is_taker=fill["is_taker"],
             )
-            if fill_pnl is None:
+            if economics is None:
                 continue
             fill_count += 1
             contracts += as_decimal(fill["count_fp"])
-            fees += _fill_fee_dollars_from_raw(fill["raw"])
-            pnl += fill_pnl
+            gross += as_decimal(economics["gross_pnl_dollars"])
+            fees += as_decimal(economics["fees_dollars"])
+            pnl += as_decimal(economics["net_pnl_dollars"])
+            fee_sources[str(economics["fee_source"])] += 1
+            if economics["fee_missing"]:
+                missing_fee_count += 1
+            if economics["fee_estimated"]:
+                estimated_fee_count += 1
             if fill["settlement_result"] == "win":
                 wins += 1
             else:
@@ -5019,8 +5133,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             "wins": wins,
             "losses": losses,
             "win_rate": (wins / fill_count) if fill_count else None,
+            "gross_pnl_dollars": str(gross.quantize(Decimal("0.0001"))),
             "net_pnl_dollars": str(pnl.quantize(Decimal("0.0001"))),
             "fees_dollars": str(fees.quantize(Decimal("0.0001"))),
+            "missing_fee_count": missing_fee_count,
+            "estimated_fee_count": estimated_fee_count,
+            "fee_sources": dict(sorted(fee_sources.items())),
             "pnl_per_contract_dollars": str(pnl_per_contract.quantize(Decimal("0.0001"))),
             "latest_fill_at": latest_fill_at.isoformat() if latest_fill_at is not None else None,
         }
@@ -5063,18 +5181,28 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         totals = {
             "fills": 0,
             "contracts": Decimal("0"),
+            "gross_pnl": Decimal("0"),
             "net_pnl": Decimal("0"),
             "fees": Decimal("0"),
             "missing_decision_lineage": 0,
+            "missing_fee_count": 0,
+            "estimated_fee_count": 0,
+            "fee_sources": Counter(),
         }
         by_cell: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
         by_market: dict[str, dict[str, Any]] = {}
 
-        def add_row(bucket: dict[str, Any], fill: dict[str, Any], pnl: Decimal) -> None:
+        def add_row(bucket: dict[str, Any], fill: dict[str, Any], economics: dict[str, Decimal | str | bool]) -> None:
             bucket["fills"] += 1
             bucket["contracts"] += as_decimal(fill["count_fp"])
-            bucket["net_pnl"] += pnl
-            bucket["fees"] += _fill_fee_dollars_from_raw(fill["raw"])
+            bucket["gross_pnl"] += as_decimal(economics["gross_pnl_dollars"])
+            bucket["net_pnl"] += as_decimal(economics["net_pnl_dollars"])
+            bucket["fees"] += as_decimal(economics["fees_dollars"])
+            bucket["fee_sources"][str(economics["fee_source"])] += 1
+            if economics["fee_missing"]:
+                bucket["missing_fee_count"] += 1
+            if economics["fee_estimated"]:
+                bucket["estimated_fee_count"] += 1
             if fill["settlement_result"] == "win":
                 bucket["wins"] += 1
             else:
@@ -5089,15 +5217,16 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 continue
             if normalized_frequency and fill_frequency != normalized_frequency:
                 continue
-            pnl = _settled_buy_fill_pnl_from_values(
+            economics = _settled_buy_fill_economics_from_values(
                 side=fill["side"],
                 action=fill["action"],
                 yes_price_dollars=fill["yes_price_dollars"],
                 count_fp=fill["count_fp"],
                 settlement_result=fill["settlement_result"],
                 raw=fill["raw"],
+                is_taker=fill["is_taker"],
             )
-            if pnl is None:
+            if economics is None:
                 continue
             side_price = _contract_price_from_yes_price(fill["side"], as_decimal(fill["yes_price_dollars"]))
             liquidity = "taker" if fill["is_taker"] else "maker"
@@ -5114,8 +5243,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                     "price_bucket": price_bucket,
                     "fills": 0,
                     "contracts": Decimal("0"),
+                    "gross_pnl": Decimal("0"),
                     "net_pnl": Decimal("0"),
                     "fees": Decimal("0"),
+                    "missing_fee_count": 0,
+                    "estimated_fee_count": 0,
+                    "fee_sources": Counter(),
                     "wins": 0,
                     "losses": 0,
                 },
@@ -5128,18 +5261,28 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                     "frequency": fill_frequency,
                     "fills": 0,
                     "contracts": Decimal("0"),
+                    "gross_pnl": Decimal("0"),
                     "net_pnl": Decimal("0"),
                     "fees": Decimal("0"),
+                    "missing_fee_count": 0,
+                    "estimated_fee_count": 0,
+                    "fee_sources": Counter(),
                     "wins": 0,
                     "losses": 0,
                 },
             )
-            add_row(cell, fill, pnl)
-            add_row(market, fill, pnl)
+            add_row(cell, fill, economics)
+            add_row(market, fill, economics)
             totals["fills"] += 1
             totals["contracts"] += as_decimal(fill["count_fp"])
-            totals["net_pnl"] += pnl
-            totals["fees"] += _fill_fee_dollars_from_raw(fill["raw"])
+            totals["gross_pnl"] += as_decimal(economics["gross_pnl_dollars"])
+            totals["net_pnl"] += as_decimal(economics["net_pnl_dollars"])
+            totals["fees"] += as_decimal(economics["fees_dollars"])
+            totals["fee_sources"][str(economics["fee_source"])] += 1
+            if economics["fee_missing"]:
+                totals["missing_fee_count"] += 1
+            if economics["fee_estimated"]:
+                totals["estimated_fee_count"] += 1
             if not _raw_has_decision_lineage(fill["raw"]):
                 totals["missing_decision_lineage"] += 1
 
@@ -5149,10 +5292,16 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             win_rate = (row["wins"] / fills) if fills else None
             pnl_per_contract = row["net_pnl"] / contracts if contracts > Decimal("0") else Decimal("0")
             return {
-                **{key: value for key, value in row.items() if key not in {"contracts", "net_pnl", "fees"}},
+                **{
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"contracts", "gross_pnl", "net_pnl", "fees", "fee_sources"}
+                },
                 "contracts": str(contracts.quantize(Decimal("0.01"))),
+                "gross_pnl_dollars": str(row["gross_pnl"].quantize(Decimal("0.0001"))),
                 "net_pnl_dollars": str(row["net_pnl"].quantize(Decimal("0.0001"))),
                 "fees_dollars": str(row["fees"].quantize(Decimal("0.0001"))),
+                "fee_sources": dict(sorted(row["fee_sources"].items())),
                 "pnl_per_contract_dollars": str(pnl_per_contract.quantize(Decimal("0.0001"))),
                 "win_rate": win_rate,
             }
@@ -5172,8 +5321,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             "totals": {
                 "fills": totals["fills"],
                 "contracts": str(totals["contracts"].quantize(Decimal("0.01"))),
+                "gross_pnl_dollars": str(totals["gross_pnl"].quantize(Decimal("0.0001"))),
                 "net_pnl_dollars": str(totals["net_pnl"].quantize(Decimal("0.0001"))),
                 "fees_dollars": str(totals["fees"].quantize(Decimal("0.0001"))),
+                "missing_fee_count": totals["missing_fee_count"],
+                "estimated_fee_count": totals["estimated_fee_count"],
+                "fee_sources": dict(sorted(totals["fee_sources"].items())),
                 "pnl_per_contract_dollars": str(
                     (
                         totals["net_pnl"] / totals["contracts"]
@@ -5186,6 +5339,236 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             "cells": cells,
             "worst_cells": cells[:20],
             "worst_markets": worst_markets[:20],
+        }
+
+    async def build_crypto_maker_markout_report(
+        self,
+        *,
+        kalshi_env: str | None,
+        days: int,
+        frequency: str | None = None,
+        asset_symbols: list[str] | None = None,
+        horizons_seconds: tuple[int, ...] = (60, 300, 900),
+    ) -> dict[str, Any]:
+        env = self._resolved_kalshi_env(kalshi_env)
+        cutoff = datetime.now(UTC) - timedelta(days=max(1, int(days)))
+        assets = {str(asset).upper() for asset in (asset_symbols or []) if str(asset or "").strip()}
+        normalized_frequency = None
+        if frequency:
+            normalized_frequency = "1h" if str(frequency).lower() in {"1h", "1hr", "hour"} else "15m"
+        horizons = tuple(sorted({max(1, int(value)) for value in horizons_seconds}))
+        stmt = select(
+            FillRecord.id,
+            FillRecord.market_ticker,
+            FillRecord.side,
+            FillRecord.action,
+            FillRecord.yes_price_dollars,
+            FillRecord.count_fp,
+            FillRecord.raw,
+            FillRecord.settlement_result,
+            FillRecord.created_at,
+        ).where(
+            FillRecord.kalshi_env == env,
+            FillRecord.action == "buy",
+            FillRecord.is_taker.is_(False),
+            FillRecord.created_at >= cutoff,
+        )
+        if normalized_frequency == "15m":
+            stmt = stmt.where(FillRecord.strategy_code == "CRYPTO_15M")
+        elif normalized_frequency == "1h":
+            stmt = stmt.where(FillRecord.strategy_code == "CRYPTO_1H")
+        else:
+            stmt = stmt.where(FillRecord.strategy_code.in_(["CRYPTO_15M", "CRYPTO_1H"]))
+        raw_fills = [dict(row) for row in (await self.session.execute(stmt)).mappings()]
+        fills: list[dict[str, Any]] = []
+        for fill in raw_fills:
+            asset, fill_frequency = _crypto_market_identity(fill["market_ticker"])
+            if asset is None or fill_frequency is None:
+                continue
+            if assets and asset not in assets:
+                continue
+            if normalized_frequency and fill_frequency != normalized_frequency:
+                continue
+            fills.append({**fill, "asset_symbol": asset, "frequency": fill_frequency})
+        if not fills:
+            return {
+                "schema_version": "crypto-maker-markout-v1",
+                "kalshi_env": env,
+                "days": int(days),
+                "frequency": normalized_frequency,
+                "asset_symbols": sorted(assets),
+                "horizons_seconds": list(horizons),
+                "shadow_only": True,
+                "live_trading_change": False,
+                "totals": {"fills": 0, "contracts": "0.00"},
+                "cells": [],
+            }
+
+        tickers = sorted({str(fill["market_ticker"]) for fill in fills})
+        min_fill_at = min(_as_utc_datetime(fill["created_at"]) for fill in fills)
+        max_fill_at = max(_as_utc_datetime(fill["created_at"]) for fill in fills) + timedelta(seconds=max(horizons))
+        snapshot_stmt = (
+            select(
+                CryptoMarketSnapshotRecord.market_ticker,
+                CryptoMarketSnapshotRecord.observed_at,
+                CryptoMarketSnapshotRecord.yes_bid_dollars,
+                CryptoMarketSnapshotRecord.yes_ask_dollars,
+                CryptoMarketSnapshotRecord.no_bid_dollars,
+                CryptoMarketSnapshotRecord.no_ask_dollars,
+            )
+            .where(
+                CryptoMarketSnapshotRecord.kalshi_env == env,
+                CryptoMarketSnapshotRecord.market_ticker.in_(tickers),
+                CryptoMarketSnapshotRecord.observed_at >= min_fill_at,
+                CryptoMarketSnapshotRecord.observed_at <= max_fill_at,
+            )
+            .order_by(CryptoMarketSnapshotRecord.market_ticker, CryptoMarketSnapshotRecord.observed_at)
+        )
+        snapshots_by_ticker: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in (await self.session.execute(snapshot_stmt)).mappings():
+            snapshots_by_ticker[str(row["market_ticker"])].append(dict(row))
+
+        def first_snapshot_at_or_after(market_ticker: str, target: datetime) -> dict[str, Any] | None:
+            for snapshot in snapshots_by_ticker.get(market_ticker, []):
+                if _as_utc_datetime(snapshot["observed_at"]) >= target:
+                    return snapshot
+            return None
+
+        totals = {
+            "fills": 0,
+            "contracts": Decimal("0"),
+            "gross_pnl": Decimal("0"),
+            "net_pnl": Decimal("0"),
+            "fees": Decimal("0"),
+            "missing_fee_count": 0,
+            "missing_decision_lineage": 0,
+            "markout": {str(seconds): {"count": 0, "sum": Decimal("0")} for seconds in horizons},
+        }
+        cells: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+
+        def make_bucket(fill: dict[str, Any], price_bucket: str, latency_bucket: str) -> dict[str, Any]:
+            key = (fill["asset_symbol"], fill["frequency"], fill["side"], price_bucket, latency_bucket)
+            return cells.setdefault(
+                key,
+                {
+                    "asset_symbol": fill["asset_symbol"],
+                    "frequency": fill["frequency"],
+                    "side": fill["side"],
+                    "price_bucket": price_bucket,
+                    "fill_latency_bucket": latency_bucket,
+                    "fills": 0,
+                    "contracts": Decimal("0"),
+                    "gross_pnl": Decimal("0"),
+                    "net_pnl": Decimal("0"),
+                    "fees": Decimal("0"),
+                    "missing_fee_count": 0,
+                    "missing_decision_lineage": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "markout": {str(seconds): {"count": 0, "sum": Decimal("0")} for seconds in horizons},
+                },
+            )
+
+        for fill in fills:
+            fill_time = _as_utc_datetime(fill["created_at"])
+            decision_time = _decision_time_from_raw(fill["raw"])
+            latency_seconds = (fill_time - decision_time).total_seconds() if decision_time is not None else None
+            if latency_seconds is not None and latency_seconds < 0:
+                latency_seconds = None
+            latency_bucket = _fill_latency_bucket(latency_seconds)
+            side_price = _contract_price_from_yes_price(fill["side"], as_decimal(fill["yes_price_dollars"]))
+            price_bucket = _crypto_price_band(side_price)
+            bucket = make_bucket(fill, price_bucket, latency_bucket)
+            economics = _settled_buy_fill_economics_from_values(
+                side=fill["side"],
+                action=fill["action"],
+                yes_price_dollars=fill["yes_price_dollars"],
+                count_fp=fill["count_fp"],
+                settlement_result=fill["settlement_result"],
+                raw=fill["raw"],
+                is_taker=False,
+            )
+            contracts = as_decimal(fill["count_fp"])
+            for target in (bucket, totals):
+                target["fills"] += 1
+                target["contracts"] += contracts
+                if economics is not None:
+                    target["gross_pnl"] += as_decimal(economics["gross_pnl_dollars"])
+                    target["net_pnl"] += as_decimal(economics["net_pnl_dollars"])
+                    target["fees"] += as_decimal(economics["fees_dollars"])
+                    if economics["fee_missing"]:
+                        target["missing_fee_count"] += 1
+                if not _raw_has_decision_lineage(fill["raw"]):
+                    target["missing_decision_lineage"] += 1
+            if fill["settlement_result"] == "win":
+                bucket["wins"] += 1
+            elif fill["settlement_result"] == "loss":
+                bucket["losses"] += 1
+            for seconds in horizons:
+                snapshot = first_snapshot_at_or_after(str(fill["market_ticker"]), fill_time + timedelta(seconds=seconds))
+                if snapshot is None:
+                    continue
+                mark_price = _snapshot_side_bid_dollars(snapshot, str(fill["side"]))
+                if mark_price is None:
+                    continue
+                markout = mark_price - side_price
+                for target in (bucket, totals):
+                    target["markout"][str(seconds)]["count"] += 1
+                    target["markout"][str(seconds)]["sum"] += markout
+
+        def finalize(row: dict[str, Any]) -> dict[str, Any]:
+            contracts = row["contracts"]
+            fills_count = int(row["fills"])
+            markouts = {
+                seconds: {
+                    "count": value["count"],
+                    "avg_dollars_per_contract": str(
+                        (
+                            value["sum"] / Decimal(value["count"])
+                            if value["count"]
+                            else Decimal("0")
+                        ).quantize(Decimal("0.0001"))
+                    )
+                    if value["count"]
+                    else None,
+                }
+                for seconds, value in row["markout"].items()
+            }
+            return {
+                **{
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"contracts", "gross_pnl", "net_pnl", "fees", "markout"}
+                },
+                "contracts": str(contracts.quantize(Decimal("0.01"))),
+                "gross_pnl_dollars": str(row["gross_pnl"].quantize(Decimal("0.0001"))),
+                "fees_dollars": str(row["fees"].quantize(Decimal("0.0001"))),
+                "net_pnl_dollars": str(row["net_pnl"].quantize(Decimal("0.0001"))),
+                "pnl_per_contract_dollars": str(
+                    (
+                        row["net_pnl"] / contracts
+                        if contracts > Decimal("0")
+                        else Decimal("0")
+                    ).quantize(Decimal("0.0001"))
+                ),
+                "win_rate": (row["wins"] / fills_count) if fills_count and "wins" in row else None,
+                "markouts": markouts,
+            }
+
+        finalized_cells = [finalize(row) for row in cells.values()]
+        finalized_cells.sort(key=lambda item: Decimal(str(item["net_pnl_dollars"])))
+        return {
+            "schema_version": "crypto-maker-markout-v1",
+            "kalshi_env": env,
+            "days": int(days),
+            "frequency": normalized_frequency,
+            "asset_symbols": sorted(assets),
+            "horizons_seconds": list(horizons),
+            "shadow_only": True,
+            "live_trading_change": False,
+            "totals": finalize(totals),
+            "cells": finalized_cells,
+            "worst_cells": finalized_cells[:20],
         }
 
     async def get_broken_book_rate_30d(self, *, kalshi_env: str | None = None) -> dict[str, Any]:

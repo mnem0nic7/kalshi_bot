@@ -240,6 +240,7 @@ but it does not make a `live_quality` candidate.
 | `crypto-model train --feature-store-only` | `False` | Trains only from materialized feature rows instead of raw source tables. |
 | `crypto-model candidates --days` | `30` | Candidate-analysis lookback. |
 | `crypto-model candidates --assets` | `None` | Limits candidate analysis to selected assets. |
+| `crypto-maker-markout-report --days` | `14` | Shadow-only maker adverse-selection report; run from `trainer_production` for historical windows. |
 
 Commands:
 
@@ -247,6 +248,7 @@ Commands:
 python -m kalshi_bot.cli crypto-model train --kalshi-env production --frequency 15m
 python -m kalshi_bot.cli crypto-model train --kalshi-env production --frequency 15m --assets BTC ETH
 python -m kalshi_bot.cli crypto-model candidates --kalshi-env production --frequency 15m --days 30 --json
+python -m kalshi_bot.cli crypto-maker-markout-report --kalshi-env production --frequency 15m --days 30 --json
 ```
 
 Training depends on both market history and spot history. A model can be trained
@@ -377,6 +379,8 @@ Main live candidate gates:
 | Setting | Current default | Effect |
 | --- | ---: | --- |
 | `kalshi_taker_fee_rate` | `0.07` | Used to convert gross edge to fee-adjusted edge. |
+| `kalshi_maker_fee_rate` | `0.0175` | Maker-fee rate used for passive replay and maker markout economics when maker fees apply. |
+| `kalshi_maker_fee_enabled` | `true` | Conservative default: charge estimated maker fees in simulations/reports unless the current Kalshi schedule says the market class is maker-fee-free. |
 | `risk_fee_aware_edge_enabled` | `True` | Keeps risk checks fee-aware. |
 | `crypto_market_price_anchor_enabled` | `True` | Blends model probability toward market mid before selection. |
 | `crypto_market_price_anchor_weight` | `0.75` | Maximum market-mid anchor weight. Effective weight can be lower depending on market-mid extremity. |

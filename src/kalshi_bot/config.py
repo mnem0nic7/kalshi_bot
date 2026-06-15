@@ -84,6 +84,8 @@ class Settings(BaseSettings):
     demo_kalshi_write_private_key_path: str | None = None
     kalshi_subaccount: int = 0
     kalshi_taker_fee_rate: float = 0.07
+    kalshi_maker_fee_rate: float = 0.0175
+    kalshi_maker_fee_enabled: bool = True
     kalshi_leaderboard_base_url: str = "https://api.elections.kalshi.com/v1"
     kalshi_leaderboard_path: str = "/social/leaderboard"
     kalshi_leaderboard_web_url: str = "https://kalshi.com/social/leaderboard"

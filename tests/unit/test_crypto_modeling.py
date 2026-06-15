@@ -58,6 +58,16 @@ def test_residual_model_calibration_is_none_with_single_label() -> None:
     assert model.get("probability_calibration") is None
 
 
+def test_residual_model_uses_chronological_holdout_for_large_calibration_sets() -> None:
+    rows = _make_rows_with_both_labels(2000)
+    model = _fit_crypto_spot_distance_residual_model(rows, fallback=_make_fallback())
+
+    assert model["calibration_scope"] == "chronological_holdout"
+    assert model["calibration_fit_rows"] == 1700
+    assert model["calibration_holdout_rows"] == 300
+    assert model["probability_calibration"]["sample_count"] == 300
+
+
 def test_predict_residual_apply_calibration_true_uses_isotonic() -> None:
     rows = _make_rows_with_both_labels(20)
     model = _fit_crypto_spot_distance_residual_model(rows, fallback=_make_fallback())

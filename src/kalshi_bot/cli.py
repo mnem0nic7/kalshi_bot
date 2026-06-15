@@ -133,6 +133,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-policy",
     "crypto-live-path",
     "crypto-pnl-report",
+    "crypto-maker-markout-report",
     "weather-live",
 }
 
@@ -3092,6 +3093,40 @@ def _format_crypto_pnl_report(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_crypto_maker_markout_report(report: dict[str, Any]) -> str:
+    totals = report.get("totals") or {}
+    lines = [
+        (
+            f"crypto-maker-markout-report env={report.get('kalshi_env')} days={report.get('days')} "
+            f"frequency={report.get('frequency') or 'all'}"
+        ),
+        (
+            f"total maker fills={totals.get('fills', 0)} contracts={totals.get('contracts')} "
+            f"net_pnl=${totals.get('net_pnl_dollars')} fees=${totals.get('fees_dollars')} "
+            f"missing_fees={totals.get('missing_fee_count', 0)}"
+        ),
+        "shadow_only=true live_trading_change=false",
+    ]
+    worst_cells = report.get("worst_cells") or []
+    if worst_cells:
+        lines.append("")
+        lines.append("Worst maker cells:")
+        for cell in worst_cells[:10]:
+            markouts = cell.get("markouts") or {}
+            markout_text = " ".join(
+                f"{seconds}s={payload.get('avg_dollars_per_contract')}"
+                for seconds, payload in markouts.items()
+                if isinstance(payload, dict) and payload.get("avg_dollars_per_contract") is not None
+            )
+            lines.append(
+                "  "
+                f"{cell.get('asset_symbol')} {cell.get('frequency')} {cell.get('side')} "
+                f"bucket={cell.get('price_bucket')} latency={cell.get('fill_latency_bucket')} "
+                f"fills={cell.get('fills')} net=${cell.get('net_pnl_dollars')} {markout_text}".rstrip()
+            )
+    return "\n".join(lines) + "\n"
+
+
 async def _run_crypto_pnl_report_command(args: argparse.Namespace, container: AppContainer) -> int:
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=args.kalshi_env)
@@ -3106,6 +3141,24 @@ async def _run_crypto_pnl_report_command(args: argparse.Namespace, container: Ap
         print(json.dumps(report, indent=2))
     else:
         print(_format_crypto_pnl_report(report), end="")
+    return 0
+
+
+async def _run_crypto_maker_markout_report_command(args: argparse.Namespace, container: AppContainer) -> int:
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=args.kalshi_env)
+        report = await repo.build_crypto_maker_markout_report(
+            kalshi_env=args.kalshi_env,
+            days=args.days,
+            frequency=args.frequency,
+            asset_symbols=args.assets,
+            horizons_seconds=tuple(args.horizons_seconds),
+        )
+        await session.commit()
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(_format_crypto_maker_markout_report(report), end="")
     return 0
 
 
@@ -3593,6 +3646,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-pnl-report":
             return await _run_crypto_pnl_report_command(args, container)
+
+        if args.command == "crypto-maker-markout-report":
+            return await _run_crypto_maker_markout_report_command(args, container)
 
         if args.command == "funnel-report":
             return await _run_funnel_report_command(args, container)
@@ -5297,6 +5353,14 @@ def build_parser() -> argparse.ArgumentParser:
     crypto_pnl_report.add_argument("--frequency", default=None)
     crypto_pnl_report.add_argument("--assets", nargs="*", default=None)
     crypto_pnl_report.add_argument("--json", action="store_true")
+
+    crypto_maker_markout_report = subparsers.add_parser("crypto-maker-markout-report")
+    crypto_maker_markout_report.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    crypto_maker_markout_report.add_argument("--days", type=int, default=14)
+    crypto_maker_markout_report.add_argument("--frequency", default=None)
+    crypto_maker_markout_report.add_argument("--assets", nargs="*", default=None)
+    crypto_maker_markout_report.add_argument("--horizons-seconds", nargs="*", type=int, default=[60, 300, 900])
+    crypto_maker_markout_report.add_argument("--json", action="store_true")
 
     weather_live = subparsers.add_parser("weather-live")
     weather_live_subparsers = weather_live.add_subparsers(dest="weather_live_command", required=True)

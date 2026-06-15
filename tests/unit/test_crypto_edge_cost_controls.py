@@ -476,7 +476,7 @@ def test_passive_fill_derives_no_ask_from_yes_bid_when_absent() -> None:
     assert fill[1] == Decimal("0.4000")
 
 
-def test_simulate_passive_trade_pays_no_taker_fee() -> None:
+def test_simulate_passive_trade_charges_estimated_maker_fee() -> None:
     base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     row = _replay_row(decision_ts=base, label_yes=1)
     future_rows = [
@@ -488,8 +488,9 @@ def test_simulate_passive_trade_pays_no_taker_fee() -> None:
 
     assert filled["filled"] is True
     assert filled["limit_price_dollars"] == "0.4800"
-    assert filled["fees"] == "0.0000"
-    assert filled["net_pnl"] == "0.5200"
+    assert filled["fees"] == "0.0100"
+    assert filled["fee_source"] == "estimated_maker"
+    assert filled["net_pnl"] == "0.5100"
     assert unfilled["filled"] is False
     assert unfilled["net_pnl"] is None
 
@@ -538,11 +539,13 @@ def test_passive_replay_metrics_expose_adverse_selection_split() -> None:
     assert metrics["passive_eligible_candidate_count"] == 2
     assert metrics["passive_filled_candidate_count"] == 1
     assert metrics["passive_fill_rate"] == 0.5
-    # Filled passive entry at 0.48, market settles NO: passive P&L = -0.48.
-    assert abs(metrics["passive_net_simulated_pl_dollars"] - (-0.48)) < 1e-9
-    assert abs(metrics["passive_avg_pnl_filled"] - (-0.48)) < 1e-9
-    # Taker net (-0.52 + 0.48 = -0.04) minus passive net (-0.48) = +0.44.
-    assert abs(metrics["taker_vs_passive_pl_delta_dollars"] - 0.44) < 1e-9
+    # Filled passive entry at 0.48, market settles NO: gross -0.48 minus 0.01 maker fee.
+    assert abs(metrics["passive_gross_simulated_pl_dollars"] - (-0.48)) < 1e-9
+    assert abs(metrics["passive_fees_dollars"] - 0.01) < 1e-9
+    assert abs(metrics["passive_net_simulated_pl_dollars"] - (-0.49)) < 1e-9
+    assert abs(metrics["passive_avg_pnl_filled"] - (-0.49)) < 1e-9
+    # Taker net (-0.52 + 0.48 = -0.04) minus passive net (-0.49) = +0.45.
+    assert abs(metrics["taker_vs_passive_pl_delta_dollars"] - 0.45) < 1e-9
     # The candidate that filled passively is the losing one (adverse selection).
     assert abs(metrics["passive_filled_avg_settlement_pnl"] - (-0.52)) < 1e-9
     assert abs(metrics["passive_unfilled_avg_settlement_pnl"] - 0.48) < 1e-9
@@ -554,6 +557,8 @@ def test_passive_replay_metrics_empty_input() -> None:
     assert metrics["passive_eligible_candidate_count"] == 0
     assert metrics["passive_filled_candidate_count"] == 0
     assert metrics["passive_fill_rate"] is None
+    assert metrics["passive_gross_simulated_pl_dollars"] == 0.0
+    assert metrics["passive_fees_dollars"] == 0.0
     assert metrics["passive_net_simulated_pl_dollars"] == 0.0
     assert metrics["passive_avg_pnl_filled"] is None
     assert metrics["passive_filled_avg_settlement_pnl"] is None
