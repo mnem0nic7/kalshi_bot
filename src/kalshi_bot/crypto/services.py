@@ -11651,11 +11651,11 @@ def _fit_crypto_xgboost_model(
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
         _sample_weights = _crypto_training_sample_weights(rows[:_cal_split_idx], settings=settings)
 
-        def _build_and_fit_xgb(device: str) -> Any:
+        def _make_xgb(device: str) -> Any:
             kwargs: dict[str, Any] = {"tree_method": "hist"}
             if device not in ("", "cpu"):
                 kwargs["device"] = device
-            fitted = xgb.XGBClassifier(
+            return xgb.XGBClassifier(
                 n_estimators=100,
                 max_depth=3,
                 learning_rate=0.05,
@@ -11668,6 +11668,9 @@ def _fit_crypto_xgboost_model(
                 n_jobs=_xgb_n_jobs,
                 **kwargs,
             )
+
+        def _build_and_fit_xgb(device: str) -> Any:
+            fitted = _make_xgb(device)
             fitted.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
             return fitted
 
@@ -11698,12 +11701,32 @@ def _fit_crypto_xgboost_model(
             "fallback_model": fallback,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
-        _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
-        _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
-        model["probability_calibration"] = _fit_probability_calibration(
-            _xgboost_predict_batch(_cal_rows, model, apply_calibration=False),
-            _cal_labels,
+        def _xgb_oof_fit_predict(train_idx: list[int], eval_idx: list[int]) -> list[float]:
+            fold_clf = _make_xgb(_xgb_device)
+            fold_clf.fit(
+                [raw_matrix[i] for i in train_idx],
+                [labels[i] for i in train_idx],
+                sample_weight=_crypto_training_sample_weights([rows[i] for i in train_idx], settings=settings),
+            )
+            return [float(value) for value in fold_clf.predict_proba([raw_matrix[i] for i in eval_idx])[:, 1]]
+
+        # Out-of-fold isotonic (see lightgbm fit); single-holdout is the fallback.
+        oof_calibration = _fit_crypto_oof_probability_calibration(
+            labels,
+            fit_predict=_xgb_oof_fit_predict,
+            n_splits=_crypto_calibration_oof_splits(),
+            min_rows=2000,
         )
+        if oof_calibration is not None:
+            oof_calibration["scope"] = "out_of_fold"
+            model["probability_calibration"] = oof_calibration
+        else:
+            _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
+            _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
+            model["probability_calibration"] = _fit_probability_calibration(
+                _xgboost_predict_batch(_cal_rows, model, apply_calibration=False),
+                _cal_labels,
+            )
         return {"name": "xgboost_classifier", "status": "available", "model": model, "dependency_version": getattr(xgb, "__version__", None)}
     except Exception as exc:
         return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_fit_failed:{exc}", "dependency_version": _package_version("xgboost") or _package_version("xgboost-cpu")}
@@ -11732,8 +11755,8 @@ def _fit_crypto_lightgbm_model(
         _cal_split_idx = int(len(raw_matrix) * 0.85) if len(raw_matrix) >= 2000 else len(raw_matrix)
         _sample_weights = _crypto_training_sample_weights(rows[:_cal_split_idx], settings=settings)
 
-        def _build_and_fit_lgb(device: str) -> Any:
-            fitted = lgb.LGBMClassifier(
+        def _make_lgb(device: str) -> Any:
+            return lgb.LGBMClassifier(
                 n_estimators=100,
                 max_depth=3,
                 learning_rate=0.05,
@@ -11747,6 +11770,9 @@ def _fit_crypto_lightgbm_model(
                 device=device,
                 verbosity=-1,
             )
+
+        def _build_and_fit_lgb(device: str) -> Any:
+            fitted = _make_lgb(device)
             fitted.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
             return fitted
 
@@ -11770,12 +11796,34 @@ def _fit_crypto_lightgbm_model(
             "fallback_model": fallback,
             "training_cutoff": _crypto_training_cutoff(rows),
         }
-        _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
-        _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
-        model["probability_calibration"] = _fit_probability_calibration(
-            _lightgbm_predict_batch(_cal_rows, model, apply_calibration=False),
-            _cal_labels,
+        def _lgb_oof_fit_predict(train_idx: list[int], eval_idx: list[int]) -> list[float]:
+            fold_clf = _make_lgb(_lgb_device)
+            fold_clf.fit(
+                [raw_matrix[i] for i in train_idx],
+                [labels[i] for i in train_idx],
+                sample_weight=_crypto_training_sample_weights([rows[i] for i in train_idx], settings=settings),
+            )
+            return [float(value) for value in fold_clf.booster_.predict([raw_matrix[i] for i in eval_idx])]
+
+        # Out-of-fold isotonic calibrates on honest (non-memorized) predictions
+        # across the full set so the candidate's ECE reflects deployed behavior;
+        # single-holdout (last 15%) is the small-sample fallback.
+        oof_calibration = _fit_crypto_oof_probability_calibration(
+            labels,
+            fit_predict=_lgb_oof_fit_predict,
+            n_splits=_crypto_calibration_oof_splits(),
+            min_rows=2000,
         )
+        if oof_calibration is not None:
+            oof_calibration["scope"] = "out_of_fold"
+            model["probability_calibration"] = oof_calibration
+        else:
+            _cal_rows = rows[_cal_split_idx:] if _cal_split_idx < len(rows) else rows
+            _cal_labels = labels[_cal_split_idx:] if _cal_split_idx < len(labels) else labels
+            model["probability_calibration"] = _fit_probability_calibration(
+                _lightgbm_predict_batch(_cal_rows, model, apply_calibration=False),
+                _cal_labels,
+            )
         return {"name": "lightgbm_classifier", "status": "available", "model": model, "dependency_version": getattr(lgb, "__version__", None)}
     except Exception as exc:
         return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_fit_failed:{exc}", "dependency_version": _package_version("lightgbm")}
@@ -11800,6 +11848,66 @@ def _fit_probability_calibration(predictions: list[Decimal], labels: list[int]) 
         }
     except Exception:
         return None
+
+
+def _crypto_calibration_oof_splits() -> int:
+    """Number of out-of-fold calibration folds (env-tunable). 0 or 1 disables OOF
+    and falls back to single-holdout isotonic."""
+    try:
+        return int(os.environ.get("CRYPTO_CALIBRATION_OOF_SPLITS", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _fit_crypto_oof_probability_calibration(
+    labels: list[int],
+    *,
+    fit_predict: Callable[[list[int], list[int]], list[float]],
+    n_splits: int = 3,
+    min_rows: int = 2000,
+) -> dict[str, Any] | None:
+    """Cross-fitted isotonic calibration.
+
+    ``fit_predict(train_idx, eval_idx)`` must train a model on ``train_idx`` and
+    return raw (uncalibrated) probabilities for ``eval_idx``. The training rows
+    are partitioned into ``n_splits`` contiguous chronological folds; each fold is
+    scored by a model trained on the other folds, so every row gets an honest
+    out-of-fold prediction. The isotonic map is then fit on those OOF predictions
+    over the full set — unlike single-holdout calibration it sees the in-sample
+    over-confidence the deployed booster will exhibit, which is what was tripping
+    the ``ece_regressed_vs_market_mid`` selection guardrail.
+
+    Returns ``None`` (caller should fall back to single-holdout) when there is too
+    little data or a fold fails.
+    """
+    n = len(labels)
+    if n < max(12, int(min_rows)) or n_splits < 2 or len(set(labels)) < 2:
+        return None
+    fold_count = min(int(n_splits), n)
+    if fold_count < 2:
+        return None
+    # Contiguous chronological folds preserve the time ordering of the rows.
+    bounds = [round(i * n / fold_count) for i in range(fold_count + 1)]
+    oof: list[float | None] = [None] * n
+    for fold in range(fold_count):
+        start, end = bounds[fold], bounds[fold + 1]
+        if end <= start:
+            continue
+        eval_idx = list(range(start, end))
+        train_idx = [i for i in range(n) if i < start or i >= end]
+        if len(set(labels[i] for i in train_idx)) < 2:
+            return None
+        try:
+            preds = fit_predict(train_idx, eval_idx)
+        except Exception:
+            return None
+        if len(preds) != len(eval_idx):
+            return None
+        for i, prediction in zip(eval_idx, preds):
+            oof[i] = float(prediction)
+    if any(value is None for value in oof):
+        return None
+    return _fit_probability_calibration([Decimal(str(value)) for value in oof], labels)
 
 
 def _apply_probability_calibration(probability: Decimal, calibration: dict[str, Any] | None) -> Decimal:
