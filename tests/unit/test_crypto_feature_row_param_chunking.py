@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import pytest
 
-from kalshi_bot.db.repositories import _PG_MAX_BIND_PARAMS, _param_safe_chunk_size
+from kalshi_bot.db.models import CryptoTrainingFeatureRowRecord
+from kalshi_bot.db.repositories import _PG_MAX_BIND_PARAMS, _insert_bind_column_count, _param_safe_chunk_size
 
 
 def test_param_safe_chunk_size_caps_by_columns():
@@ -35,3 +36,15 @@ def test_param_safe_chunk_size_never_below_one():
 
 def test_pg_max_bind_params_under_asyncpg_ceiling():
     assert _PG_MAX_BIND_PARAMS <= 32767
+
+
+def test_feature_row_chunk_size_accounts_for_default_bind_columns():
+    payload_columns = {
+        col.name: object()
+        for col in CryptoTrainingFeatureRowRecord.__table__.columns
+        if col.name not in {"id", "created_at", "updated_at"}
+    }
+    bind_columns = _insert_bind_column_count(CryptoTrainingFeatureRowRecord, payload_columns)
+
+    assert bind_columns == len(CryptoTrainingFeatureRowRecord.__table__.columns)
+    assert _param_safe_chunk_size(2000, bind_columns) * bind_columns <= 32767

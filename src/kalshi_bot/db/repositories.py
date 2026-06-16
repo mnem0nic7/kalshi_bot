@@ -184,6 +184,13 @@ def _param_safe_chunk_size(requested_rows: int, num_columns: int) -> int:
     if num_columns <= 0:
         return max(1, requested_rows)
     return max(1, min(requested_rows, _PG_MAX_BIND_PARAMS // num_columns))
+
+
+def _insert_bind_column_count(record_type: type[Any], payload: dict[str, Any]) -> int:
+    """Estimate bound INSERT columns, including ORM-side default columns."""
+    return max(len(payload), len(record_type.__table__.columns))
+
+
 _CRYPTO_MARKET_ID_RE = re.compile(r"^KX([A-Z0-9]+)(15M|1H)-")
 
 
@@ -2950,7 +2957,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         conflict_keys = {"kalshi_env", "frequency", "row_id"}
         # A multi-row INSERT binds rows*columns params; cap the row-chunk so the
         # wide crypto-rich feature schema stays under asyncpg's 32767 ceiling.
-        chunk_size = _param_safe_chunk_size(chunk_size, len(prepared[0]))
+        # SQLAlchemy also binds Python-side defaults such as id/created_at/updated_at.
+        bind_columns = _insert_bind_column_count(CryptoTrainingFeatureRowRecord, prepared[0])
+        chunk_size = _param_safe_chunk_size(chunk_size, bind_columns)
         for start in range(0, len(prepared), chunk_size):
             chunk = prepared[start : start + chunk_size]
             if dialect == "postgresql":
