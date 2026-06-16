@@ -11640,6 +11640,7 @@ def _fit_crypto_xgboost_model(
         return {"name": "xgboost_classifier", "status": "unavailable", "reason": f"xgboost_unavailable:{exc}", "dependency_version": None}
     try:
         _xgb_requested = os.environ.get("CRYPTO_XGBOOST_DEVICE", "cpu").lower()
+        _xgb_n_jobs = int(os.environ.get("CRYPTO_XGBOOST_N_JOBS", "-1") or -1)
         _xgb_gpu_min_rows = int(os.environ.get("CRYPTO_GPU_MIN_ROWS", "20000") or 20000)
         _xgb_device, _xgb_downgrade = _resolve_tree_device(_xgb_requested, len(labels), gpu_min_rows=_xgb_gpu_min_rows)
         if _xgb_downgrade:
@@ -11664,7 +11665,7 @@ def _fit_crypto_xgboost_model(
                 reg_lambda=1.5,
                 eval_metric="logloss",
                 random_state=17,
-                n_jobs=-1,
+                n_jobs=_xgb_n_jobs,
                 **kwargs,
             )
             fitted.fit(raw_matrix[:_cal_split_idx], labels[:_cal_split_idx], sample_weight=_sample_weights)
@@ -11691,6 +11692,7 @@ def _fit_crypto_xgboost_model(
                 "random_state": 17,
                 "tree_method": "hist",
                 "device": _xgb_device,
+                "n_jobs": _xgb_n_jobs,
             },
             "feature_defaults": defaults,
             "fallback_model": fallback,

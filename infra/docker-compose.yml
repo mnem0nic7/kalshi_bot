@@ -569,6 +569,11 @@ services:
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
       CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
       CRYPTO_XGBOOST_DEVICE: cuda
+      # Keep per-asset candidate selection moving through the full 15m/1h
+      # rotation. Replay gates still enforce profitability before live use.
+      CRYPTO_XGBOOST_N_JOBS: "2"
+      CRYPTO_LIGHTGBM_N_JOBS: "2"
+      CRYPTO_MODEL_CANDIDATE_MAX_WALK_FORWARD_FOLDS: "2"
       # The build partitions a single asset BY MARKET across workers, but each
       # worker receives the dense spot window. Keep this conservative so the
       # trainer finishes under its 32g cgroup instead of stalling at the limit.

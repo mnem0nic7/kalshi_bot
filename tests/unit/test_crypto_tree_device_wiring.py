@@ -48,6 +48,15 @@ def test_xgboost_size_gate_downgrades_small_gpu_request_to_cpu(monkeypatch) -> N
     assert result["model"]["xgboost"]["device"] == "cpu"
 
 
+def test_xgboost_records_configured_n_jobs(monkeypatch) -> None:
+    monkeypatch.setenv("CRYPTO_XGBOOST_N_JOBS", "2")
+
+    result = _fit_crypto_model_candidates(_rows())["xgboost_classifier"]
+
+    assert result["status"] == "available", result.get("reason")
+    assert result["model"]["xgboost"]["n_jobs"] == 2
+
+
 def test_lightgbm_records_device_and_defaults_cpu(monkeypatch) -> None:
     monkeypatch.delenv("CRYPTO_LIGHTGBM_DEVICE", raising=False)
 
