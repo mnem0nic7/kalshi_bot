@@ -10007,6 +10007,14 @@ def _dedup_spot_rows_by_provider_preference(rows: list[CryptoSpotOHLCRecord]) ->
     return [best_by_key[key][1] for key in keys_in_order]
 
 
+def _spot_payload(row: CryptoSpotOHLCRecord) -> dict[str, Any]:
+    try:
+        payload = row.payload
+    except DetachedInstanceError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[str, Any]:
     """Precompute the decision-time-independent parts of _spot_context_for_decision.
 
@@ -10022,7 +10030,7 @@ def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[
     micro_prefix: list[int] = []
     last = -1
     for i, row in enumerate(clean):
-        payload = getattr(row, "payload", None)
+        payload = _spot_payload(row)
         if isinstance(payload, dict) and isinstance(payload.get("market_microstructure"), dict):
             last = i
         micro_prefix.append(last)
@@ -10112,8 +10120,7 @@ def _spot_context_for_decision(
             (
                 row
                 for row in reversed(eligible)
-                if isinstance(getattr(row, "payload", None), dict)
-                and isinstance(row.payload.get("market_microstructure"), dict)
+                if isinstance(_spot_payload(row).get("market_microstructure"), dict)
             ),
             None,
         )
@@ -10182,10 +10189,10 @@ def _spot_context_for_decision(
     if moneyness_pct is not None and volatility is not None and volatility > 0:
         target_distance_volatility = moneyness_pct / volatility
     kalshi_gap = mid_yes - spot_probability_proxy if spot_probability_proxy is not None else None
-    payload = current.payload if isinstance(current.payload, dict) else {}
+    payload = _spot_payload(current)
     microstructure = payload.get("market_microstructure") if isinstance(payload.get("market_microstructure"), dict) else {}
     if not microstructure and microstructure_row is not None:
-        microstructure = microstructure_row.payload.get("market_microstructure") or {}
+        microstructure = _spot_payload(microstructure_row).get("market_microstructure") or {}
     best_bid_ask = microstructure.get("best_bid_ask") if isinstance(microstructure.get("best_bid_ask"), dict) else {}
     latest_trade = microstructure.get("latest_trade") if isinstance(microstructure.get("latest_trade"), dict) else {}
     spot_exchange_bid = _optional_decimal(best_bid_ask.get("best_bid_dollars"))

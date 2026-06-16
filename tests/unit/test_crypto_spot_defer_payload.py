@@ -1,15 +1,28 @@
-"""The decision-row build never reads a spot row's JSON ``payload`` (only the
-structured OHLC/timestamp columns). During materialize the spot rows are loaded
-once and then broadcast (pickled) to every parallel build worker, so carrying the
-payload bloats both the parent and each worker copy; it OOMed the 32g trainer
-even at 2 workers. ``_list_crypto_spot_rows_with_cross_assets`` must be able to
-defer the payload so the broadcast stays lean.
+"""During materialize the spot rows are loaded once and then broadcast (pickled)
+to every parallel build worker. Carrying every JSON payload bloats both the
+parent and each worker copy; it OOMed the 32g trainer even at 2 workers.
+``_list_crypto_spot_rows_with_cross_assets`` must be able to defer the payload,
+and the optional payload-backed microstructure features must tolerate that.
 """
 from __future__ import annotations
 
-import pytest
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
-from kalshi_bot.crypto.services import _list_crypto_spot_rows_with_cross_assets
+import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import defer
+
+from kalshi_bot.config import Settings
+from kalshi_bot.crypto.services import (
+    _list_crypto_spot_rows_with_cross_assets,
+    _prepare_spot_context_series,
+    _spot_context_for_decision,
+)
+from kalshi_bot.db.models import CryptoSpotOHLCRecord
+from kalshi_bot.db.session import create_engine, create_session_factory, init_models
+
+NOW = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
 
 
 class _RecordingRepo:
@@ -50,3 +63,60 @@ async def test_cross_asset_spot_loader_defaults_payload_loaded():
         limit=1000,
     )
     assert all(call.get("defer_payload") is False for call in repo.calls)
+
+
+async def _session_factory(tmp_path):
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/spot_payload.db")
+    engine = create_engine(settings)
+    await init_models(engine)
+    return create_session_factory(engine)
+
+
+@pytest.mark.asyncio
+async def test_prepared_spot_context_tolerates_deferred_detached_payload(tmp_path):
+    session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            CryptoSpotOHLCRecord(
+                kalshi_env="production",
+                provider="coinbase",
+                asset_symbol="BTC",
+                quote_currency="USD",
+                frequency="15m",
+                interval_seconds=900,
+                start_ts=NOW - timedelta(minutes=15),
+                end_ts=NOW,
+                open_dollars=Decimal("70000"),
+                high_dollars=Decimal("70100"),
+                low_dollars=Decimal("69900"),
+                close_dollars=Decimal("70050"),
+                volume=Decimal("1"),
+                source_kind="spot_ohlc",
+                observed_at=NOW,
+                payload={
+                    "market_microstructure": {
+                        "best_bid_ask": {"best_bid_dollars": "70049.00"},
+                        "recent_trade_count": 12,
+                    }
+                },
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        stmt = select(CryptoSpotOHLCRecord).options(defer(CryptoSpotOHLCRecord.payload))
+        rows = list((await session.execute(stmt)).scalars())
+
+    prepared = _prepare_spot_context_series(rows)
+    context = _spot_context_for_decision(
+        rows,
+        decision_ts=NOW + timedelta(minutes=1),
+        target_price=Decimal("70000"),
+        mid_yes=Decimal("0.50"),
+        prepared=prepared,
+    )
+
+    assert context["spot_feature_status"] == "available"
+    assert context["spot_close_dollars"] == Decimal("70050")
+    assert context["spot_exchange_bid_dollars"] is None
+    assert context["spot_exchange_recent_trade_count"] is None
