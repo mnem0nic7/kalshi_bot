@@ -3649,7 +3649,7 @@ class CryptoTrainingBackfillService:
                 ops_since_commit = 0
 
         for row in spot_rows:
-            payload = row.payload if isinstance(row.payload, dict) else {}
+            payload = _spot_payload(row)
             microstructure = payload.get("market_microstructure") if isinstance(payload.get("market_microstructure"), dict) else {}
             best_bid_ask = microstructure.get("best_bid_ask") if isinstance(microstructure.get("best_bid_ask"), dict) else {}
             if best_bid_ask:

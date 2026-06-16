@@ -15,6 +15,7 @@ from sqlalchemy.orm import defer
 
 from kalshi_bot.config import Settings
 from kalshi_bot.crypto.services import (
+    CryptoTrainingBackfillService,
     _list_crypto_spot_rows_with_cross_assets,
     _prepare_spot_context_series,
     _spot_context_for_decision,
@@ -32,6 +33,24 @@ class _RecordingRepo:
     async def list_crypto_spot_ohlc(self, **kwargs):
         self.calls.append(kwargs)
         return []
+
+
+class _NoopSession:
+    async def commit(self):
+        raise AssertionError("no microstructure rows should be committed")
+
+    async def rollback(self):
+        raise AssertionError("no rollback should be needed")
+
+
+class _NoopMicrostructureRepo:
+    session = _NoopSession()
+
+    async def upsert_crypto_order_book_snapshot(self, **kwargs):
+        raise AssertionError("deferred payload should skip order book upserts")
+
+    async def upsert_crypto_trade_tick(self, **kwargs):
+        raise AssertionError("deferred payload should skip trade tick upserts")
 
 
 @pytest.mark.asyncio
@@ -120,3 +139,50 @@ async def test_prepared_spot_context_tolerates_deferred_detached_payload(tmp_pat
     assert context["spot_close_dollars"] == Decimal("70050")
     assert context["spot_exchange_bid_dollars"] is None
     assert context["spot_exchange_recent_trade_count"] is None
+
+
+@pytest.mark.asyncio
+async def test_microstructure_materialize_tolerates_deferred_detached_payload(tmp_path):
+    session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            CryptoSpotOHLCRecord(
+                kalshi_env="production",
+                provider="coinbase",
+                asset_symbol="BTC",
+                quote_currency="USD",
+                frequency="15m",
+                interval_seconds=900,
+                start_ts=NOW - timedelta(minutes=15),
+                end_ts=NOW,
+                open_dollars=Decimal("70000"),
+                high_dollars=Decimal("70100"),
+                low_dollars=Decimal("69900"),
+                close_dollars=Decimal("70050"),
+                volume=Decimal("1"),
+                source_kind="spot_ohlc",
+                observed_at=NOW,
+                payload={
+                    "market_microstructure": {
+                        "best_bid_ask": {"best_bid_dollars": "70049.00"},
+                        "recent_trades": [{"trade_id": "t1", "price": "70050"}],
+                    }
+                },
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        stmt = select(CryptoSpotOHLCRecord).options(defer(CryptoSpotOHLCRecord.payload))
+        rows = list((await session.execute(stmt)).scalars())
+
+    service = CryptoTrainingBackfillService(
+        settings=Settings(kalshi_env="production"),
+        session_factory=object(),
+        history_service=object(),
+    )
+    await service._materialize_spot_microstructure(
+        _NoopMicrostructureRepo(),
+        rows,
+        frequency="15m",
+    )
