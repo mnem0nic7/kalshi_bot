@@ -572,12 +572,13 @@ services:
       # One asset at a time: no asset-level parallelism needed. Keep build workers
       # low so the per-asset (incremental) materialize stays well under mem_limit.
       CRYPTO_TRAIN_BUILD_WORKERS: "2"
-      # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. The per-asset
-      # first pass is a full_cold_cache rebuild (existing feature rows are an older
-      # schema => watermark=None); 180d makes that rebuild + microstructure backfill
-      # take many hours and never finish. 45d keeps a tractable one-time catch-up;
-      # subsequent incremental passes keep the window current.
-      CRYPTO_TRAIN_LOOKBACK_DAYS: "45"
+      # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. One-asset-at-a-time
+      # training uses the SERIAL decision-row build (the asset-parallel path needs
+      # >1 asset), single-threaded and slow on densified 60s spot data: a 45d
+      # full_cold_cache rebuild ran 3h+ on one core without finishing. 10d keeps the
+      # one-time serial rebuild tractable; incremental passes then stay cheap.
+      # (Raising the window needs an intra-asset-parallel build, not just config.)
+      CRYPTO_TRAIN_LOOKBACK_DAYS: "10"
       # Triple-guard: a trainer must never place orders.
       CRYPTO_AUTONOMY_ENABLED: "false"
       CRYPTO_TRADING_ENABLED: "false"
