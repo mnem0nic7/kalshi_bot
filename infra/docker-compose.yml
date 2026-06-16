@@ -580,12 +580,12 @@ services:
       # trainer finishes under its 32g cgroup instead of stalling at the limit.
       CRYPTO_TRAIN_BUILD_WORKERS: "2"
       # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. One-asset-at-a-time
-      # training uses the SERIAL decision-row build (the asset-parallel path needs
-      # >1 asset), single-threaded and slow on densified 60s spot data: a 45d
-      # full_cold_cache rebuild ran 3h+ on one core without finishing. 10d keeps the
-      # one-time serial rebuild tractable; incremental passes then stay cheap.
-      # (Raising the window needs an intra-asset-parallel build, not just config.)
-      CRYPTO_TRAIN_LOOKBACK_DAYS: "10"
+      # training uses the SERIAL model-fit/replay pass per asset. Even after
+      # incremental materialization, a 10d BTC feature-store fit holds ~155k rows
+      # and stalls the 15m/1h rotation. 3d keeps fresh per-asset windows large
+      # enough for replay gates while letting the trainer cycle all assets.
+      # (Raising the window needs faster per-asset model selection, not just config.)
+      CRYPTO_TRAIN_LOOKBACK_DAYS: "3"
       # Triple-guard: a trainer must never place orders.
       CRYPTO_AUTONOMY_ENABLED: "false"
       CRYPTO_TRADING_ENABLED: "false"
