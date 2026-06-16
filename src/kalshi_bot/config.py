@@ -223,6 +223,12 @@ class Settings(BaseSettings):
     crypto_train_incremental_max_gap_hours: int = 168
     crypto_train_incremental_label_refresh_hours: int = 24
     crypto_train_build_workers: int = 1  # 1 = serial (today); >1 = ProcessPool over assets (trainer only)
+    # Populate orderbook microstructure features (spot_exchange_spread_bps,
+    # recent_trade_count, exchange bid/ask) during the build. Loads the spot
+    # payload (vs defer) and compacts it to the microstructure scalars before
+    # the worker broadcast so it stays memory-safe. Off by default; enable on
+    # the trainer where the model needs signal the market mid does not price.
+    crypto_train_microstructure_features_enabled: bool = False
     # Balance training sample weights so each market contributes equally
     # regardless of how many 15s snapshot rows it produced (~60 rows/market).
     crypto_train_market_balanced_weights: bool = True
