@@ -565,7 +565,9 @@ services:
       # rather than loading raw snapshots + cross-asset spot into memory.
       CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "false"
       CRYPTO_CONTINUOUS_TRAIN_ENABLED: "true"
+      CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m,1h"
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
+      CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
       CRYPTO_XGBOOST_DEVICE: cuda
       # One asset at a time: no asset-level parallelism needed. Keep build workers
       # low so the per-asset (incremental) materialize stays well under mem_limit.
