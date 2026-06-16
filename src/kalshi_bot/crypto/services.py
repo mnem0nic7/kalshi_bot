@@ -12534,8 +12534,18 @@ def _crypto_model_candidate_report(
     full_candidate_status: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     min_train_rows = max(2, min(settings.crypto_min_training_samples, 20)) if settings is not None else max(2, min(len(rows) // 2, 20))
-    max_folds = max(0, int(settings.crypto_model_candidate_max_walk_forward_folds)) if settings is not None else 0
-    folds = _crypto_walk_forward_folds(rows, min_train_rows=min_train_rows, max_folds=max_folds or None)
+    max_folds = _crypto_model_candidate_report_max_folds(settings)
+    if max_folds == 0:
+        report = _crypto_in_sample_candidate_report(
+            rows,
+            full_candidate_status or _fit_crypto_model_candidates(rows, settings=settings),
+            settings=settings,
+            crypto_policy=crypto_policy,
+        )
+        report["status"] = "walk_forward_disabled"
+        report["reason"] = "crypto_model_candidate_report_max_walk_forward_folds=0"
+        return report
+    folds = _crypto_walk_forward_folds(rows, min_train_rows=min_train_rows, max_folds=max_folds)
     if not folds:
         report = _crypto_in_sample_candidate_report(
             rows,
@@ -12753,6 +12763,15 @@ def _metrics_for_candidate(entries: list[dict[str, Any]], name: str) -> dict[str
         if entry.get("name") == name and isinstance(entry.get("metrics"), dict):
             return entry["metrics"]
     return None
+
+
+def _crypto_model_candidate_report_max_folds(settings: Settings | None) -> int | None:
+    if settings is None:
+        return None
+    override = settings.crypto_model_candidate_report_max_walk_forward_folds
+    if override is not None:
+        return max(0, int(override))
+    return max(0, int(settings.crypto_model_candidate_max_walk_forward_folds))
 
 
 def _crypto_model_selection_usable(entry: dict[str, Any], *, allow_guardrail_failed: bool = False) -> bool:
@@ -13146,7 +13165,7 @@ def _crypto_oos_prediction_rows(
     folds = _crypto_walk_forward_folds(
         rows,
         min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)),
-        max_folds=max_folds or None,
+        max_folds=max_folds,
     )
     predicted_rows: list[dict[str, Any]] = []
     fold_summaries: list[dict[str, Any]] = []
@@ -13355,7 +13374,7 @@ def _evaluate_crypto_walk_forward(
     folds = _crypto_walk_forward_folds(
         rows,
         min_train_rows=max(2, min(settings.crypto_min_training_samples, 20)),
-        max_folds=max_folds or None,
+        max_folds=max_folds,
     )
     if not folds:
         empty_metrics = _crypto_model_metrics([], {}, settings=settings, crypto_policy=crypto_policy)
@@ -13706,6 +13725,8 @@ def _crypto_walk_forward_folds(
     min_train_rows: int,
     max_folds: int | None = None,
 ) -> list[dict[str, Any]]:
+    if max_folds is not None and max_folds <= 0:
+        return []
     ordered = sorted(rows, key=lambda row: (str(row.get("market_day")), row.get("decision_ts") or datetime.max.replace(tzinfo=UTC)))
     days = sorted({str(row["market_day"]) for row in ordered if row.get("market_day")})
     fold_days = days[-max_folds:] if max_folds is not None and max_folds > 0 else days

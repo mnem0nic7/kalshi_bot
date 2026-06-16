@@ -3735,6 +3735,47 @@ def test_crypto_candidate_registry_reports_optional_rich_models(tmp_path) -> Non
     assert names["lightgbm_classifier"]["status"] in {"available", "unavailable", "guardrail_failed"}
 
 
+def test_crypto_candidate_report_can_disable_walk_forward_without_replay_setting(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        crypto_min_training_samples=4,
+        crypto_model_candidate_max_walk_forward_folds=2,
+        crypto_model_candidate_report_max_walk_forward_folds=0,
+    )
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    rows = []
+    for day in range(4):
+        for idx, label in enumerate((1, 0)):
+            mid = Decimal("0.3500") if label else Decimal("0.6500")
+            rows.append(
+                {
+                    "row_id": f"disabled-row-{day}-{idx}",
+                    "market_ticker": f"KXBTC15M-DISABLED-{day}-{idx}",
+                    "asset_symbol": "BTC",
+                    "mid_yes_dollars": mid,
+                    "yes_bid_dollars": mid - Decimal("0.0100"),
+                    "yes_ask_dollars": mid + Decimal("0.0100"),
+                    "no_ask_dollars": Decimal("1.0000") - mid,
+                    "time_to_close_seconds": 300,
+                    "market_age_seconds": 600,
+                    "spread_bps": 200,
+                    "quote_source": "snapshot_quotes",
+                    "strict_trade_eligible": True,
+                    "label_yes": label,
+                    "decision_ts": base + timedelta(days=day, minutes=idx),
+                    "settlement_ts": base + timedelta(days=day, minutes=idx + 15),
+                    "market_day": (base + timedelta(days=day)).date().isoformat(),
+                }
+            )
+
+    report = _crypto_model_candidate_report(rows, settings=settings)
+
+    assert report["status"] == "walk_forward_disabled"
+    assert report["reason"] == "crypto_model_candidate_report_max_walk_forward_folds=0"
+    assert report["selection_scope"] == "in_sample_training_fallback"
+    assert report["fold_count"] == 0
+
+
 def test_crypto_candidate_registry_reports_static_spot_distance_contrarian_profit(tmp_path) -> None:
     settings = _settings(
         tmp_path,
@@ -6148,6 +6189,21 @@ def test_crypto_replay_limit_preserves_prior_market_day_for_oos() -> None:
     assert counts == {"2026-06-05": 25, "2026-06-06": 25}
     assert len(folds) == 1
     assert folds[0]["train_cutoff_market_day"] == "2026-06-06"
+
+
+def test_crypto_walk_forward_zero_max_folds_disables_folds() -> None:
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    rows = [
+        {
+            "market_ticker": f"KXBTC15M-ZERO-{day}-{idx}",
+            "market_day": (base + timedelta(days=day)).date().isoformat(),
+            "decision_ts": base + timedelta(days=day, minutes=idx),
+        }
+        for day in range(4)
+        for idx in range(4)
+    ]
+
+    assert _crypto_walk_forward_folds(rows, min_train_rows=4, max_folds=0) == []
 
 
 def test_crypto_replay_candidate_selection_does_not_require_empirical_bucket_maturity(tmp_path) -> None:

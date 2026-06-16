@@ -574,6 +574,7 @@ services:
       CRYPTO_XGBOOST_N_JOBS: "2"
       CRYPTO_LIGHTGBM_N_JOBS: "2"
       CRYPTO_MODEL_CANDIDATE_MAX_WALK_FORWARD_FOLDS: "2"
+      CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "0"
       # The build partitions a single asset BY MARKET across workers, but each
       # worker receives the dense spot window. Keep this conservative so the
       # trainer finishes under its 32g cgroup instead of stalling at the limit.
