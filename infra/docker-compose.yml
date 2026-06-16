@@ -575,6 +575,8 @@ services:
       CRYPTO_LIGHTGBM_N_JOBS: "2"
       CRYPTO_MODEL_CANDIDATE_MAX_WALK_FORWARD_FOLDS: "2"
       CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "0"
+      CRYPTO_CONTINUOUS_TRAIN_REPLAY_DAYS: "10"
+      CRYPTO_CONTINUOUS_TRAIN_REPLAY_LIMIT: "80000"
       # The build partitions a single asset BY MARKET across workers, but each
       # worker receives the dense spot window. Keep this conservative so the
       # trainer finishes under its 32g cgroup instead of stalling at the limit.

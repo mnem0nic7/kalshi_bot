@@ -1407,7 +1407,21 @@ class DaemonService:
             use_feature_store=bool(preflight),
             feature_store_only=bool(preflight),
         )
-        await self.crypto_replay_service.run(frequency=frequency, asset_symbols=[asset])
+        replay_days = max(0, int(self.settings.crypto_continuous_train_replay_days))
+        replay_limit = max(0, int(self.settings.crypto_continuous_train_replay_limit))
+        logger.info(
+            "crypto_continuous_train replay asset=%s freq=%s days=%s limit=%s",
+            asset,
+            frequency,
+            replay_days or None,
+            replay_limit or None,
+        )
+        await self.crypto_replay_service.run(
+            frequency=frequency,
+            asset_symbols=[asset],
+            days=replay_days or None,
+            limit=replay_limit or None,
+        )
         await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=[asset])
         return "refreshed"
 

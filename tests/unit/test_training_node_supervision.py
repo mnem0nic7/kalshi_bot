@@ -117,6 +117,37 @@ class _MakeTaskStub:
     _make_training_node_task = DaemonService._make_training_node_task
 
 
+class _AsyncCallRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        return {"status": "ok"}
+
+
+class _ContinuousTrainStub:
+    def __init__(self) -> None:
+        self.settings = SimpleNamespace(
+            crypto_training_preflight_enabled=False,
+            crypto_continuous_train_replay_days=10,
+            crypto_continuous_train_replay_limit=80_000,
+        )
+        self.crypto_training_backfill_service = None
+        self.crypto_spot_service = None
+        self.crypto_history_service = SimpleNamespace(
+            collect_settled=_AsyncCallRecorder(),
+            bootstrap=_AsyncCallRecorder(),
+        )
+        self.crypto_forecast_service = SimpleNamespace(train=_AsyncCallRecorder())
+        self.crypto_replay_service = SimpleNamespace(
+            run=_AsyncCallRecorder(),
+            gate=_AsyncCallRecorder(),
+        )
+
+    _train_one_crypto_asset = DaemonService._train_one_crypto_asset
+
+
 def test_make_training_node_task_heartbeat_returns_coroutine() -> None:
     stub = _MakeTaskStub()
     coro = stub._make_training_node_task("heartbeat")
@@ -135,6 +166,31 @@ def test_make_training_node_task_unknown_raises() -> None:
     stub = _MakeTaskStub()
     with pytest.raises(ValueError, match="unknown training-node task"):
         stub._make_training_node_task("bogus_task")
+
+
+@pytest.mark.asyncio
+async def test_continuous_train_bounds_per_asset_replay() -> None:
+    stub = _ContinuousTrainStub()
+
+    status = await stub._train_one_crypto_asset(frequency="15m", asset="BTC")
+
+    assert status == "refreshed"
+    assert stub.crypto_forecast_service.train.calls[-1] == {
+        "frequency": "15m",
+        "asset_symbols": ["BTC"],
+        "use_feature_store": False,
+        "feature_store_only": False,
+    }
+    assert stub.crypto_replay_service.run.calls[-1] == {
+        "frequency": "15m",
+        "asset_symbols": ["BTC"],
+        "days": 10,
+        "limit": 80_000,
+    }
+    assert stub.crypto_replay_service.gate.calls[-1] == {
+        "frequency": "15m",
+        "asset_symbols": ["BTC"],
+    }
 
 
 # ---------------------------------------------------------------------------
