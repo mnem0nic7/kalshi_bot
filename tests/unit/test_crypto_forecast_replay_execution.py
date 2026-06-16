@@ -1763,6 +1763,14 @@ def test_settled_label_duration_guard_requires_hour_duration_for_1h() -> None:
         open_time=now,
         close_time=now + timedelta(days=1),
     )
+    hourly_event_listing = _market(
+        market_ticker="KXBTCD-26JUN1617-T75249.99",
+        series_ticker="KXBTCD",
+        event_ticker="KXBTCD-26JUN1617",
+        frequency="1h",
+        open_time=now - timedelta(hours=12),
+        close_time=now + timedelta(hours=13),
+    )
     fifteen = _market(
         frequency="15m",
         open_time=None,
@@ -1772,6 +1780,7 @@ def test_settled_label_duration_guard_requires_hour_duration_for_1h() -> None:
     assert _settled_label_matches_requested_duration(hourly, "1h") is True
     assert _settled_label_matches_requested_duration(missing_open, "1h") is False
     assert _settled_label_matches_requested_duration(daily, "1h") is False
+    assert _settled_label_matches_requested_duration(hourly_event_listing, "1h") is True
     assert _settled_label_matches_requested_duration(fifteen, "15m") is True
 
 
@@ -2059,6 +2068,25 @@ async def test_1h_snapshot_queries_exclude_daily_duration_rows(tmp_path) -> None
             observed_at=now - timedelta(minutes=1),
             source_kind="live_quote_evidence",
         )
+        await repo.record_crypto_market_snapshot(
+            kalshi_env=settings.kalshi_env,
+            series_ticker="KXBTCD",
+            market_ticker="KXBTCD-26JUN1617-T75249.99",
+            event_ticker="KXBTCD-26JUN1617",
+            asset_symbol="BTC",
+            frequency="1h",
+            status="active",
+            open_time=daily_open,
+            close_time=daily_close,
+            target_price_dollars=Decimal("100000.00000000"),
+            yes_bid_dollars=Decimal("0.4500"),
+            yes_ask_dollars=Decimal("0.4700"),
+            no_bid_dollars=Decimal("0.5300"),
+            no_ask_dollars=Decimal("0.5500"),
+            settlement_result="yes",
+            observed_at=now - timedelta(seconds=30),
+            source_kind="live_quote_evidence",
+        )
         latest = await repo.list_latest_crypto_market_snapshots(
             frequency="1h",
             kalshi_env=settings.kalshi_env,
@@ -2079,9 +2107,13 @@ async def test_1h_snapshot_queries_exclude_daily_duration_rows(tmp_path) -> None
         )
         await session.commit()
 
-    assert {row.market_ticker for row in all_frequency_rows} == {"KXBTCD-DAILY", "KXBTCD-HOURLY"}
-    assert [row.market_ticker for row in latest] == ["KXBTCD-HOURLY"]
-    assert [row.market_ticker for row in live_quotes] == ["KXBTCD-HOURLY"]
+    assert {row.market_ticker for row in all_frequency_rows} == {
+        "KXBTCD-DAILY",
+        "KXBTCD-HOURLY",
+        "KXBTCD-26JUN1617-T75249.99",
+    }
+    assert [row.market_ticker for row in latest] == ["KXBTCD-26JUN1617-T75249.99", "KXBTCD-HOURLY"]
+    assert {row.market_ticker for row in live_quotes} == {"KXBTCD-26JUN1617-T75249.99", "KXBTCD-HOURLY"}
     await engine.dispose()
 
 
@@ -8996,6 +9028,68 @@ def test_crypto_autonomy_selector_blocks_1h_final_five_minutes_by_default(tmp_pa
 
     assert one_hour_selected == []
     assert one_hour_skipped[0]["reason"] == "too_close_to_close"
+
+
+@pytest.mark.asyncio
+async def test_crypto_autonomy_run_once_uses_current_close_window_for_hourly(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        app_shadow_mode=True,
+        crypto_autonomy_enabled=True,
+    )
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    await init_models(engine)
+    asset_control = CryptoAssetControlService(settings=settings, session_factory=session_factory)
+    async with session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
+        await repo.ensure_deployment_control(
+            settings.app_color,
+            kalshi_env=settings.kalshi_env,
+            initial_active_color=settings.app_color,
+            initial_kill_switch_enabled=False,
+        )
+        await session.commit()
+
+    class _FakeKalshi:
+        write_credentials = None
+
+    class _FakeMarketService:
+        kalshi = _FakeKalshi()
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def discover_markets(self, **kwargs) -> list[CryptoMarket]:
+            self.calls.append(dict(kwargs))
+            return []
+
+        async def create_room_for_market(self, market_ticker: str, *, reason: str) -> dict[str, object]:
+            raise AssertionError("no markets should be created")
+
+    class _FakeWorkflowService:
+        async def run_room(self, room_id: str, *, reason: str) -> None:
+            raise AssertionError("no rooms should run")
+
+    market_service = _FakeMarketService()
+    result = await CryptoAutonomyService(
+        settings=settings,
+        session_factory=session_factory,
+        market_service=market_service,  # type: ignore[arg-type]
+        asset_control_service=asset_control,
+        workflow_service=_FakeWorkflowService(),  # type: ignore[arg-type]
+    ).run_once(frequency="1h")
+
+    assert result["status"] == "ok"
+    assert market_service.calls
+    call = market_service.calls[0]
+    assert call["frequency"] == "1h"
+    assert call["status"] is None
+    assert call["persist"] is True
+    assert call["asset_symbols"] is None
+    assert call["min_close_time"] is not None
+    assert call["max_close_time"] is not None
+    await engine.dispose()
 
 
 def test_crypto_autonomy_cycle_ops_payload_groups_asset_skip_reasons() -> None:

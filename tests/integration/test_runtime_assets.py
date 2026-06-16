@@ -117,9 +117,10 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert 'assets="$${CRYPTO_CURRENT_1H_ASSETS:-$${PRODUCTION_CRYPTO_CURRENT_1H_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}}"' in compose_text
     assert 'CRYPTO_1H_TOUCH20_ASSET_SETTINGS: "${PRODUCTION_CRYPTO_1H_TOUCH20_ASSET_SETTINGS:-{}}"' in compose_text
     assert "CRYPTO_1H_TOUCH20_RULES_ASSETS: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}" in compose_text
-    assert 'settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-0}"' in compose_text
+    assert 'settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-120}"' in compose_text
+    assert '&& (( cycle % settled_every == 0 )); then' in compose_text
     assert '--days "$${CRYPTO_1H_CURRENT_SETTLED_DAYS:-2}"' in compose_text
-    assert 'sleep "$${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-0}"' in compose_text
+    assert 'sleep "$${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-30}"' in compose_text
     assert "PRODUCTION_CRYPTO_CURRENT_1H_ASSETS=BTC,HYPE,ETH,BNB,SOL,DOGE,XRP" in env_lines
     assert "crypto_non_model_1h_touch20_production:" in compose_text
     assert "--frequency 1h" in compose_text
@@ -128,7 +129,8 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert "crypto-non-model-touch20 replay" in compose_text
     assert "crypto-non-model-touch20 gate" in compose_text
     assert "CRYPTO_CURRENT_15M_INTERVAL_SECONDS: ${CRYPTO_CURRENT_15M_INTERVAL_SECONDS:-0}" in compose_text
-    assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS: ${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-0}" in compose_text
+    assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS: ${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-30}" in compose_text
+    assert "CRYPTO_ORDERBOOK_COLLECT_ENABLED: ${CRYPTO_1H_CURRENT_ORDERBOOK_COLLECT_ENABLED:-false}" in compose_text
     assert "CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS: ${CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS:-0}" in compose_text
     assert "CRYPTO_1H_TOUCH20_LOOP_INTERVAL_SECONDS: ${CRYPTO_1H_TOUCH20_LOOP_INTERVAL_SECONDS:-0}" in compose_text
     assert "CRYPTO_TRADING_ENABLED: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED:-false}" in compose_text
@@ -141,9 +143,10 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER=true" in env_lines
     assert "ENABLE_CRYPTO_1H_TOUCH20_CONTAINER=false" in env_lines
     assert "CRYPTO_CURRENT_15M_INTERVAL_SECONDS=0" in env_lines
-    assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS=0" in env_lines
-    assert "CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=20" in env_lines
+    assert "CRYPTO_1H_CURRENT_INTERVAL_SECONDS=30" in env_lines
+    assert "CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES=120" in env_lines
     assert "CRYPTO_1H_CURRENT_SETTLED_DAYS=2" in env_lines
+    assert "CRYPTO_1H_CURRENT_ORDERBOOK_COLLECT_ENABLED=false" in env_lines
     assert "CRYPTO_1H_CURRENT_REPLAY_GATE_ENABLED=false" in env_lines
     assert "CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED=true" in env_lines
     assert "CRYPTO_BTC15M_TOUCH20_LOOP_INTERVAL_SECONDS=0" in env_lines

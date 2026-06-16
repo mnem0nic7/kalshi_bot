@@ -777,8 +777,8 @@ services:
             --json; then
             echo "1h current spot collection failed" >&2
           fi
-          settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-0}"
-          if [[ "$$settled_every" =~ ^[0-9]+$ ]] && (( settled_every > 0 )) && { (( cycle == 1 )) || (( cycle % settled_every == 0 )); }; then
+          settled_every="$${CRYPTO_1H_CURRENT_SETTLED_EVERY_CYCLES:-120}"
+          if [[ "$$settled_every" =~ ^[0-9]+$ ]] && (( settled_every > 0 )) && (( cycle % settled_every == 0 )); then
             settled_label_args=""
             if [[ "$${CRYPTO_1H_CURRENT_SETTLED_LABEL_PROPAGATION_ENABLED:-false}" != "true" ]]; then
               settled_label_args="--skip-label-propagation"
@@ -822,7 +822,7 @@ services:
               fi
             done
           fi
-          sleep "$${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-0}"
+          sleep "$${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-30}"
         done
     environment:
       <<: *production-env
@@ -867,7 +867,8 @@ services:
       CRYPTO_1H_TOUCH20_RULES_ASSETS: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}
       CRYPTO_1H_TOUCH20_ASSET_SETTINGS: "${PRODUCTION_CRYPTO_1H_TOUCH20_ASSET_SETTINGS:-{}}"
       CRYPTO_CURRENT_1H_ASSETS: ${PRODUCTION_CRYPTO_CURRENT_1H_ASSETS:-}
-      CRYPTO_1H_CURRENT_INTERVAL_SECONDS: ${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-0}
+      CRYPTO_1H_CURRENT_INTERVAL_SECONDS: ${CRYPTO_1H_CURRENT_INTERVAL_SECONDS:-30}
+      CRYPTO_ORDERBOOK_COLLECT_ENABLED: ${CRYPTO_1H_CURRENT_ORDERBOOK_COLLECT_ENABLED:-false}
 
   crypto_non_model_btc15m_touch20_production:
     <<: *production-daemon-base

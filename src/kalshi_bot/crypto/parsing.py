@@ -100,6 +100,7 @@ def parse_crypto_market(
     if not series_ticker:
         series_ticker = _series_from_market_ticker(ticker)
     asset = series.asset_symbol if series is not None else asset_symbol_from_series(series_ticker)
+    event_ticker = str(market.get("event_ticker") or "").strip()
     open_time = parse_datetime(market.get("open_time") or market.get("open_ts"))
     close_time = parse_datetime(market.get("close_time") or market.get("close_ts"))
     expected_expiration_time = parse_datetime(
@@ -109,17 +110,33 @@ def parse_crypto_market(
     )
     requested_frequency = normalize_frequency(frequency)
     series_frequency = normalize_frequency(series.frequency if series is not None else market.get("frequency"))
+    ticker_frequency = (
+        _frequency_from_ticker(ticker)
+        or _frequency_from_ticker(event_ticker)
+        or _frequency_from_ticker(series_ticker)
+    )
     duration_frequency = _frequency_from_duration(open_time, close_time)
     if series is not None and requested_frequency in {"15m", "1h"} and open_time is not None and close_time is not None:
         if duration_frequency != requested_frequency:
-            return None
-    normalized = (
-        duration_frequency
-        or series_frequency
-        or _frequency_from_ticker(series_ticker)
-        or requested_frequency
-        or "15m"
-    )
+            hourly_listing_window = (
+                requested_frequency == "1h"
+                and duration_frequency == "1d"
+                and (series_frequency == "1h" or ticker_frequency == "1h")
+            )
+            if not hourly_listing_window:
+                return None
+    if requested_frequency == "1h" and (series_frequency == "1h" or ticker_frequency == "1h"):
+        normalized = "1h"
+    elif requested_frequency == "15m" and (series_frequency == "15m" or ticker_frequency == "15m"):
+        normalized = "15m"
+    else:
+        normalized = (
+            duration_frequency
+            or series_frequency
+            or ticker_frequency
+            or requested_frequency
+            or "15m"
+        )
     return CryptoMarket(
         market_ticker=ticker,
         series_ticker=series_ticker,
@@ -298,6 +315,8 @@ def _frequency_from_ticker(ticker: str) -> str | None:
     if "15M" in upper:
         return "15m"
     if upper.endswith("1H"):
+        return "1h"
+    if re.match(r"^KX[A-Z0-9]+D?-\d{2}[A-Z]{3}\d{4}(?:-|$)", upper):
         return "1h"
     return None
 

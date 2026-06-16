@@ -148,6 +148,8 @@ if [[ "${target_env}" == "all" || "${target_env}" == "production" ]]; then
   fi
   export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"
   export CRYPTO_1H_CURRENT_APP_COLOR="${production_active_color}"
+  export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"
+  export CRYPTO_1H_TOUCH20_APP_COLOR="${production_active_color}"
 fi
 
 if [[ ("${target_env}" == "all" || "${target_env}" == "production") && "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
@@ -159,6 +161,11 @@ if [[ ("${target_env}" == "all" || "${target_env}" == "production") && "${ENABLE
   docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
     crypto_current_1h_production
   wait_for_service_health crypto_current_1h_production 60
+fi
+if [[ ("${target_env}" == "all" || "${target_env}" == "production") && "${ENABLE_CRYPTO_1H_TOUCH20_CONTAINER:-false}" == "true" ]]; then
+  docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build --no-deps \
+    crypto_non_model_1h_touch20_production
+  wait_for_service_health crypto_non_model_1h_touch20_production 60
 fi
 
 infra/scripts/sync-web-color.sh "${target_env}"

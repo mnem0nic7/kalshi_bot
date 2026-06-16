@@ -101,6 +101,39 @@ def test_crypto_market_parser_infers_hourly_duration_and_ignores_title_dates() -
     assert market.target_price_dollars == Decimal("105000.00000000")
 
 
+def test_crypto_market_parser_accepts_hourly_d_suffix_listing_window() -> None:
+    series = parse_crypto_series(
+        {"ticker": "KXBTCD", "title": "Bitcoin hourly", "category": "Crypto", "frequency": "hourly"},
+        frequency="1h",
+    )
+
+    market = parse_crypto_market(
+        {
+            "ticker": "KXBTCD-26JUN1617-T75249.99",
+            "event_ticker": "KXBTCD-26JUN1617",
+            "series_ticker": "KXBTCD",
+            "floor_strike": 75249.99,
+            "open_time": "2026-06-15T20:00:00Z",
+            "close_time": "2026-06-16T21:00:00Z",
+            "expected_expiration_time": "2026-06-16T21:05:00Z",
+            "yes_bid_dollars": "0.0000",
+            "yes_ask_dollars": "0.0100",
+            "no_bid_dollars": "0.9900",
+            "no_ask_dollars": "1.0000",
+            "status": "active",
+        },
+        series=series,
+        frequency="1h",
+    )
+
+    assert market is not None
+    assert market.asset_symbol == "BTC"
+    assert market.frequency == "1h"
+    assert market.status == "active"
+    assert market.yes_ask_dollars == Decimal("0.0100")
+    assert market.target_price_dollars == Decimal("75249.99000000")
+
+
 def test_crypto_market_parser_rejects_weekly_range_for_requested_hourly_series() -> None:
     series = parse_crypto_series(
         {"ticker": "KXBTC", "title": "Bitcoin range", "category": "Crypto", "frequency": "hourly"},

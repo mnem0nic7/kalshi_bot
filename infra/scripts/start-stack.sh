@@ -114,6 +114,8 @@ if [[ "${production_active_color}" != "blue" && "${production_active_color}" != 
 fi
 export CRYPTO_CURRENT_APP_COLOR="${production_active_color}"
 export CRYPTO_1H_CURRENT_APP_COLOR="${production_active_color}"
+export CRYPTO_BTC15M_TOUCH20_APP_COLOR="${production_active_color}"
+export CRYPTO_1H_TOUCH20_APP_COLOR="${production_active_color}"
 runtime_services=(
   app_demo_blue app_demo_green
   app_production_blue app_production_green
@@ -136,6 +138,9 @@ fi
 if [[ "${ENABLE_CRYPTO_CURRENT_1H_CONTAINER:-false}" == "true" ]]; then
   runtime_services+=(crypto_current_1h_production)
 fi
+if [[ "${ENABLE_CRYPTO_1H_TOUCH20_CONTAINER:-false}" == "true" ]]; then
+  runtime_services+=(crypto_non_model_1h_touch20_production)
+fi
 docker compose -f "${compose_file}" ${compose_env_file} up -d --no-build \
   "${runtime_services[@]}"
 wait_for_services_health 180 \
@@ -145,6 +150,9 @@ if [[ "${ENABLE_CRYPTO_CURRENT_CONTAINER:-true}" == "true" ]]; then
 fi
 if [[ "${ENABLE_CRYPTO_CURRENT_1H_CONTAINER:-false}" == "true" ]]; then
   wait_for_service_health crypto_current_1h_production 60
+fi
+if [[ "${ENABLE_CRYPTO_1H_TOUCH20_CONTAINER:-false}" == "true" ]]; then
+  wait_for_service_health crypto_non_model_1h_touch20_production 60
 fi
 infra/scripts/sync-web-color.sh all
 # Stop and remove caddy explicitly before recreating to avoid Docker compose

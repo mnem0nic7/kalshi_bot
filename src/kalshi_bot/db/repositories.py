@@ -192,11 +192,34 @@ def _insert_bind_column_count(record_type: type[Any], payload: dict[str, Any]) -
 
 
 _CRYPTO_MARKET_ID_RE = re.compile(r"^KX([A-Z0-9]+)(15M|1H)-")
+_CRYPTO_HOURLY_EVENT_TICKER_RE = re.compile(r"^KX[A-Z0-9]+D?-\d{2}[A-Z]{3}\d{4}(?:-|$)")
+_CRYPTO_HOURLY_LISTING_WINDOW_SECONDS = (80000, 90000)
 
 
 def _crypto_frequency_duration_bounds(frequency: str | None) -> tuple[int, int] | None:
     frequency_key = str(frequency or "").strip().lower()
     return {"1h": (3000, 4200), "hourly": (3000, 4200)}.get(frequency_key)
+
+
+def _crypto_frequency_allows_hourly_event_listing(frequency: str | None) -> bool:
+    frequency_key = str(frequency or "").strip().lower()
+    return frequency_key in {"1h", "hourly"}
+
+
+def _crypto_snapshot_has_hourly_event_ticker(row: Any) -> bool:
+    for attr in ("market_ticker", "event_ticker"):
+        value = str(getattr(row, attr, "") or "").upper()
+        if _CRYPTO_HOURLY_EVENT_TICKER_RE.match(value):
+            return True
+    return False
+
+
+def _crypto_snapshot_matches_hourly_event_listing(row: Any, frequency: str | None, seconds: float) -> bool:
+    return (
+        _crypto_frequency_allows_hourly_event_listing(frequency)
+        and _CRYPTO_HOURLY_LISTING_WINDOW_SECONDS[0] <= seconds <= _CRYPTO_HOURLY_LISTING_WINDOW_SECONDS[1]
+        and _crypto_snapshot_has_hourly_event_ticker(row)
+    )
 
 
 def _crypto_snapshot_matches_frequency_duration(row: Any, frequency: str | None) -> bool:
@@ -208,7 +231,47 @@ def _crypto_snapshot_matches_frequency_duration(row: Any, frequency: str | None)
     if open_time is None or close_time is None:
         return True
     seconds = (close_time - open_time).total_seconds()
-    return duration_bounds[0] <= seconds <= duration_bounds[1]
+    return (
+        duration_bounds[0] <= seconds <= duration_bounds[1]
+        or _crypto_snapshot_matches_hourly_event_listing(row, frequency, seconds)
+    )
+
+
+def _crypto_hourly_event_listing_condition(duration_seconds: Any) -> Any:
+    return and_(
+        duration_seconds.between(*_CRYPTO_HOURLY_LISTING_WINDOW_SECONDS),
+        or_(
+            CryptoMarketSnapshotRecord.market_ticker.op("~")(_CRYPTO_HOURLY_EVENT_TICKER_RE.pattern),
+            CryptoMarketSnapshotRecord.event_ticker.op("~")(_CRYPTO_HOURLY_EVENT_TICKER_RE.pattern),
+        ),
+    )
+
+
+def _crypto_snapshot_duration_sql(prefix: str = "") -> str:
+    field = f"{prefix}." if prefix else ""
+    duration_expr = f"EXTRACT(EPOCH FROM ({field}close_time - {field}open_time))"
+    return f"""
+    (
+        {field}open_time IS NULL
+        OR {field}close_time IS NULL
+        OR {duration_expr} BETWEEN :duration_min AND :duration_max
+        OR (
+            {duration_expr} BETWEEN :hourly_event_listing_duration_min AND :hourly_event_listing_duration_max
+            AND (
+                {field}market_ticker ~ :hourly_event_ticker_regex
+                OR COALESCE({field}event_ticker, '') ~ :hourly_event_ticker_regex
+            )
+        )
+    )
+    """
+
+
+def _set_crypto_duration_sql_params(params: dict[str, Any], duration_bounds: tuple[int, int]) -> None:
+    params["duration_min"] = duration_bounds[0]
+    params["duration_max"] = duration_bounds[1]
+    params["hourly_event_listing_duration_min"] = _CRYPTO_HOURLY_LISTING_WINDOW_SECONDS[0]
+    params["hourly_event_listing_duration_max"] = _CRYPTO_HOURLY_LISTING_WINDOW_SECONDS[1]
+    params["hourly_event_ticker_regex"] = _CRYPTO_HOURLY_EVENT_TICKER_RE.pattern
 
 
 def _crypto_snapshot_duration_condition(frequency: str | None) -> Any | None:
@@ -219,11 +282,14 @@ def _crypto_snapshot_duration_condition(frequency: str | None) -> Any | None:
         "epoch",
         CryptoMarketSnapshotRecord.close_time - CryptoMarketSnapshotRecord.open_time,
     )
-    return or_(
+    conditions = [
         CryptoMarketSnapshotRecord.open_time.is_(None),
         CryptoMarketSnapshotRecord.close_time.is_(None),
         duration_seconds.between(*duration_bounds),
-    )
+    ]
+    if _crypto_frequency_allows_hourly_event_listing(frequency):
+        conditions.append(_crypto_hourly_event_listing_condition(duration_seconds))
+    return or_(*conditions)
 
 
 def _is_crypto_market_ticker(market_ticker: str | None) -> bool:
@@ -1444,6 +1510,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 python_duration_filter = True
                 stmt = select(
                     CryptoMarketSnapshotRecord.market_ticker,
+                    CryptoMarketSnapshotRecord.event_ticker,
                     CryptoMarketSnapshotRecord.open_time,
                     CryptoMarketSnapshotRecord.close_time,
                 ).where(
@@ -1465,7 +1532,12 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         seen: set[str] = set()
         for row in rows:
             if python_duration_filter and not _crypto_snapshot_matches_frequency_duration(
-                SimpleNamespace(open_time=row.open_time, close_time=row.close_time),
+                SimpleNamespace(
+                    market_ticker=row.market_ticker,
+                    event_ticker=getattr(row, "event_ticker", None),
+                    open_time=row.open_time,
+                    close_time=row.close_time,
+                ),
                 frequency,
             ):
                 continue
@@ -1814,18 +1886,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
         row_limit = max(1, int(limit or 200000))
         bind = self.session.get_bind()
-        frequency_key = str(frequency or "").strip().lower()
-        duration_bounds = {"1h": (3000, 4200), "hourly": (3000, 4200)}.get(frequency_key)
+        duration_bounds = _crypto_frequency_duration_bounds(frequency)
 
         def _matches_requested_duration(row: Any) -> bool:
-            if duration_bounds is None:
-                return True
-            open_time = getattr(row, "open_time", None)
-            close_time = getattr(row, "close_time", None)
-            if open_time is None or close_time is None:
-                return True
-            seconds = (close_time - open_time).total_seconds()
-            return duration_bounds[0] <= seconds <= duration_bounds[1]
+            return _crypto_snapshot_matches_frequency_duration(row, frequency)
 
         def _merge_quote_path_rows(direct_rows: list[Any], fallback_rows: list[Any]) -> list[Any]:
             merged: list[Any] = []
@@ -1873,18 +1937,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             direct_conditions.append(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             direct_conditions.append(CryptoMarketSnapshotRecord.observed_at >= since)
-        if duration_bounds is not None and bind is not None and bind.dialect.name == "postgresql":
-            duration_seconds = func.extract(
-                "epoch",
-                CryptoMarketSnapshotRecord.close_time - CryptoMarketSnapshotRecord.open_time,
-            )
-            direct_conditions.append(
-                or_(
-                    CryptoMarketSnapshotRecord.open_time.is_(None),
-                    CryptoMarketSnapshotRecord.close_time.is_(None),
-                    duration_seconds.between(*duration_bounds),
-                )
-            )
+        duration_condition = _crypto_snapshot_duration_condition(frequency)
+        if duration_condition is not None and bind is not None and bind.dialect.name == "postgresql":
+            direct_conditions.append(duration_condition)
         entry_seconds = max(0, int(entry_min_seconds_to_close or 0))
         if entry_seconds > 0 and bind is not None and bind.dialect.name == "postgresql" and include_joined_fallback:
             from sqlalchemy import text as sql_text
@@ -1941,35 +1996,10 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 snapshot_where.append("snapshot.observed_at >= :since")
                 params["since"] = since
             if duration_bounds is not None:
-                label_where.append(
-                    """
-                    (
-                        label.open_time IS NULL
-                        OR label.close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (label.close_time - label.open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                entry_where.append(
-                    """
-                    (
-                        entry.open_time IS NULL
-                        OR entry.close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (entry.close_time - entry.open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                snapshot_where.append(
-                    """
-                    (
-                        snapshot.open_time IS NULL
-                        OR snapshot.close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (snapshot.close_time - snapshot.open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                params["duration_min"] = duration_bounds[0]
-                params["duration_max"] = duration_bounds[1]
+                label_where.append(_crypto_snapshot_duration_sql("label"))
+                entry_where.append(_crypto_snapshot_duration_sql("entry"))
+                snapshot_where.append(_crypto_snapshot_duration_sql("snapshot"))
+                _set_crypto_duration_sql_params(params, duration_bounds)
             raw = sql_text(
                 f"""
                 WITH label_candidates AS (
@@ -2106,26 +2136,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 snapshot_where.append("snapshot.observed_at >= :since")
                 params["since"] = since
             if duration_bounds is not None:
-                entry_where.append(
-                    """
-                    (
-                        open_time IS NULL
-                        OR close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                snapshot_where.append(
-                    """
-                    (
-                        snapshot.open_time IS NULL
-                        OR snapshot.close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (snapshot.close_time - snapshot.open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                params["duration_min"] = duration_bounds[0]
-                params["duration_max"] = duration_bounds[1]
+                entry_where.append(_crypto_snapshot_duration_sql())
+                snapshot_where.append(_crypto_snapshot_duration_sql("snapshot"))
+                _set_crypto_duration_sql_params(params, duration_bounds)
             raw = sql_text(
                 f"""
                 WITH entry_rows AS (
@@ -2241,26 +2254,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
                 snapshot_where.append("snapshot.observed_at >= :since")
                 params["since"] = since
             if duration_bounds is not None:
-                label_where.append(
-                    """
-                    (
-                        open_time IS NULL
-                        OR close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (close_time - open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                snapshot_where.append(
-                    """
-                    (
-                        snapshot.open_time IS NULL
-                        OR snapshot.close_time IS NULL
-                        OR EXTRACT(EPOCH FROM (snapshot.close_time - snapshot.open_time)) BETWEEN :duration_min AND :duration_max
-                    )
-                    """
-                )
-                params["duration_min"] = duration_bounds[0]
-                params["duration_max"] = duration_bounds[1]
+                label_where.append(_crypto_snapshot_duration_sql())
+                snapshot_where.append(_crypto_snapshot_duration_sql("snapshot"))
+                _set_crypto_duration_sql_params(params, duration_bounds)
             raw = sql_text(
                 f"""
                 WITH labels AS (

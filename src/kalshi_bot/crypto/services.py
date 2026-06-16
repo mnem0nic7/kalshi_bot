@@ -6622,12 +6622,22 @@ class CryptoAutonomyService:
                 "app_color": self.settings.app_color,
             }
 
-        discovered = await self.market_service.discover_markets(
-            frequency=freq,
-            status="open",
-            persist=True,
-            asset_symbols=sorted(requested_assets) or None,
-        )
+        discovery_kwargs: dict[str, Any] = {
+            "frequency": freq,
+            "status": "open",
+            "persist": True,
+            "asset_symbols": sorted(requested_assets) or None,
+        }
+        if freq == "1h":
+            observed_at = datetime.now(UTC)
+            discovery_kwargs.update(
+                {
+                    "status": None,
+                    "min_close_time": observed_at - timedelta(minutes=1),
+                    "max_close_time": observed_at + timedelta(hours=1, minutes=5),
+                }
+            )
+        discovered = await self.market_service.discover_markets(**discovery_kwargs)
         if requested_assets:
             discovered = [market for market in discovered if normalize_asset_symbol(market.asset_symbol) in requested_assets]
         created: list[dict[str, Any]] = []
