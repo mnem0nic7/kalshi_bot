@@ -6191,6 +6191,28 @@ def test_crypto_replay_limit_preserves_prior_market_day_for_oos() -> None:
     assert folds[0]["train_cutoff_market_day"] == "2026-06-06"
 
 
+def test_crypto_replay_limit_preserves_market_coverage_before_extra_rows() -> None:
+    rows: list[dict[str, object]] = []
+    base = datetime.fromisoformat("2026-06-05T00:00:00+00:00")
+    for market_index in range(600):
+        day = "2026-06-05" if market_index < 300 else "2026-06-06"
+        for row_index in range(100):
+            rows.append(
+                {
+                    "market_day": day,
+                    "decision_ts": base + timedelta(minutes=(market_index * 100) + row_index),
+                    "market_ticker": f"KXBTC15M-{market_index:04d}",
+                }
+            )
+
+    limited = _crypto_limit_replay_rows_for_oos(rows, limit=20_000)  # type: ignore[arg-type]
+    market_counts = Counter(str(row.get("market_ticker")) for row in limited)
+
+    assert len(limited) == 20_000
+    assert len(market_counts) == 600
+    assert min(market_counts.values()) >= 1
+
+
 def test_crypto_walk_forward_zero_max_folds_disables_folds() -> None:
     base = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     rows = [

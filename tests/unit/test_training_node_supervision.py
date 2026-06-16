@@ -131,7 +131,7 @@ class _ContinuousTrainStub:
         self.settings = SimpleNamespace(
             crypto_training_preflight_enabled=False,
             crypto_continuous_train_replay_days=10,
-            crypto_continuous_train_replay_limit=80_000,
+            crypto_continuous_train_replay_limit=40_000,
         )
         self.crypto_training_backfill_service = None
         self.crypto_spot_service = None
@@ -185,7 +185,7 @@ async def test_continuous_train_bounds_per_asset_replay() -> None:
         "frequency": "15m",
         "asset_symbols": ["BTC"],
         "days": 10,
-        "limit": 80_000,
+        "limit": 40_000,
     }
     assert stub.crypto_replay_service.gate.calls[-1] == {
         "frequency": "15m",

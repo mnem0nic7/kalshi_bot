@@ -13751,6 +13751,32 @@ def _crypto_limit_replay_rows_for_oos(rows: list[dict[str, Any]], *, limit: int 
     if limit is None or limit <= 0 or len(rows) <= limit:
         return list(rows)
     ordered = sorted(rows, key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))))
+    by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    no_market_rows: list[dict[str, Any]] = []
+    for row in ordered:
+        market_ticker = str(row.get("market_ticker") or "").strip()
+        if market_ticker:
+            by_market[market_ticker].append(row)
+        else:
+            no_market_rows.append(row)
+    if 0 < len(by_market) <= limit:
+        per_market_quota = max(1, limit // len(by_market))
+        selected: list[dict[str, Any]] = []
+        overflow: list[dict[str, Any]] = []
+        for market_rows in by_market.values():
+            selected.extend(market_rows[-per_market_quota:])
+            overflow.extend(market_rows[:-per_market_quota])
+        remaining = limit - len(selected)
+        if remaining > 0:
+            fill_rows = sorted(
+                [*overflow, *no_market_rows],
+                key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))),
+            )
+            selected.extend(fill_rows[-remaining:])
+        return sorted(
+            selected[:limit],
+            key=lambda row: (row.get("decision_ts") or datetime.max.replace(tzinfo=UTC), str(row.get("market_ticker"))),
+        )
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
     no_day_rows: list[dict[str, Any]] = []
     for row in ordered:

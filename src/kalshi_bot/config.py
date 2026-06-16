@@ -595,7 +595,7 @@ class Settings(BaseSettings):
     crypto_continuous_train_assets: str = ""
     crypto_continuous_train_frequencies: str = "15m"
     crypto_continuous_train_replay_days: int = 10
-    crypto_continuous_train_replay_limit: int = 80_000
+    crypto_continuous_train_replay_limit: int = 40_000
     # Optional pause between assets (0 = train back-to-back).
     crypto_continuous_train_idle_seconds: int = 0
     risk_max_order_count_fp: float = 500.0
