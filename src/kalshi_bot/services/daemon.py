@@ -1109,7 +1109,7 @@ class DaemonService:
                 await self.crypto_autonomy_service.run_once(frequency="1h")
             except Exception:
                 logger.warning("crypto autonomy 1h loop error", exc_info=True)
-            await asyncio.sleep(0)
+            await asyncio.sleep(idle_interval)
 
     async def _periodic_crypto_autonomy_asset_loop(self, asset_symbol: str) -> None:
         """Per-asset 15m autonomy loop — each asset runs independently so no asset blocks another."""
@@ -1125,7 +1125,7 @@ class DaemonService:
                 await self.crypto_autonomy_service.run_once(frequency="15m", asset_symbols=[asset_symbol])
             except Exception:
                 logger.warning("crypto autonomy 15m loop error asset=%s", asset_symbol, exc_info=True)
-            await asyncio.sleep(0)
+            await asyncio.sleep(idle_interval)
 
     async def _periodic_crypto_history_loop(self) -> None:
         while True:

@@ -316,9 +316,8 @@ class Settings(BaseSettings):
     # assets trade. It NEVER enables live orders — execution stays gated by
     # asset_mode==LIVE / live-eligibility checks. Default off (safe).
     crypto_shadow_evidence_always_enabled: bool = False
-    # Sleep interval for idle/inactive-color states only. The active-color loop
-    # runs continuously (asyncio.sleep(0) between iterations) so this value has
-    # no effect on trading cadence.
+    # Sleep interval between crypto autonomy passes. This keeps active-color
+    # loops from flooding Kalshi/API/DB when no market clears the entry gates.
     crypto_autonomy_idle_interval_seconds: int = 5
     crypto_autonomy_min_seconds_to_close: int = 0
     # Per-frequency override: minimum time-to-close for 1h markets.

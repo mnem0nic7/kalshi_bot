@@ -769,7 +769,7 @@ async def test_crypto_spot_current_loop_collects_immediately_for_active_color(tm
 
 
 @pytest.mark.asyncio
-async def test_crypto_autonomy_loop_runs_next_pass_as_soon_as_previous_finishes(tmp_path) -> None:
+async def test_crypto_autonomy_loop_throttles_after_pass(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/daemon-crypto-autonomy-continuous.db",
         kalshi_env="production",
@@ -779,7 +779,8 @@ async def test_crypto_autonomy_loop_runs_next_pass_as_soon_as_previous_finishes(
         daemon_heartbeat_interval_seconds=60,
         daemon_startup_grace_seconds=0,
         daemon_startup_jitter_seconds=0,
-        crypto_autonomy_interval_seconds=30,
+        crypto_auto_frequencies="1h",
+        crypto_autonomy_idle_interval_seconds=1,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -813,13 +814,15 @@ async def test_crypto_autonomy_loop_runs_next_pass_as_soon_as_previous_finishes(
 
     task = asyncio.create_task(daemon._periodic_crypto_autonomy_loop())
     try:
-        await asyncio.wait_for(autonomy_service.second_started.wait(), timeout=1)
+        await asyncio.wait_for(autonomy_service.first_finished.wait(), timeout=1)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(autonomy_service.second_started.wait(), timeout=0.05)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
     assert autonomy_service.overlapped is False
-    assert autonomy_service.run_once_calls[:2] == [{"frequency": "15m"}, {"frequency": "15m"}]
+    assert autonomy_service.run_once_calls == [{"frequency": "1h"}]
 
     await engine.dispose()
 
@@ -839,7 +842,7 @@ async def test_crypto_only_daemon_runs_crypto_loops_with_role_scoped_heartbeat(t
         crypto_auto_frequencies="1h",
         crypto_spot_current_auto_enabled=True,
         crypto_spot_current_interval_seconds=30,
-        crypto_autonomy_interval_seconds=30,
+        crypto_autonomy_idle_interval_seconds=1,
     )
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
@@ -899,7 +902,8 @@ async def test_crypto_only_daemon_runs_crypto_loops_with_role_scoped_heartbeat(t
     assert result["crypto_auto_frequencies"] == ["1h"]
     assert stream_service.calls == []
     assert reconciliation_service.calls == []
-    assert spot_service.collect_current_calls[:1] == [{"frequency": "1h"}]
+    assert spot_service.collect_current_calls
+    assert spot_service.collect_current_calls[0]["frequency"] == "1h"
     assert autonomy_service.run_once_calls
     assert all(call == {"frequency": "1h"} for call in autonomy_service.run_once_calls)
     assert role_checkpoint.payload["daemon_role"] == "crypto_1h"
