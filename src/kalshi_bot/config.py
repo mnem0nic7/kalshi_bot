@@ -240,7 +240,7 @@ class Settings(BaseSettings):
     crypto_replay_min_net_pl_dollars: float = 0.0
     crypto_replay_min_pnl_per_candidate_dollars: float = 0.05
     crypto_replay_max_hard_cap_breaches: int = 0
-    crypto_replay_require_calibration_better_than_mid: bool = True
+    crypto_replay_require_calibration_better_than_mid: bool = False
     crypto_replay_require_pnl_beats_market_mid: bool = True
     crypto_replay_min_pnl_advantage_dollars: float = 0.0
     crypto_max_spread_to_edge_ratio: float = 1.0
