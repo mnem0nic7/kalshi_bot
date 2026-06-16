@@ -138,6 +138,7 @@ def test_compose_declares_opt_in_crypto_1h_touch20_runtime() -> None:
     assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
     assert "PRODUCTION_CRYPTO_1H_TOUCH20_RULES_TRADING_ENABLED=false" in env_lines
     assert "PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_EVERY_CYCLES=0" in env_lines
+    assert "PRODUCTION_CRYPTO_1H_AUTONOMY_MIN_SECONDS_TO_CLOSE=300" in env_lines
     assert "CRYPTO_1H_TOUCH20_RULES_ENABLED=false" in env_lines
     assert "CRYPTO_1H_TOUCH20_BUCKET_TIME_BAND_MINUTES=15" in env_lines
     assert "ENABLE_CRYPTO_CURRENT_1H_CONTAINER=true" in env_lines

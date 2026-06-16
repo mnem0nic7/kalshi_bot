@@ -260,7 +260,7 @@ x-production-env: &production-env
   CRYPTO_1H_TOUCH20_REPLAY_GATE_DAYS: ${PRODUCTION_CRYPTO_1H_TOUCH20_REPLAY_GATE_DAYS:-30}
   CRYPTO_1H_TOUCH20_RULES_ASSETS: ${PRODUCTION_CRYPTO_1H_TOUCH20_RULES_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}
   CRYPTO_1H_TOUCH20_ASSET_SETTINGS: "${PRODUCTION_CRYPTO_1H_TOUCH20_ASSET_SETTINGS:-{}}"
-  CRYPTO_1H_AUTONOMY_MIN_SECONDS_TO_CLOSE: ${PRODUCTION_CRYPTO_1H_AUTONOMY_MIN_SECONDS_TO_CLOSE:-1200}
+  CRYPTO_1H_AUTONOMY_MIN_SECONDS_TO_CLOSE: ${PRODUCTION_CRYPTO_1H_AUTONOMY_MIN_SECONDS_TO_CLOSE:-300}
   CRYPTO_LIVE_MIN_MARKET_AGE_SECONDS: ${PRODUCTION_CRYPTO_LIVE_MIN_MARKET_AGE_SECONDS:-60}
   CRYPTO_TAKE_PROFIT_ENABLED: ${PRODUCTION_CRYPTO_TAKE_PROFIT_ENABLED:-false}
   CRYPTO_TAKE_PROFIT_FREQUENCIES: ${PRODUCTION_CRYPTO_TAKE_PROFIT_FREQUENCIES:-15m,1h}
@@ -586,6 +586,10 @@ services:
       CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "2"
       CRYPTO_CONTINUOUS_TRAIN_REPLAY_DAYS: "10"
       CRYPTO_CONTINUOUS_TRAIN_REPLAY_LIMIT: "40000"
+      # Populate orderbook microstructure features (the signal BTC-15m needs to
+      # beat mid). Loads spot payload then compacts to microstructure scalars
+      # before the worker broadcast (~35x smaller) so it stays under the cap.
+      CRYPTO_TRAIN_MICROSTRUCTURE_FEATURES_ENABLED: "true"
       # The build partitions a single asset BY MARKET across workers, but each
       # worker receives the dense spot window. Keep this conservative so the
       # trainer finishes under its 32g cgroup instead of stalling at the limit.
