@@ -715,16 +715,22 @@ async def _list_crypto_spot_rows_with_cross_assets(
     requested_assets: list[str] | None,
     since: datetime | None,
     limit: int,
+    defer_payload: bool = False,
 ) -> list[Any]:
     """Load the requested assets' spot rows under their own row budget, then the
     remaining cross-feature assets under a second budget, so widening the scope
-    for cross-asset returns can never truncate the primary asset's coverage."""
+    for cross-asset returns can never truncate the primary asset's coverage.
+
+    ``defer_payload`` skips the (build-unused) JSON payload column; the spot set
+    is broadcast/pickled to every parallel build worker, so dropping the payload
+    keeps both the parent and each worker copy lean."""
     primary = await repo.list_crypto_spot_ohlc(
         frequency=frequency,
         kalshi_env=kalshi_env,
         asset_symbols=requested_assets or None,
         since=since,
         limit=limit,
+        defer_payload=defer_payload,
     )
     requested = set(normalize_asset_symbols(requested_assets))
     if not requested:
@@ -738,6 +744,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
         asset_symbols=cross,
         since=since,
         limit=limit,
+        defer_payload=defer_payload,
     )
     return [*primary, *cross_rows]
 
@@ -3487,6 +3494,7 @@ class CryptoTrainingBackfillService:
                 requested_assets=requested_assets,
                 since=since,
                 limit=self.settings.crypto_train_max_spot_rows,
+                defer_payload=True,
             )
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
