@@ -168,7 +168,22 @@ _PENDING_BUY_ORDER_STATUSES = {"resting", "submitted", "accepted", "open", "pend
 # expands to one bind param per id, so the second-stage snapshot lookup must be
 # chunked well under that ceiling once the distinct-market count grows large.
 _CRYPTO_ID_IN_CHUNK_SIZE = 30000
+# Safe upper bound on bind params per statement (under asyncpg's hard 32767). A
+# multi-row INSERT uses rows*columns params, so a fixed row-chunk overflows on a
+# wide schema; callers cap rows = floor(limit / columns) via _param_safe_chunk_size.
+_PG_MAX_BIND_PARAMS = 32000
 _CRYPTO_MARKET_TICKER_RE = re.compile(r"^KX[A-Z0-9]+(?:15M|1H)-")
+
+
+def _param_safe_chunk_size(requested_rows: int, num_columns: int) -> int:
+    """Largest row-chunk whose rows*columns stays under the bind-param ceiling.
+
+    Returns ``min(requested_rows, floor(_PG_MAX_BIND_PARAMS / num_columns))``,
+    never below 1 so a single very wide row can still be written one at a time.
+    """
+    if num_columns <= 0:
+        return max(1, requested_rows)
+    return max(1, min(requested_rows, _PG_MAX_BIND_PARAMS // num_columns))
 _CRYPTO_MARKET_ID_RE = re.compile(r"^KX([A-Z0-9]+)(15M|1H)-")
 
 
@@ -2933,6 +2948,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         dialect = self.session.bind.dialect.name if self.session.bind is not None else ""
         written = 0
         conflict_keys = {"kalshi_env", "frequency", "row_id"}
+        # A multi-row INSERT binds rows*columns params; cap the row-chunk so the
+        # wide crypto-rich feature schema stays under asyncpg's 32767 ceiling.
+        chunk_size = _param_safe_chunk_size(chunk_size, len(prepared[0]))
         for start in range(0, len(prepared), chunk_size):
             chunk = prepared[start : start + chunk_size]
             if dialect == "postgresql":
