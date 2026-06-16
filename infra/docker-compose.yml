@@ -574,20 +574,24 @@ services:
       CRYPTO_XGBOOST_N_JOBS: "2"
       CRYPTO_LIGHTGBM_N_JOBS: "2"
       CRYPTO_MODEL_CANDIDATE_MAX_WALK_FORWARD_FOLDS: "2"
-      CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "0"
+      # Model-SELECTION candidate report now runs out-of-sample (was "0" =
+      # in-sample). In-sample selection made tree candidates look tail-
+      # overconfident (ECE flagged) and selected market-mid/asset-time fallbacks.
+      # 2 walk-forward folds give honest per-candidate ECE/P&L for selection.
+      CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "2"
       CRYPTO_CONTINUOUS_TRAIN_REPLAY_DAYS: "10"
       CRYPTO_CONTINUOUS_TRAIN_REPLAY_LIMIT: "40000"
       # The build partitions a single asset BY MARKET across workers, but each
       # worker receives the dense spot window. Keep this conservative so the
       # trainer finishes under its 32g cgroup instead of stalling at the limit.
       CRYPTO_TRAIN_BUILD_WORKERS: "2"
-      # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. One-asset-at-a-time
-      # training uses the SERIAL model-fit/replay pass per asset. Even after
-      # incremental materialization, a 10d BTC feature-store fit holds ~155k rows
-      # and stalls the 15m/1h rotation. 3d keeps fresh per-asset windows large
-      # enough for replay gates while letting the trainer cycle all assets.
-      # (Raising the window needs faster per-asset model selection, not just config.)
-      CRYPTO_TRAIN_LOOKBACK_DAYS: "3"
+      # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. Restored from 3d
+      # to 30d so candidate selection + the now-OOS report folds have a robust,
+      # multi-regime window (3d was too thin for trustworthy walk-forward folds).
+      # Compute now compounds: OOS report folds (2x) x OOF calibration (3 inner
+      # fits per tree) x ~10x rows. If the 15m/1h rotation stalls, dial back
+      # CRYPTO_TRAIN_LOOKBACK_DAYS, CRYPTO_CALIBRATION_OOF_SPLITS, or add workers.
+      CRYPTO_TRAIN_LOOKBACK_DAYS: "30"
       # Triple-guard: a trainer must never place orders.
       CRYPTO_AUTONOMY_ENABLED: "false"
       CRYPTO_TRADING_ENABLED: "false"
