@@ -568,6 +568,11 @@ services:
       CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m,1h"
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
       CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
+      CRYPTO_TRAINING_PREFLIGHT_SETTLED_DAYS: "10"
+      CRYPTO_TRAINING_PREFLIGHT_HISTORY_DAYS: "10"
+      CRYPTO_TRAINING_PREFLIGHT_SPOT_DAYS: "10"
+      CRYPTO_TRAIN_INCREMENTAL_WARMUP_HOURS: "264"
+      CRYPTO_TRAIN_INCREMENTAL_LABEL_REFRESH_HOURS: "240"
       CRYPTO_XGBOOST_DEVICE: cuda
       # Keep per-asset candidate selection moving through the full 15m/1h
       # rotation. Replay gates still enforce profitability before live use.
