@@ -569,9 +569,11 @@ services:
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
       CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
       CRYPTO_XGBOOST_DEVICE: cuda
-      # One asset at a time: no asset-level parallelism needed. Keep build workers
-      # low so the per-asset (incremental) materialize stays well under mem_limit.
-      CRYPTO_TRAIN_BUILD_WORKERS: "2"
+      # The build now partitions a single asset BY MARKET across workers (intra-asset
+      # parallelism), so one-asset-at-a-time training uses the dedicated cpuset
+      # (4-7,12-15 = 8 cores). 6 workers leaves headroom for the parent + bounds the
+      # per-worker spot broadcast under mem_limit.
+      CRYPTO_TRAIN_BUILD_WORKERS: "6"
       # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. One-asset-at-a-time
       # training uses the SERIAL decision-row build (the asset-parallel path needs
       # >1 asset), single-threaded and slow on densified 60s spot data: a 45d

@@ -9527,6 +9527,7 @@ def _crypto_decision_rows(
     *,
     funding_rate_rows: list[CryptoFundingRateRecord] | None = None,
     settings: Settings | None = None,
+    add_recent_asset_features: bool = True,
 ) -> list[dict[str, Any]]:
     candles_by_market: dict[str, list[CryptoMarketCandlestickRecord]] = defaultdict(list)
     for candle in candles:
@@ -9760,7 +9761,30 @@ def _crypto_decision_rows(
                     **_funding_rate_context_for_decision(funding_by_asset, snapshot.asset_symbol, decision_ts=decision_ts),
                 }
             )
-    return _crypto_add_recent_asset_features(rows)
+    # asset_recent_* features roll over an asset's prior rows across ALL its
+    # markets, so they must be computed on the full per-asset row set. The
+    # market-partitioned parallel build defers this to a single post-concat pass.
+    if add_recent_asset_features:
+        return _crypto_add_recent_asset_features(rows)
+    return rows
+
+
+def _balance_markets_into_bins(weighted: list[tuple[str, int]], max_bins: int) -> list[list[str]]:
+    """Greedy longest-processing-time partition of markets into <= ``max_bins``
+    bins, balancing total weight (snapshot count). Each market lands in exactly
+    one bin; empty bins are dropped. Deterministic (heaviest first, ties by key,
+    least-loaded bin by lowest index). Used to split one asset's per-market
+    decision-row build evenly across worker processes."""
+    if not weighted or max_bins <= 0:
+        return []
+    n_bins = min(max_bins, len(weighted))
+    bins: list[list[str]] = [[] for _ in range(n_bins)]
+    loads = [0] * n_bins
+    for key, weight in sorted(weighted, key=lambda kv: (-int(kv[1]), str(kv[0]))):
+        target = min(range(n_bins), key=lambda b: (loads[b], b))
+        bins[target].append(key)
+        loads[target] += int(weight)
+    return [b for b in bins if b]
 
 
 def _crypto_decision_rows_parallel(
@@ -9772,24 +9796,26 @@ def _crypto_decision_rows_parallel(
     workers: int,
     funding_rate_rows: list[CryptoFundingRateRecord] | None = None,
 ) -> list[dict[str, Any]]:
-    """Asset-partitioned parallel build.
+    """Market-partitioned parallel build.
 
-    workers<=1 (or a single asset in the dataset) delegates to the serial
-    `_crypto_decision_rows` unchanged. Otherwise: split snapshots and candles by
-    asset_symbol, broadcast ALL spot_rows + funding_rate_rows to each worker
-    (cross-asset spot features require the full set), run each asset's build in a
-    separate process, then concatenate. The output row set is identical to the
-    serial path (asserted by the parity test).
+    Decision rows are per-market independent (candles, prior-snapshot, settlement
+    join and the dedup ``seen`` set are all keyed by market_ticker; spot/funding
+    are broadcast per asset), so the build splits by MARKET across a process pool
+    and concatenates with an output row set identical to the serial path (asserted
+    by the parity tests). Partitioning by market (not asset) is what lets
+    one-asset-at-a-time training — the continuous trainer — use every core instead
+    of falling back to a single-threaded serial build.
+
+    ``workers<=1`` or a single market delegates to the serial
+    ``_crypto_decision_rows`` unchanged.
 
     NOTE on memory: ProcessPoolExecutor pickles every argument per submitted task,
     so the full spot_rows + funding_rate_rows are copied into each worker (~N
-    copies for N concurrent assets). On the dense 60s spot dataset this broadcast
-    is the dominant memory cost; the operator bounds it via
-    `crypto_train_build_workers`. The win holds because per-asset COMPUTE
-    dominates the pickle/transfer overhead.
+    copies for N bins). On the dense 60s spot dataset this broadcast is the
+    dominant memory cost; the operator bounds N via ``crypto_train_build_workers``.
+    The win holds because per-row COMPUTE dominates the pickle/transfer overhead.
     """
-    assets = sorted({str(s.asset_symbol) for s in snapshots})
-    if workers <= 1 or len(assets) <= 1:
+    if workers <= 1:
         return _crypto_decision_rows(
             snapshots,
             candles,
@@ -9798,39 +9824,60 @@ def _crypto_decision_rows_parallel(
             funding_rate_rows=funding_rate_rows,
         )
 
-    max_workers = min(workers, len(assets))
+    snapshots_by_market: dict[str, list[CryptoMarketSnapshotRecord]] = defaultdict(list)
+    for snap in snapshots:
+        snapshots_by_market[str(snap.market_ticker)].append(snap)
+    candles_by_market: dict[str, list[CryptoMarketCandlestickRecord]] = defaultdict(list)
+    for candle in candles:
+        candles_by_market[str(candle.market_ticker)].append(candle)
+
+    markets = list(snapshots_by_market.keys())
+    if len(markets) <= 1:
+        return _crypto_decision_rows(
+            snapshots,
+            candles,
+            spot_rows,
+            settings=settings,
+            funding_rate_rows=funding_rate_rows,
+        )
+
+    max_workers = min(workers, len(markets))
+    bins = _balance_markets_into_bins(
+        [(market, len(snapshots_by_market[market])) for market in markets],
+        max_workers,
+    )
     logger.info(
-        "crypto.parallel_build: assets=%d workers=%d spot_rows=%d funding_rows=%d",
-        len(assets),
+        "crypto.parallel_build: markets=%d bins=%d workers=%d spot_rows=%d funding_rows=%d",
+        len(markets),
+        len(bins),
         max_workers,
         len(spot_rows or []),
         len(funding_rate_rows or []),
     )
 
-    snapshots_by_asset: dict[str, list[CryptoMarketSnapshotRecord]] = defaultdict(list)
-    for snap in snapshots:
-        snapshots_by_asset[str(snap.asset_symbol)].append(snap)
-    candles_by_asset: dict[str, list[CryptoMarketCandlestickRecord]] = defaultdict(list)
-    for candle in candles:
-        candles_by_asset[str(candle.asset_symbol)].append(candle)
-
     rows: list[dict[str, Any]] = []
     _ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=_ctx) as pool:
-        futures = {
-            pool.submit(
-                _crypto_decision_rows,
-                snapshots_by_asset.get(asset, []),
-                candles_by_asset.get(asset, []),
-                spot_rows,
-                settings=settings,
-                funding_rate_rows=funding_rate_rows,
-            ): asset
-            for asset in assets
-        }
+        futures = []
+        for bin_markets in bins:
+            bin_snapshots = [snap for market in bin_markets for snap in snapshots_by_market[market]]
+            bin_candles = [candle for market in bin_markets for candle in candles_by_market.get(market, [])]
+            futures.append(
+                pool.submit(
+                    _crypto_decision_rows,
+                    bin_snapshots,
+                    bin_candles,
+                    spot_rows,
+                    settings=settings,
+                    funding_rate_rows=funding_rate_rows,
+                    # asset_recent_* features span markets; defer to one pass below.
+                    add_recent_asset_features=False,
+                )
+            )
         for future in concurrent.futures.as_completed(futures):
             rows.extend(future.result())
-    return rows
+    # Apply the per-asset rolling features once on the full row set (parity with serial).
+    return _crypto_add_recent_asset_features(rows)
 
 
 def _crypto_settlement_snapshots_by_market(
