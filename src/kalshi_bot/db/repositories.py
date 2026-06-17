@@ -173,6 +173,37 @@ _CRYPTO_ID_IN_CHUNK_SIZE = 30000
 # wide schema; callers cap rows = floor(limit / columns) via _param_safe_chunk_size.
 _PG_MAX_BIND_PARAMS = 32000
 _CRYPTO_MARKET_TICKER_RE = re.compile(r"^KX[A-Z0-9]+(?:15M|1H)-")
+# Rows fetched per batch when streaming spot OHLC under microstructure
+# projection — bounds the transient full-payload memory to chunk * ~8.7KB.
+_SPOT_MICROSTRUCTURE_STREAM_CHUNK = 5000
+
+
+def compact_spot_microstructure_payload(payload: Any) -> dict[str, Any]:
+    """Reduce a spot payload to ONLY the microstructure scalars the feature
+    builder reads (best_bid_ask + recent_trade_count).
+
+    The full spot payload (~8.7KB/row, dominated by the ~3.9KB recent_trades
+    array the model does not use) OOMs the trainer at 30d scale. Keeping just
+    best_bid_ask (orderbook bid/ask/mid/spread) and the trade *count* is a ~35x
+    shrink. Returns ``{}`` when there is no usable microstructure.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    micro = payload.get("market_microstructure")
+    if not isinstance(micro, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    best_bid_ask = micro.get("best_bid_ask")
+    if isinstance(best_bid_ask, dict) and best_bid_ask:
+        compact["best_bid_ask"] = best_bid_ask
+    trade_count = micro.get("recent_trade_count")
+    if trade_count is None and isinstance(micro.get("recent_trades"), list):
+        trade_count = len(micro["recent_trades"])
+    if trade_count is not None:
+        compact["recent_trade_count"] = trade_count
+    if not compact:
+        return {}
+    return {"market_microstructure": compact}
 
 
 def _param_safe_chunk_size(requested_rows: int, num_columns: int) -> int:
@@ -2811,6 +2842,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         until: datetime | None = None,
         limit: int = 1000,
         defer_payload: bool = False,
+        microstructure_projection: bool = False,
     ) -> list[CryptoSpotOHLCRecord]:
         stmt = select(CryptoSpotOHLCRecord).where(
             CryptoSpotOHLCRecord.kalshi_env == self._resolved_kalshi_env(kalshi_env)
@@ -2828,6 +2860,22 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts >= since)
         if until is not None:
             stmt = stmt.where(CryptoSpotOHLCRecord.end_ts <= until)
+        if microstructure_projection:
+            # Memory-safe: stream rows and compact each payload to the
+            # microstructure scalars as it arrives, so full payloads (~8.7KB
+            # each) never all coexist in memory. Each row is expunged BEFORE we
+            # rewrite its payload so the read path can never flush the compacted
+            # value back to the persisted row.
+            stmt = stmt.order_by(CryptoSpotOHLCRecord.end_ts.desc()).limit(limit)
+            stmt = stmt.execution_options(yield_per=_SPOT_MICROSTRUCTURE_STREAM_CHUNK)
+            rows: list[CryptoSpotOHLCRecord] = []
+            result = await self.session.stream_scalars(stmt)
+            async for record in result:
+                full_payload = record.payload
+                self.session.expunge(record)
+                record.payload = compact_spot_microstructure_payload(full_payload)
+                rows.append(record)
+            return rows
         if defer_payload:
             stmt = stmt.options(defer(CryptoSpotOHLCRecord.payload))
         stmt = stmt.order_by(CryptoSpotOHLCRecord.end_ts.desc()).limit(limit)

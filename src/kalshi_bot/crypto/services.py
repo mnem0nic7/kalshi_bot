@@ -66,7 +66,11 @@ from kalshi_bot.db.models import (
     Signal,
     TradeTicketRecord,
 )
-from kalshi_bot.db.repositories import PlatformRepository, _crypto_snapshot_matches_frequency_duration
+from kalshi_bot.db.repositories import (
+    PlatformRepository,
+    _crypto_snapshot_matches_frequency_duration,
+    compact_spot_microstructure_payload,
+)
 from kalshi_bot.integrations.crypto_spot import (
     COINGECKO_IDS,
     COINBASE_PRODUCT_IDS,
@@ -716,6 +720,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
     since: datetime | None,
     limit: int,
     defer_payload: bool = False,
+    microstructure_projection: bool = False,
 ) -> list[Any]:
     """Load the requested assets' spot rows under their own row budget, then the
     remaining cross-feature assets under a second budget, so widening the scope
@@ -723,7 +728,11 @@ async def _list_crypto_spot_rows_with_cross_assets(
 
     ``defer_payload`` skips the (build-unused) JSON payload column; the spot set
     is broadcast/pickled to every parallel build worker, so dropping the payload
-    keeps both the parent and each worker copy lean."""
+    keeps both the parent and each worker copy lean.
+
+    ``microstructure_projection`` instead streams the payload and compacts it to
+    the microstructure scalars at the DB layer (memory-safe), so the orderbook
+    features survive without loading full payloads."""
     primary = await repo.list_crypto_spot_ohlc(
         frequency=frequency,
         kalshi_env=kalshi_env,
@@ -731,6 +740,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
         since=since,
         limit=limit,
         defer_payload=defer_payload,
+        microstructure_projection=microstructure_projection,
     )
     requested = set(normalize_asset_symbols(requested_assets))
     if not requested:
@@ -745,6 +755,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
         since=since,
         limit=limit,
         defer_payload=defer_payload,
+        microstructure_projection=microstructure_projection,
     )
     return [*primary, *cross_rows]
 
@@ -3487,9 +3498,10 @@ class CryptoTrainingBackfillService:
                 limit=self.settings.crypto_train_max_candlesticks,
                 defer_payload=True,
             )
-            # When microstructure features are enabled we must load the spot
-            # payload (it carries best_bid_ask + recent_trade_count); otherwise
-            # defer it to keep the broadcast light.
+            # When microstructure features are enabled, stream the payload and
+            # compact it to microstructure scalars at the DB layer (memory-safe)
+            # so the orderbook/trade-count signal survives without loading full
+            # payloads; otherwise defer the payload entirely to keep it light.
             microstructure_features = bool(self.settings.crypto_train_microstructure_features_enabled)
             spot_rows = await _list_crypto_spot_rows_with_cross_assets(
                 repo,
@@ -3499,15 +3511,11 @@ class CryptoTrainingBackfillService:
                 since=since,
                 limit=self.settings.crypto_train_max_spot_rows,
                 defer_payload=not microstructure_features,
+                microstructure_projection=microstructure_features,
             )
         snapshots = _filter_crypto_snapshot_rows(snapshots, requested_assets)
         candles = _filter_crypto_snapshot_rows(candles, requested_assets)
         spot_rows = _filter_crypto_snapshot_rows(spot_rows, _crypto_spot_feature_asset_scope(requested_assets))
-        if microstructure_features:
-            # Compact the (now-loaded) payload to microstructure scalars before
-            # the parallel build broadcasts spot_rows to workers — ~35x smaller,
-            # so the orderbook/trade-count signal survives without OOM.
-            _compact_spot_rows_microstructure(spot_rows)
 
         # COMPUTE PHASE — pure in-memory; no DB connection held. Run in a thread
         # so the asyncio event loop is not blocked during the multi-hour CPU pass.
@@ -10034,42 +10042,10 @@ def _spot_payload(row: CryptoSpotOHLCRecord) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _compact_spot_microstructure_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
-    """Reduce a spot payload to ONLY the microstructure scalars the feature
-    builder needs (best_bid_ask + recent_trade_count).
-
-    The full payload (~8.7KB/row, dominated by the ~3.9KB ``recent_trades``
-    array) OOMs the trainer when broadcast to parallel build workers. The model
-    features only read ``best_bid_ask`` (orderbook bid/ask/mid/spread) and the
-    trade *count*, so we drop everything else (~35x shrink) and broadcast that.
-    Returns ``{}`` when there is no usable microstructure.
-    """
-    if not isinstance(payload, dict):
-        return {}
-    micro = payload.get("market_microstructure")
-    if not isinstance(micro, dict):
-        return {}
-    compact: dict[str, Any] = {}
-    best_bid_ask = micro.get("best_bid_ask")
-    if isinstance(best_bid_ask, dict) and best_bid_ask:
-        compact["best_bid_ask"] = best_bid_ask
-    trade_count = micro.get("recent_trade_count")
-    if trade_count is None and isinstance(micro.get("recent_trades"), list):
-        trade_count = len(micro["recent_trades"])
-    if trade_count is not None:
-        compact["recent_trade_count"] = trade_count
-    if not compact:
-        return {}
-    return {"market_microstructure": compact}
-
-
-def _compact_spot_rows_microstructure(spot_rows: list[CryptoSpotOHLCRecord]) -> None:
-    """In-place: replace each spot row's payload with its compacted
-    microstructure-only form so the parallel build broadcast stays memory-safe
-    while keeping the orderbook/trade-count signal alive. Rows are detached
-    (post-load), so assigning the column attribute does not trigger a flush."""
-    for row in spot_rows:
-        row.payload = _compact_spot_microstructure_payload(_spot_payload(row))
+# Canonical microstructure-payload compaction lives in the db layer (the
+# memory-safe streaming loader applies it during fetch). Re-exported here for the
+# in-memory feature-building paths and tests.
+_compact_spot_microstructure_payload = compact_spot_microstructure_payload
 
 
 def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[str, Any]:
