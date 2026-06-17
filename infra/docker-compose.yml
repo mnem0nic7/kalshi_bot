@@ -579,11 +579,13 @@ services:
       CRYPTO_XGBOOST_N_JOBS: "2"
       CRYPTO_LIGHTGBM_N_JOBS: "2"
       CRYPTO_MODEL_CANDIDATE_MAX_WALK_FORWARD_FOLDS: "2"
-      # Model-SELECTION candidate report now runs out-of-sample (was "0" =
-      # in-sample). In-sample selection made tree candidates look tail-
-      # overconfident (ECE flagged) and selected market-mid/asset-time fallbacks.
-      # 2 walk-forward folds give honest per-candidate ECE/P&L for selection.
-      CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "2"
+      # Model-SELECTION candidate report runs out-of-sample. 4 walk-forward folds
+      # (was 2) widen the OOS window so a champion must beat mid across more
+      # regimes — 2 folds let small-sample variance pass suspect winners (v11
+      # XRP/DOGE/HYPE). Pairs with the brier-regression deploy ceiling. Cost:
+      # serial build x 4 folds is slow; the real throughput fix is per-worker
+      # spot/snapshot partitioning to re-enable parallelism.
+      CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS: "4"
       CRYPTO_CONTINUOUS_TRAIN_REPLAY_DAYS: "10"
       CRYPTO_CONTINUOUS_TRAIN_REPLAY_LIMIT: "40000"
       # Populate orderbook microstructure features (the signal BTC-15m needs to
