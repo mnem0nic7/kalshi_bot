@@ -268,6 +268,19 @@ python -m kalshi_bot.cli crypto-maker-markout-report --kalshi-env production --f
 | `crypto-pnl-report --days 14` | Fee-accurate fill economics (gross/net/fees, wins/losses, by market and cell). |
 | `crypto-maker-markout-report --days 14` | Maker fill quality / adverse-selection markout. |
 | `crypto-vol-eval --frequency 15m` | Light, **training-free** OOS evaluation of the analytic `vol_normal_fair_value` strategy vs the market mid, after fees + live edge-shrinkage. Fits only the per-fold isotonic calibration (no tree models, no GPU), so the σ estimator and calibration can be iterated in seconds instead of behind the full candidate trainer. Reports vol vs mid Brier (`beats_mid_brier`), OOS net P&L, advantage vs mid, and trade count per asset. |
+| `crypto-mm run` | Runs the NON-TRADING market-making research loop (`src/kalshi_bot/mm/`) — the `crypto_mm_production` container's command. `crypto-mm collect-once` / `eval-once` run a single spine/eval pass for debugging. |
+
+### Market-making research stack knobs (`mm_*`, container `crypto_mm_production`)
+
+| Setting | Current default | Effect |
+| --- | ---: | --- |
+| `mm_enabled` | `False` | Master switch for the MM research stack (the container sets `MM_ENABLED=true`). |
+| `mm_data_dir` | `data/mm` | Data-spine output dir (container mounts the `mm_data` volume at `/app/data/mm`). |
+| `mm_frequency` | `15m` | Market frequency the loop logs/evaluates. |
+| `mm_eval_interval_seconds` | `900` | How often the loop runs the vol fair-value OOS eval between spine-logging ticks. |
+| `mm_idle_seconds` | `5` | Sleep between loop iterations. |
+
+The container is triple-guarded non-trading (`CRYPTO_TRADING_ENABLED=false`, `APP_SHADOW_MODE=true`, `APP_ENABLE_KILL_SWITCH=true`); it never reaches `ExecutionService`. See `docs/operations/crypto-mm-research-stack.md`.
 
 Training depends on both market history and spot history. A model can be trained
 but still fail replay if the replay window does not produce enough strict

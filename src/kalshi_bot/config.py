@@ -275,6 +275,14 @@ class Settings(BaseSettings):
     # trainer over-states edge ~5x and promotes models that trade $0 live
     # (BTC 15m lightgbm "+$1.99/11 trades" -> 0 live fills, 2026-06-17).
     crypto_model_selection_apply_edge_shrinkage: bool = True
+    # Market-making research stack (src/kalshi_bot/mm/) — a NON-TRADING continuous
+    # loop that logs the data spine and periodically OOS-evaluates the analytic
+    # vol fair value. Runs in its own container; never places orders.
+    mm_enabled: bool = False
+    mm_data_dir: str = "data/mm"
+    mm_frequency: str = "15m"
+    mm_eval_interval_seconds: float = 900.0
+    mm_idle_seconds: float = 5.0
     # Optional override for model-selection reporting inside training. The
     # replay gate still uses crypto_model_candidate_max_walk_forward_folds.
     crypto_model_candidate_report_max_walk_forward_folds: int | None = None

@@ -1,0 +1,51 @@
+"""Analytic fair value + volatility estimator (plan §4.2).
+
+`fair_up_normal` is the digital-option probability Φ(ln(S/K)/(σ√τ)) on the MM
+tick schema. `realized_vol` is the simple v1 σ̂ (trailing realized vol). The
+σ estimate is the one place where added modeling sophistication pays off
+(EWMA/HAR, intraday-seasonality) — crypto-vol-eval showed the analytic edge
+stands or falls on it — so it lives here, isolated and swappable.
+
+The raw formula is NOT trusted on its own: the loop fits an isotonic calibration
+map (plan 4.2) on logged settlements before any P&L is claimed.
+"""
+from __future__ import annotations
+
+import math
+from decimal import Decimal
+
+
+def realized_vol(prices: list[Decimal]) -> Decimal | None:
+    """Std of simple returns over the supplied price window (per-step σ̂)."""
+    valid = [p for p in prices if p is not None and p > 0]
+    if len(valid) < 3:
+        return None
+    rets = [float((b - a) / a) for a, b in zip(valid, valid[1:]) if a > 0]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / len(rets)
+    if var <= 0:
+        return None
+    return Decimal(str(math.sqrt(var)))
+
+
+def fair_up_normal(
+    *,
+    spot: Decimal,
+    strike: Decimal,
+    sigma: Decimal,
+    seconds_to_close: int,
+    step_interval_seconds: float = 60.0,
+) -> Decimal | None:
+    """Φ(z) with z = (ln(S/K)/σ_step)·√(step/τ); None on degenerate inputs.
+
+    Uses the simple-return moneyness (S−K)/K as the ln(S/K) proxy. As τ→0 the
+    √(step/τ) term grows and the probability snaps toward 0/1 (terminal regime).
+    """
+    if strike <= 0 or sigma <= 0 or seconds_to_close <= 0:
+        return None
+    step = float(step_interval_seconds) or 60.0
+    moneyness = (spot - strike) / strike
+    z = (float(moneyness) / float(sigma)) * math.sqrt(step / float(seconds_to_close))
+    return Decimal(str(0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))))

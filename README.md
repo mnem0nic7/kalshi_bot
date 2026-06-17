@@ -55,6 +55,7 @@ The compose stack separates trading runtime, web surfaces, data collectors, and 
 - `crypto_current_production` collects current 15m quote and spot evidence; `crypto_current_1h_production` does the same for 1h when enabled.
 - `crypto_non_model_btc15m_touch20_production` and `crypto_non_model_1h_touch20_production` are singleton Touch20 workers controlled by explicit enable flags.
 - `daemon_production_crypto_1h_<color>` is the optional blue/green 1h model daemon, separate from the main production daemon.
+- `crypto_mm_production` is the NON-TRADING statistical market-making research loop (`src/kalshi_bot/mm/`): data spine + analytic fair value + backtest, isolated CPU-only/mem-capped, never places orders.
 - `trainer_production` is a dedicated training-node singleton for model refreshes. It is shadow-mode and kill-switch guarded, uses the trainer CPU set/GPU, and is managed separately from `start-stack.sh`.
 
 ## Local Python workflow
@@ -146,6 +147,7 @@ kalshi-bot-cli crypto-report --frequency 15m --days 7        # decision funnel (
 kalshi-bot-cli crypto-pnl-report --days 14                   # fee-accurate fill P&L (gross/net/fees, by market)
 kalshi-bot-cli crypto-maker-markout-report --days 14         # maker fill quality / adverse selection
 kalshi-bot-cli crypto-vol-eval --frequency 15m              # light, training-free OOS eval of the analytic vol fair-value strategy vs mid
+kalshi-bot-cli crypto-mm run                                 # statistical market-making RESEARCH loop (NON-TRADING); runs as the crypto_mm_production container
 ```
 
 Kalshi's social leaderboard may require a logged-in first-party web session. Set

@@ -132,6 +132,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-asset-mode",
     "crypto-policy",
     "crypto-live-path",
+    "crypto-mm",
     "crypto-vol-eval",
     "crypto-report",
     "crypto-pnl-report",
@@ -768,6 +769,33 @@ def _format_crypto_vol_eval(report: dict[str, Any]) -> str:
             f"trades={a['vol_selected_count']} win_rate={a.get('vol_win_rate')}"
         )
     return "\n".join(lines) + "\n"
+
+
+async def _run_crypto_mm_command(args: argparse.Namespace, container: AppContainer) -> int:
+    from kalshi_bot.mm.service import MarketMakingResearchService
+
+    service = MarketMakingResearchService(
+        settings=container.settings,
+        session_factory=container.session_factory,
+        market_service=container.crypto_market_service,
+        forecast_service=container.crypto_forecast_service,
+        frequency=getattr(args, "frequency", None) or container.settings.mm_frequency,
+        eval_interval_seconds=container.settings.mm_eval_interval_seconds,
+        idle_seconds=container.settings.mm_idle_seconds,
+    )
+    sub = getattr(args, "crypto_mm_command", "run")
+    if sub == "collect-once":
+        ticks = await service._collect_ticks()
+        await service._store_ticks(ticks)
+        print(json.dumps({"status": "ok", "ticks_logged": len(ticks), "data_dir": service.store.base_dir}, indent=2, default=str))
+        return 0
+    if sub == "eval-once":
+        report = await service._run_eval()
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+    # default: run the continuous loop
+    await service.run()
+    return 0
 
 
 async def _run_crypto_vol_eval_command(args: argparse.Namespace, container: AppContainer) -> int:
@@ -3764,6 +3792,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "crypto-policy":
             return await _run_crypto_policy_command(args, container)
 
+        if args.command == "crypto-mm":
+            return await _run_crypto_mm_command(args, container)
+
         if args.command == "crypto-vol-eval":
             return await _run_crypto_vol_eval_command(args, container)
 
@@ -5472,6 +5503,18 @@ def build_parser() -> argparse.ArgumentParser:
     funnel_report.add_argument("--frequency", default="15m")
     funnel_report.add_argument("--assets", nargs="*", default=None)
     funnel_report.add_argument("--json", action="store_true")
+
+    crypto_mm = subparsers.add_parser(
+        "crypto-mm",
+        help="Statistical market-making research loop (NON-TRADING): data spine + analytic fair value + backtest.",
+    )
+    crypto_mm.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    crypto_mm.add_argument("--frequency", default=None)
+    crypto_mm_subparsers = crypto_mm.add_subparsers(dest="crypto_mm_command")
+    for _mm_cmd in ("run", "collect-once", "eval-once"):
+        _p = crypto_mm_subparsers.add_parser(_mm_cmd)
+        add_kalshi_env_argument(_p)
+        _p.add_argument("--frequency", default=None)
 
     crypto_vol_eval = subparsers.add_parser(
         "crypto-vol-eval",

@@ -622,6 +622,43 @@ services:
       retries: 3
       start_period: 120s
 
+  crypto_mm_production:
+    # Statistical market-making RESEARCH stack (src/kalshi_bot/mm/). NON-TRADING:
+    # logs the data spine + periodically OOS-evaluates the analytic vol fair
+    # value. Isolated from the live daemons and the GPU trainer; CPU-only.
+    <<: [*cpu-limits, *production-daemon-base]
+    command: ["python", "-m", "kalshi_bot.cli", "crypto-mm", "run"]
+    # Not trading-critical: be the kernel's first victim under host pressure, and
+    # cap the cgroup so a runaway eval self-limits instead of starving the host.
+    oom_score_adj: 500
+    mem_limit: 8g
+    volumes:
+      - ${LIVE_KALSHI_KEY_PATH_HOST:-../Kalshi-1.txt}:${LIVE_KALSHI_KEY_PATH_CONTAINER:-/run/secrets/kalshi-live.pem}:ro
+      - ${CODEX_HOME_HOST:-/root/.codex}:${CODEX_HOME_CONTAINER:-/root/.codex}:ro
+      - mm_data:/app/data/mm
+    environment:
+      <<: *production-env
+      KALSHI_ENV: production
+      APP_COLOR: mm
+      MM_ENABLED: "true"
+      MM_DATA_DIR: /app/data/mm
+      MM_FREQUENCY: "15m"
+      MM_EVAL_INTERVAL_SECONDS: "900"
+      # Triple-guard: this container must never place orders.
+      CRYPTO_AUTONOMY_ENABLED: "false"
+      CRYPTO_TRADING_ENABLED: "false"
+      APP_SHADOW_MODE: "true"
+      APP_ENABLE_KILL_SWITCH: "true"
+      # Collectors stay on the live daemons; this service only reads spot + quotes.
+      CRYPTO_QUOTE_EVIDENCE_ENABLED: "false"
+      CRYPTO_SPOT_CURRENT_AUTO_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import kalshi_bot.mm.service"]
+      interval: 120s
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+
   daemon_production_crypto_1h_blue:
     <<: *production-daemon-base
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
@@ -1102,3 +1139,4 @@ volumes:
   caddy_data:
   caddy_config:
   training_data:
+  mm_data:

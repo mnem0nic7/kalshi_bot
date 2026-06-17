@@ -41,6 +41,9 @@ kalshi-bot-cli crypto-report --frequency 15m --days 7        # decision funnel (
 kalshi-bot-cli crypto-pnl-report --days 14                   # fee-accurate FILL economics (gross/net/fees, by market)
 kalshi-bot-cli crypto-maker-markout-report --days 14         # maker fill quality / adverse selection
 kalshi-bot-cli crypto-vol-eval --frequency 15m              # light, training-free OOS eval of the analytic vol fair-value strategy vs mid (no GPU/tree fits)
+kalshi-bot-cli crypto-mm run                                 # statistical market-making RESEARCH loop (NON-TRADING): data spine + fair value + backtest (runs as crypto_mm_production)
+kalshi-bot-cli crypto-mm collect-once                        # one data-spine collection pass (debug)
+kalshi-bot-cli crypto-mm eval-once                           # one vol fair-value OOS eval pass (debug)
 ```
 
 No linter/formatter is configured in `pyproject.toml`. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. The global `conftest.py` sets `WEB_AUTH_ENABLED=false` as an autouse fixture, so integration tests skip HTTP basic-auth without extra setup.
@@ -116,6 +119,15 @@ All 7 assets are *configured* on the **CRYPTO_15M model path**, but as of the 20
 - **Sim/live edge-shrinkage parity (commit `bd9b0f5`):** champion selection now applies the live edge-shrinkage fit (β floored at `crypto_edge_shrinkage_beta_floor`, raw ~0.125 — realized live edge ≈12.5% of predicted) inside the trainer candidate simulation, gated by `crypto_model_selection_apply_edge_shrinkage` (default true). Before this, selection optimized an edge ~5× larger than what reaches the book and promoted models that traded $0 live (BTC 15m lightgbm showed "+$1.99/11 trades" in sim but placed **0 live fills** — all decisions blocked at the $0.45 entry cap / fee-edge floor). Expect most assets to honestly select `market_mid_baseline` until a candidate has edge that survives the brake. The brier-vs-mid deploy ceiling (`crypto_model_max_brier_regression_vs_mid`) is the companion guard.
 - **Analytic vol fair-value candidate `vol_normal_fair_value` (commit `5c59782`):** mechanism-based `Φ(ln(S/K)/(σ√τ))` from existing spot features + isotonic calibration; competes in the champion pool against the curve-fit heads (from `docs/research/kalshi_15m_market_making_plan.md` §4.2).
 - **Trading evaluation:** use `kalshi-bot-cli crypto-report` (decision funnel + live champion) alongside `crypto-pnl-report` (fee-accurate fill economics). As of 2026-06-17 all 7 assets trade $0 on 15m (every decision blocked at the entry cap / fee-edge floor; even "eligible" decisions don't fill — see the eligible→0-fill gap). Touch20 (`btc15m_touch20`, `1h_touch20`) is a separate, fully disabled strategy — `RULES_ENABLED=false`, `RULES_TRADING_ENABLED=false`, containers disabled. Do not conflate touch20 with the model path. The 1h model path is also currently disabled (insufficient OOS data). Promotion process and per-asset gate/model artifact history: `docs/operations/crypto-live-asset-promotion.md`.
+
+### Market-making research stack (`mm/`)
+A self-contained, **NON-TRADING** research subsystem implementing `docs/research/kalshi_15m_market_making_plan.md` as a continuous loop, isolated in its own container (`crypto_mm_production`, CPU-only, `mem_limit 8g`, `oom_score_adj 500`). It **never places orders** — execution stays in `ExecutionService`; the container is triple-guarded (`CRYPTO_TRADING_ENABLED=false`, shadow on, kill switch on).
+- `data_spine.py` — multi-venue spot consolidation (volume/recency weighted, staleness + outlier guards), market-tick normalization anchored to `floor_strike`.
+- `fair_value.py` — analytic `Φ(ln(S/K)/(σ√τ))` + the σ̂ estimator (`realized_vol`). **σ is the lever** — `crypto-vol-eval` showed the analytic edge stands or falls on it; iterate σ here.
+- `backtest.py` — maker entry rule (avoid the 45–55¢ band) + realistic-fill / settlement P&L (no maker rebate).
+- `storage.py` — append-only per-day JSONL on the `mm_data` volume (+ optional Parquet compaction).
+- `loop.py` / `service.py` — the continuous loop (log every tick; OOS-evaluate every `MM_EVAL_INTERVAL_SECONDS`), assembled with real collaborators. Run via `crypto-mm run`.
+Staged per plan §6: the data spine is v1 (reuses already-collected spot, so it's verifiable without new WS infra); live multi-venue WS book reconstruction, the §4.3 order-flow gate, and live execution are deliberate later stages. Config: `mm_*` settings in `config.py`.
 
 ### Persistence (`db/`)
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
