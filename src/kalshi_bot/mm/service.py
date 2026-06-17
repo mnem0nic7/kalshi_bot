@@ -18,7 +18,7 @@ from kalshi_bot.config import Settings
 from kalshi_bot.crypto.services import CryptoForecastService, CryptoMarketService, normalize_asset_symbols
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.mm.data_spine import VenueQuote, build_market_tick, consolidate_spot, seconds_to_close
-from kalshi_bot.mm.fair_value import fair_up_normal, realized_vol
+from kalshi_bot.mm.fair_value import fair_up_normal, infer_step_seconds, realized_vol
 from kalshi_bot.mm.loop import MarketMakingLoop, MmLoopConfig
 from kalshi_bot.mm.storage import TickStore
 
@@ -80,18 +80,20 @@ class MarketMakingResearchService:
                     )
                 except Exception:
                     continue
-                closes = [r.close_dollars for r in sorted(rows, key=lambda r: getattr(r, "end_ts", 0) or 0)]
-                closes = [c for c in closes if c is not None]
+                ordered = sorted(rows, key=lambda r: getattr(r, "end_ts", 0) or 0)
+                closes = [r.close_dollars for r in ordered if r.close_dollars is not None]
                 if not closes:
                     continue
-                spot_by_asset[asset] = (closes[-1], realized_vol(closes), getattr(rows[-1], "end_ts", None))
+                stamps = [getattr(r, "end_ts", None) for r in ordered]
+                step = infer_step_seconds([s.timestamp() for s in stamps if s is not None]) or 60.0
+                spot_by_asset[asset] = (closes[-1], realized_vol(closes), step)
         ticks: list[dict[str, Any]] = []
         for market in markets:
             strike = market.target_price_dollars
             spot_info = spot_by_asset.get(market.asset_symbol)
             if strike is None or strike <= 0 or spot_info is None:
                 continue
-            spot_price, sigma, _ = spot_info
+            spot_price, sigma, step_seconds = spot_info
             spot = consolidate_spot([VenueQuote(venue="coinbase", price=spot_price, age_seconds=0.0)])
             if spot is None or market.close_time is None:
                 continue
@@ -109,8 +111,15 @@ class MarketMakingResearchService:
                 observed_ts=now_ts,
             )
             tick["realized_vol"] = None if sigma is None else str(sigma)
+            tick["step_interval_seconds"] = step_seconds
             fair = (
-                fair_up_normal(spot=spot.price, strike=strike, sigma=sigma, seconds_to_close=ttc)
+                fair_up_normal(
+                    spot=spot.price,
+                    strike=strike,
+                    sigma=sigma,
+                    seconds_to_close=ttc,
+                    step_interval_seconds=step_seconds,
+                )
                 if sigma is not None
                 else None
             )

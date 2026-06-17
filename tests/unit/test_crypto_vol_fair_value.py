@@ -16,6 +16,8 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
+import pytest
+
 from kalshi_bot.config import Settings
 from kalshi_bot.crypto.services import (
     CRYPTO_MODEL_CANDIDATE_NAMES,
@@ -86,6 +88,24 @@ def test_fair_value_monotonic_in_moneyness() -> None:
     lo = _predict_crypto_probability(_row(moneyness_pct=0.0005, sigma=0.001, tau=60), _model(), apply_calibration=False)
     hi = _predict_crypto_probability(_row(moneyness_pct=0.0020, sigma=0.001, tau=60), _model(), apply_calibration=False)
     assert float(hi) > float(lo) > 0.5
+
+
+def test_fair_value_z_clamp_desaturates_tail() -> None:
+    # Deep in-the-money, tiny vol, near close → raw z explodes → Phi saturates to
+    # the price ceiling. max_abs_z caps z so the tail stays calibratable.
+    saturating = _row(moneyness_pct=0.02, sigma=0.0005, tau=10)
+    uncapped = _predict_crypto_probability(saturating, _model(), apply_calibration=False)
+    capped = _predict_crypto_probability(saturating, _model(max_abs_z=2.0), apply_calibration=False)
+    # The cap pulls the saturated prediction back, to exactly Phi(cap).
+    assert float(capped) < float(uncapped)
+    assert float(capped) == pytest.approx(_phi(2.0), abs=1e-4)
+
+
+def test_fair_value_z_clamp_preserves_unsaturated_values() -> None:
+    # Within the cap, predictions are unchanged.
+    row = _row(moneyness_pct=0.001, sigma=0.001, tau=60)  # z = 1.0
+    capped = _predict_crypto_probability(row, _model(max_abs_z=2.5), apply_calibration=False)
+    assert abs(float(capped) - _phi(1.0)) < 1e-4
 
 
 def test_fair_value_falls_back_when_inputs_missing() -> None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
-from kalshi_bot.mm.fair_value import fair_up_normal, realized_vol
+from kalshi_bot.mm.fair_value import fair_up_normal, infer_step_seconds, realized_vol
 
 
 def _phi(z: float) -> float:
@@ -31,6 +31,26 @@ def test_fair_up_none_on_bad_inputs():
     assert fair_up_normal(spot=Decimal("100"), strike=Decimal("0"), sigma=Decimal("0.001"), seconds_to_close=60) is None
     assert fair_up_normal(spot=Decimal("100"), strike=Decimal("100"), sigma=Decimal("0"), seconds_to_close=60) is None
     assert fair_up_normal(spot=Decimal("100"), strike=Decimal("100"), sigma=Decimal("0.001"), seconds_to_close=0) is None
+
+
+def test_infer_step_seconds_uses_median_delta():
+    # Timestamps ~5s apart (the real spot cadence) → step ≈ 5, not the 60s default.
+    ts = [1000.0, 1005.0, 1010.3, 1015.0, 1020.0]
+    assert abs(infer_step_seconds(ts) - 5.0) < 1.0
+
+
+def test_infer_step_seconds_none_when_insufficient():
+    assert infer_step_seconds([1000.0]) is None
+    assert infer_step_seconds([]) is None
+
+
+def test_fair_up_step_scaling_matters_before_calibration():
+    # With the true ~5s step the raw fair value is far less extreme than under the
+    # wrong 60s assumption (z larger by sqrt(60/5)).
+    near = dict(spot=Decimal("100.1"), strike=Decimal("100"), sigma=Decimal("0.001"), seconds_to_close=120)
+    wrong = fair_up_normal(**near, step_interval_seconds=60.0, max_abs_z=None)
+    right = fair_up_normal(**near, step_interval_seconds=5.0, max_abs_z=None)
+    assert float(wrong) > float(right) > 0.5
 
 
 def test_realized_vol_positive_for_varying_series_and_none_when_flat():

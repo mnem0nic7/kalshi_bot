@@ -157,6 +157,12 @@ def _settled_label_matches_requested_duration(market: CryptoMarket, frequency: s
 
 CRYPTO_MODEL_BASELINE_CANDIDATES = {"market_mid_baseline"}
 
+# vol_normal_fair_value terminal/heavy-tail z cap (plan 4.2). First-pass σ fix:
+# a tiny per-step σ makes z explode near close, saturating Φ to 0/1 so isotonic
+# collapses to base rate (brier~0.25). Capping |z| preserves tail ranking so the
+# calibration can work. Tune via crypto-vol-eval.
+_CRYPTO_VOL_FAIR_VALUE_MAX_ABS_Z = 3.0
+
 
 def _resolve_crypto_shadow_evidence_mode(
     *,
@@ -11611,6 +11617,7 @@ def _fit_crypto_vol_fair_value_model(rows: list[dict[str, Any]], *, fallback: di
         "model_type": "vol_normal_fair_value",
         "step_interval_seconds": 60,
         "volatility_field": "spot_realized_volatility_32",
+        "max_abs_z": _CRYPTO_VOL_FAIR_VALUE_MAX_ABS_Z,
         "fallback_model": fallback,
         "training_cutoff": _crypto_training_cutoff(rows),
     }
@@ -12227,6 +12234,17 @@ def _crypto_vol_normal_fair_up(row: dict[str, Any], model: dict[str, Any]) -> De
     # z = (moneyness / sigma_step) * sqrt(step / tau): more time left -> smaller z
     # (fair toward 0.5); as tau -> 0 the term grows and fair snaps toward 0/1.
     z = (float(moneyness) / float(sigma)) * math.sqrt(step / float(tau))
+    # Terminal/heavy-tail stability (plan 4.2: handle tau->0 explicitly). A tiny
+    # per-step sigma makes z explode near close, saturating Phi to 0/1 so distinct
+    # setups become indistinguishable and isotonic collapses to base rate
+    # (the brier~0.25 failure). Capping |z| keeps the tail < 1 so ranking — and
+    # thus calibratability — survives; it also crudely proxies the jump risk the
+    # Gaussian ignores at settlement.
+    max_abs_z = model.get("max_abs_z")
+    if max_abs_z is not None:
+        cap = abs(float(max_abs_z))
+        if cap > 0:
+            z = max(-cap, min(cap, z))
     fair_up = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
     return _clamp_price(Decimal(str(fair_up)))
 

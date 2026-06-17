@@ -13,6 +13,23 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal
+from statistics import median
+
+
+def infer_step_seconds(timestamps: list[float]) -> float | None:
+    """Median gap between consecutive spot observations.
+
+    The σ̂ is a per-step realized vol, so the per-step→remaining-horizon scaling
+    needs the *actual* cadence — the live spot feed is ~5s, not the 60s the
+    candidate assumed. Returns None when there aren't enough timestamps.
+    """
+    ts = sorted(float(t) for t in timestamps if t is not None)
+    if len(ts) < 2:
+        return None
+    deltas = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    if not deltas:
+        return None
+    return float(median(deltas))
 
 
 def realized_vol(prices: list[Decimal]) -> Decimal | None:
@@ -37,15 +54,20 @@ def fair_up_normal(
     sigma: Decimal,
     seconds_to_close: int,
     step_interval_seconds: float = 60.0,
+    max_abs_z: float | None = 3.0,
 ) -> Decimal | None:
     """Φ(z) with z = (ln(S/K)/σ_step)·√(step/τ); None on degenerate inputs.
 
     Uses the simple-return moneyness (S−K)/K as the ln(S/K) proxy. As τ→0 the
-    √(step/τ) term grows and the probability snaps toward 0/1 (terminal regime).
+    √(step/τ) term grows and the probability snaps toward 0/1 (terminal regime);
+    ``max_abs_z`` caps |z| so a tiny per-step σ near close doesn't saturate Φ
+    past the point where calibration can recover it (see crypto-vol-eval finding).
     """
     if strike <= 0 or sigma <= 0 or seconds_to_close <= 0:
         return None
     step = float(step_interval_seconds) or 60.0
     moneyness = (spot - strike) / strike
     z = (float(moneyness) / float(sigma)) * math.sqrt(step / float(seconds_to_close))
+    if max_abs_z is not None and max_abs_z > 0:
+        z = max(-float(max_abs_z), min(float(max_abs_z), z))
     return Decimal(str(0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))))
