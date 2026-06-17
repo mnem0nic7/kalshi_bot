@@ -142,6 +142,7 @@ CRYPTO_MODEL_CANDIDATE_NAMES = (
     "spot_distance_contrarian",
     "spot_distance_contrarian_gated",
     "asset_time_calibration",
+    "vol_normal_fair_value",
     "xgboost_classifier",
     "lightgbm_classifier",
 )
@@ -11448,6 +11449,12 @@ def _fit_crypto_model_candidates(
             "model": _fit_crypto_asset_time_calibration_model(rows, fallback=fallback),
             "dependency_version": None,
         },
+        "vol_normal_fair_value": {
+            "name": "vol_normal_fair_value",
+            "status": "available",
+            "model": _fit_crypto_vol_fair_value_model(rows, fallback=fallback),
+            "dependency_version": None,
+        },
     }
     if not rows or len(set(labels)) < 2:
         reason = "need_two_outcome_classes"
@@ -11533,6 +11540,27 @@ def _fit_crypto_spot_distance_residual_model(rows: list[dict[str, Any]], *, fall
     model["probability_calibration"] = _fit_probability_calibration(
         [_predict_crypto_probability(row, model, apply_calibration=False) for row in calibration_rows],
         [int(row["label_yes"]) for row in calibration_rows],
+    )
+    return model
+
+
+def _fit_crypto_vol_fair_value_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    """Analytic Phi(ln(S/K)/(sigma*sqrt(tau))) fair value + isotonic calibration.
+
+    The raw fair value is parameter-free (no labels), so the only fitted part is
+    the calibration map, which corrects the per-step->horizon vol scale error and
+    distributional (heavy-tail) mismatch against realized settlements (plan 4.2:
+    'do not trust the closed form ... apply isotonic/Platt calibration')."""
+    model: dict[str, Any] = {
+        "model_type": "vol_normal_fair_value",
+        "step_interval_seconds": 60,
+        "volatility_field": "spot_realized_volatility_32",
+        "fallback_model": fallback,
+        "training_cutoff": _crypto_training_cutoff(rows),
+    }
+    model["probability_calibration"] = _fit_probability_calibration(
+        [_predict_crypto_probability(row, model, apply_calibration=False) for row in rows],
+        [int(row["label_yes"]) for row in rows],
     )
     return model
 
@@ -12049,6 +12077,31 @@ def _crypto_spot_distance_contrarian_gate_active(
     return True
 
 
+def _crypto_vol_normal_fair_up(row: dict[str, Any], model: dict[str, Any]) -> Decimal | None:
+    """Mechanism-based fair probability for an 'up' binary (plan sec 2/4.2):
+
+        fair_up = Phi( ln(S/K) / (sigma * sqrt(tau)) )
+
+    with sigma the per-step realized vol and tau the remaining horizon. Returns
+    ``None`` when the inputs are missing/degenerate so the caller falls back to
+    the market mid. The monotonic isotonic calibration applied on top absorbs the
+    residual scale error in the per-step -> remaining-horizon vol conversion.
+    """
+    moneyness = _optional_decimal(row.get("spot_moneyness_pct"))
+    sigma = _optional_decimal(row.get(str(model.get("volatility_field") or "spot_realized_volatility_32")))
+    if sigma is None:
+        sigma = _optional_decimal(row.get("spot_realized_volatility"))
+    tau = _optional_int(row.get("time_to_close_seconds"))
+    if moneyness is None or sigma is None or sigma <= 0 or tau is None or tau <= 0:
+        return None
+    step = float(model.get("step_interval_seconds") or 60) or 60.0
+    # z = (moneyness / sigma_step) * sqrt(step / tau): more time left -> smaller z
+    # (fair toward 0.5); as tau -> 0 the term grows and fair snaps toward 0/1.
+    z = (float(moneyness) / float(sigma)) * math.sqrt(step / float(tau))
+    fair_up = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    return _clamp_price(Decimal(str(fair_up)))
+
+
 def _predict_crypto_probability(
     row: dict[str, Any],
     model: dict[str, Any] | None,
@@ -12152,6 +12205,11 @@ def _predict_crypto_probability(
             return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
         except Exception:
             return _predict_crypto_probability(row, model.get("fallback_model"))
+    if model_type == "vol_normal_fair_value":
+        fair_up = _crypto_vol_normal_fair_up(row, model)
+        if fair_up is None:
+            return _predict_crypto_probability(row, model.get("fallback_model"))
+        return _apply_probability_calibration(fair_up, model.get("probability_calibration")) if apply_calibration else fair_up
     adjustment = Decimal(int(model.get("global_adjustment_bps") or 0)) / Decimal("10000")
     adjustment += Decimal(int((model.get("asset_adjustments_bps") or {}).get(str(row.get("asset_symbol")), 0))) / Decimal("20000")
     momentum = _decimal(row.get("candle_momentum_dollars") or Decimal("0")) * Decimal("0.25")
