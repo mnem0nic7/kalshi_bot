@@ -132,6 +132,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-asset-mode",
     "crypto-policy",
     "crypto-live-path",
+    "crypto-report",
     "crypto-pnl-report",
     "crypto-maker-markout-report",
     "weather-live",
@@ -3132,6 +3133,84 @@ def _format_crypto_maker_markout_report(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_crypto_trading_report(report: dict[str, Any]) -> str:
+    lines: list[str] = []
+    meta = report.get("meta", {})
+    lines.append(
+        f"crypto-report env={meta.get('kalshi_env')} freq={meta.get('frequency')} "
+        f"days={meta.get('days')} window_since={meta.get('since')}"
+    )
+    lines.append("  (decision funnel + live champion; gross realized P&L — for fee-accurate fill P&L use crypto-pnl-report)")
+    pf = report.get("portfolio", {})
+    wr = pf.get("win_rate")
+    lines.append(
+        f"PORTFOLIO: decisions={pf.get('decisions', 0)} filled={pf.get('filled', 0)} "
+        f"trade_rate={pf.get('trade_rate', 0.0):.4f} wins={pf.get('wins', 0)} losses={pf.get('losses', 0)} "
+        f"win_rate={'n/a' if wr is None else f'{wr:.3f}'} "
+        f"realized_gross=${pf.get('realized_pnl', 0)} simulated=${pf.get('simulated_pnl', 0)}"
+    )
+    for asset in sorted(report.get("assets", {})):
+        bucket = report["assets"][asset]
+        awr = bucket.get("win_rate")
+        lines.append(
+            f"\n{asset}: champion={bucket.get('champion_model_type') or 'n/a'}"
+            f" ({bucket.get('champion_status') or 'n/a'}) | decisions={bucket['decisions']}"
+            f" filled={bucket['filled']} trade_rate={bucket['trade_rate']:.4f}"
+            f" win_rate={'n/a' if awr is None else f'{awr:.3f}'}"
+            f" realized_gross=${bucket['realized_pnl']} simulated=${bucket['simulated_pnl']}"
+        )
+        blockers = bucket.get("top_blockers") or []
+        if blockers:
+            shown = ", ".join(f"{reason}={count}" for reason, count in blockers[:4])
+            lines.append(f"    blocked: {shown}")
+    return "\n".join(lines) + "\n"
+
+
+async def _run_crypto_report_command(args: argparse.Namespace, container: AppContainer) -> int:
+    from kalshi_bot.crypto.reporting import build_crypto_trading_report
+    from kalshi_bot.crypto.services import _crypto_artifact_type, _latest_crypto_artifact_for_asset
+
+    frequency = "1h" if str(getattr(args, "frequency", "15m")).lower() in {"1h", "1hr", "hour"} else "15m"
+    assets = normalize_asset_symbols(args.assets) if getattr(args, "assets", None) else list(CRYPTO_LIVE_PATH_DEFAULT_ASSETS)
+    since = datetime.now(UTC) - timedelta(days=max(1, int(getattr(args, "days", 7))))
+    async with container.session_factory() as session:
+        repo = PlatformRepository(session, kalshi_env=args.kalshi_env)
+        aggregates = await repo.summarize_crypto_decision_outcomes(
+            frequency=frequency,
+            kalshi_env=args.kalshi_env,
+            asset_symbols=assets,
+            since=since,
+        )
+        champions: dict[str, dict[str, Any]] = {}
+        for asset in assets:
+            artifact = await _latest_crypto_artifact_for_asset(
+                repo,
+                frequency=frequency,
+                artifact_type=_crypto_artifact_type("model", [asset]),
+                kalshi_env=args.kalshi_env,
+                asset_symbol=asset,
+            )
+            if artifact is not None:
+                metrics = artifact.metrics if isinstance(artifact.metrics, dict) else {}
+                champions[asset] = {
+                    "model_type": metrics.get("champion_model_type") or metrics.get("champion_model"),
+                    "status": metrics.get("champion_status") or artifact.status,
+                }
+        await session.commit()
+    report = build_crypto_trading_report(aggregates, champions=champions)
+    report["meta"] = {
+        "kalshi_env": container.settings.kalshi_env,
+        "frequency": frequency,
+        "days": int(getattr(args, "days", 7)),
+        "since": since.isoformat(),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print(_format_crypto_trading_report(report), end="")
+    return 0
+
+
 async def _run_crypto_pnl_report_command(args: argparse.Namespace, container: AppContainer) -> int:
     async with container.session_factory() as session:
         repo = PlatformRepository(session, kalshi_env=args.kalshi_env)
@@ -3648,6 +3727,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
         if args.command == "crypto-policy":
             return await _run_crypto_policy_command(args, container)
+
+        if args.command == "crypto-report":
+            return await _run_crypto_report_command(args, container)
 
         if args.command == "crypto-pnl-report":
             return await _run_crypto_pnl_report_command(args, container)
@@ -5351,6 +5433,16 @@ def build_parser() -> argparse.ArgumentParser:
     funnel_report.add_argument("--frequency", default="15m")
     funnel_report.add_argument("--assets", nargs="*", default=None)
     funnel_report.add_argument("--json", action="store_true")
+
+    crypto_report = subparsers.add_parser(
+        "crypto-report",
+        help="Trading-evaluation funnel: per-asset decisions, block reasons, fills, win rate, and live champion.",
+    )
+    crypto_report.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    crypto_report.add_argument("--days", type=int, default=7)
+    crypto_report.add_argument("--frequency", default="15m")
+    crypto_report.add_argument("--assets", nargs="*", default=None)
+    crypto_report.add_argument("--json", action="store_true")
 
     crypto_pnl_report = subparsers.add_parser("crypto-pnl-report")
     crypto_pnl_report.add_argument("--kalshi-env", choices=["demo", "production"], default="production")

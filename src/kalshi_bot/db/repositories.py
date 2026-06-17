@@ -3120,6 +3120,60 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoDecisionOutcomeRecord.decision_time >= since)
         return int((await self.session.execute(stmt)).scalar_one() or 0)
 
+    async def summarize_crypto_decision_outcomes(
+        self,
+        *,
+        frequency: str,
+        kalshi_env: str | None = None,
+        asset_symbols: list[str] | None = None,
+        since: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Per-(asset, gate_status) aggregates for the trading-evaluation report.
+
+        Aggregated in SQL (GROUP BY) so the report never loads the full
+        decision-outcome table — which is high-volume. ``realized_pnl`` is the
+        internal gross P&L (fees not included)."""
+        record = CryptoDecisionOutcomeRecord
+        filled = case((record.fill_count > 0, 1), else_=0)
+        win = case((record.realized_pnl_dollars > 0, 1), else_=0)
+        loss = case((record.realized_pnl_dollars < 0, 1), else_=0)
+        stmt = (
+            select(
+                record.asset_symbol,
+                record.gate_status,
+                func.count().label("decisions"),
+                func.coalesce(func.sum(filled), 0).label("filled"),
+                func.coalesce(func.sum(win), 0).label("wins"),
+                func.coalesce(func.sum(loss), 0).label("losses"),
+                func.coalesce(func.sum(record.realized_pnl_dollars), 0).label("realized_pnl"),
+                func.coalesce(func.sum(record.simulated_pnl_dollars), 0).label("simulated_pnl"),
+            )
+            .where(
+                record.kalshi_env == self._resolved_kalshi_env(kalshi_env),
+                record.frequency == frequency,
+            )
+            .group_by(record.asset_symbol, record.gate_status)
+        )
+        symbols = [symbol for symbol in (asset_symbols or []) if str(symbol or "").strip()]
+        if symbols:
+            stmt = stmt.where(record.asset_symbol.in_(symbols))
+        if since is not None:
+            stmt = stmt.where(record.decision_time >= since)
+        rows = (await self.session.execute(stmt)).all()
+        return [
+            {
+                "asset_symbol": row.asset_symbol,
+                "gate_status": row.gate_status,
+                "decisions": int(row.decisions or 0),
+                "filled": int(row.filled or 0),
+                "wins": int(row.wins or 0),
+                "losses": int(row.losses or 0),
+                "realized_pnl": row.realized_pnl,
+                "simulated_pnl": row.simulated_pnl,
+            }
+            for row in rows
+        ]
+
     async def list_recent_settled_crypto_outcomes(
         self,
         *,
