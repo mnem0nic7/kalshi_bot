@@ -12477,12 +12477,51 @@ def _crypto_candidate_profit_sort_key(entry: dict[str, Any]) -> tuple[Decimal, D
     )
 
 
+def _crypto_market_mid_brier(candidates: list[dict[str, Any]]) -> float | None:
+    for candidate in candidates:
+        if candidate.get("name") == "market_mid_baseline":
+            metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+            brier = metrics.get("brier")
+            if brier is not None:
+                return float(brier)
+    return None
+
+
+def _crypto_candidate_brier_ok_vs_mid(
+    candidate: dict[str, Any],
+    *,
+    mid_brier: float | None,
+    max_brier_regression_vs_mid: float | None,
+) -> bool:
+    """A profitable candidate whose Brier is materially worse than the market
+    mid is almost certainly a simulation artifact (badly-calibrated-but-
+    profitable), not real edge. Reject it from deployment. Returns True when no
+    ceiling is configured or the candidate's calibration can't be assessed."""
+    if mid_brier is None or max_brier_regression_vs_mid is None:
+        return True
+    metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+    brier = metrics.get("brier")
+    if brier is None:
+        return True
+    return float(brier) <= mid_brier * (1.0 + float(max_brier_regression_vs_mid))
+
+
 def _crypto_select_champion(
     candidates: list[dict[str, Any]],
     *,
     min_selected_count: int = 1,
     allow_guardrail_failed_profit_candidates: bool = False,
+    max_brier_regression_vs_mid: float | None = None,
 ) -> str:
+    mid_brier = _crypto_market_mid_brier(candidates)
+
+    def _brier_ok(candidate: dict[str, Any]) -> bool:
+        return _crypto_candidate_brier_ok_vs_mid(
+            candidate,
+            mid_brier=mid_brier,
+            max_brier_regression_vs_mid=max_brier_regression_vs_mid,
+        )
+
     profit_candidates = [
         candidate
         for candidate in candidates
@@ -12506,6 +12545,7 @@ def _crypto_select_champion(
             min_selected_count=min_selected_count,
             allow_guardrail_failed=allow_guardrail_failed_profit_candidates,
         )
+        and _brier_ok(candidate)
     ]
     if deployable:
         deployable.sort(key=_crypto_candidate_profit_sort_key, reverse=True)
@@ -12515,6 +12555,7 @@ def _crypto_select_champion(
         for candidate in candidates
         if _crypto_model_selection_usable(candidate)
         and _crypto_candidate_has_min_policy_support(candidate, min_selected_count=min_selected_count)
+        and _brier_ok(candidate)
         and (
             not _crypto_candidate_has_profit_metrics(candidate)
             or _crypto_candidate_is_profit_deployable(
@@ -12652,6 +12693,9 @@ def _crypto_in_sample_candidate_report(
         guarded_entries,
         min_selected_count=min_policy_selected_count,
         allow_guardrail_failed_profit_candidates=allow_guardrail_failed_profit_candidates,
+        max_brier_regression_vs_mid=(
+            settings.crypto_model_max_brier_regression_vs_mid if settings is not None else None
+        ),
     )
     champion_entry = _crypto_candidate_entry_by_name(guarded_entries, champion)
     return {
@@ -12809,6 +12853,9 @@ def _crypto_model_candidate_report(
         entries,
         min_selected_count=min_policy_selected_count,
         allow_guardrail_failed_profit_candidates=allow_guardrail_failed_profit_candidates,
+        max_brier_regression_vs_mid=(
+            settings.crypto_model_max_brier_regression_vs_mid if settings is not None else None
+        ),
     )
     champion_entry = _crypto_candidate_entry_by_name(entries, champion)
     return {

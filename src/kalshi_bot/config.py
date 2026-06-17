@@ -263,6 +263,11 @@ class Settings(BaseSettings):
     crypto_dynamic_order_pnl_scale_per_candidate_dollars: float = 0.20
     crypto_pnl_sizing_auto_enabled: bool = True
     crypto_model_candidate_max_walk_forward_folds: int = 24
+    # A profitable candidate whose OOS Brier is more than this fraction worse than
+    # the market mid is rejected as champion (badly-calibrated-but-profitable =
+    # simulation artifact, e.g. v11 XRP/DOGE/HYPE sklearn at brier 0.17-0.19 vs
+    # mid ~0.15). Genuine edge keeps Brier at/below mid (BTC/SOL/BNB).
+    crypto_model_max_brier_regression_vs_mid: float = 0.07
     # Optional override for model-selection reporting inside training. The
     # replay gate still uses crypto_model_candidate_max_walk_forward_folds.
     crypto_model_candidate_report_max_walk_forward_folds: int | None = None
