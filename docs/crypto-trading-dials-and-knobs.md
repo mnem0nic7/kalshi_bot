@@ -242,6 +242,15 @@ but it does not make a `live_quality` candidate.
 | `crypto-model candidates --assets` | `None` | Limits candidate analysis to selected assets. |
 | `crypto-maker-markout-report --days` | `14` | Shadow-only maker adverse-selection report; run from `trainer_production` for historical windows. |
 
+### Champion selection knobs
+
+| Setting | Current default | Effect |
+| --- | ---: | --- |
+| `crypto_model_selection_apply_edge_shrinkage` | `True` | Applies the live edge-shrinkage fit (from the `crypto_edge_shrinkage:{freq}` deployment-control note, β floored at `crypto_edge_shrinkage_beta_floor`) inside the trainer candidate simulation, so champion selection optimizes the **post-shrinkage** edge that actually reaches the order book. Without it the trainer over-states edge (raw β ≈ 0.125 ⇒ ~5×) and promotes models that trade $0 live. (Commit `bd9b0f5`, 2026-06-17.) |
+| `crypto_model_max_brier_regression_vs_mid` | `0.07` | Deploy ceiling: rejects a profit-"deployable" champion whose Brier regresses more than this fraction vs the market-mid baseline (the miscalibrated-but-profitable artifact signature). |
+
+Candidate models (champion pool, `CRYPTO_MODEL_CANDIDATE_NAMES`): `market_mid_baseline`, `current_heuristic`, `sklearn_logistic`, `spot_distance_residual`, `spot_distance_contrarian`, `spot_distance_contrarian_gated`, `asset_time_calibration`, **`vol_normal_fair_value`** (analytic `Φ(ln(S/K)/(σ√τ))` + isotonic calibration; commit `5c59782`), `xgboost_classifier`, `lightgbm_classifier`.
+
 Commands:
 
 ```bash
@@ -250,6 +259,14 @@ python -m kalshi_bot.cli crypto-model train --kalshi-env production --frequency 
 python -m kalshi_bot.cli crypto-model candidates --kalshi-env production --frequency 15m --days 30 --json
 python -m kalshi_bot.cli crypto-maker-markout-report --kalshi-env production --frequency 15m --days 30 --json
 ```
+
+### Trading evaluation reports
+
+| Command | Effect |
+| --- | --- |
+| `crypto-report --frequency 15m --days 7` | Per-asset decision funnel (decisions → block reasons → eligible → fills), win rate, gross realized + simulated P&L, and the live champion `model_type`/status. Surfaces *why* the system is/ isn't trading. |
+| `crypto-pnl-report --days 14` | Fee-accurate fill economics (gross/net/fees, wins/losses, by market and cell). |
+| `crypto-maker-markout-report --days 14` | Maker fill quality / adverse-selection markout. |
 
 Training depends on both market history and spot history. A model can be trained
 but still fail replay if the replay window does not produce enough strict

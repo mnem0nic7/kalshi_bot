@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Documentation policy (MANDATORY)
+
+**Every commit that changes behavior must update the documentation in the same commit.** Before you `git commit`, check whether the change affects any of: this `CLAUDE.md` (architecture, commands, config, safety/status notes), `README.md` (command list), `docs/crypto-trading-dials-and-knobs.md` / `docs/training-dials-and-knobs.md` (new/changed settings), the relevant `docs/operations/*` or `docs/research/*` (status, runbooks, findings). If it does, update those files and stage them together with the code. A new CLI command, config setting, model candidate, gate, or status change is never "done" until the docs reflect it. When a documented status becomes stale (e.g. a per-asset model status), correct it rather than leaving the old claim. If a commit genuinely needs no doc change, that is fine — but it should be a conscious check, not an omission.
+
 ## Commands
 
 ```bash
@@ -31,6 +35,11 @@ python3 -m kalshi_bot.main
 
 # CLI entry point
 kalshi-bot-cli <subcommand>   # see README for the full list
+
+# Evaluate crypto trading (run inside a container / where the DB is reachable)
+kalshi-bot-cli crypto-report --frequency 15m --days 7        # decision funnel (blocks→eligible→fills) + live champion per asset
+kalshi-bot-cli crypto-pnl-report --days 14                   # fee-accurate FILL economics (gross/net/fees, by market)
+kalshi-bot-cli crypto-maker-markout-report --days 14         # maker fill quality / adverse selection
 ```
 
 No linter/formatter is configured in `pyproject.toml`. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. The global `conftest.py` sets `WEB_AUTH_ENABLED=false` as an autouse fixture, so integration tests skip HTTP basic-auth without extra setup.
@@ -100,7 +109,12 @@ All crypto services are wired through `AppContainer` alongside weather services.
 
 Active crypto assets (as of 2026-05-20): **BTC, ETH, SOL, XRP, BNB, DOGE, HYPE**. ADA and BCH were removed from all active asset lists (`crypto_model_nightly_assets`, the CLI live-path default, passive-bid, overnight-readiness prefixes) because they have no backfilled spot history yet — configured-but-untrainable. Their inert lookup/parsing tables (Coinbase/CoinGecko product-id maps, ticker-recognition lists) are intentionally kept, so re-adding them after a backfill is a config-only change.
 
-All 7 assets are *configured* on the **CRYPTO_15M model path**, but as of the 2026-06-13 nightly only **HYPE and DOGE actually run a trained model** (`spot_distance_residual` + isotonic calibration); **BTC, ETH, SOL, XRP, BNB fell back to `model_type=market_mid_baseline`** (they echo the market mid — no learned model, no calibration, ≈zero edge → effectively standing down). This is the model-selection safety gate working as designed: a trained candidate only goes live if it shows positive OOS net simulated P&L *and* beats market-mid (`_crypto_select_champion` / `_crypto_candidate_is_profit_deployable` in `crypto/services.py`); the majors' candidates didn't clear it. Diagnosis + forward plan: `docs/research/2026-06-14-model-selection-diagnosis-and-plan.md`. The earlier "all 7 on trained model (2026-06-05)" status is stale — verify live `model_type` per asset via `crypto_model_artifacts` before assuming. Touch20 (`btc15m_touch20`, `1h_touch20`) is a separate, fully disabled strategy — `RULES_ENABLED=false`, `RULES_TRADING_ENABLED=false`, containers disabled. Do not conflate touch20 with the model path. The 1h model path is also currently disabled (insufficient OOS data). Promotion process and per-asset gate/model artifact history: `docs/operations/crypto-live-asset-promotion.md`.
+All 7 assets are *configured* on the **CRYPTO_15M model path**, but as of the 2026-06-13 nightly only **HYPE and DOGE actually run a trained model** (`spot_distance_residual` + isotonic calibration); **BTC, ETH, SOL, XRP, BNB fell back to `model_type=market_mid_baseline`** (they echo the market mid — no learned model, no calibration, ≈zero edge → effectively standing down). This is the model-selection safety gate working as designed: a trained candidate only goes live if it shows positive OOS net simulated P&L *and* beats market-mid (`_crypto_select_champion` / `_crypto_candidate_is_profit_deployable` in `crypto/services.py`); the majors' candidates didn't clear it. Diagnosis + forward plan: `docs/research/2026-06-14-model-selection-diagnosis-and-plan.md`. The earlier "all 7 on trained model (2026-06-05)" status is stale — verify live `model_type` per asset via `crypto_model_artifacts` before assuming.
+
+**2026-06-17 updates (sim/live parity + new candidate + reporting):**
+- **Sim/live edge-shrinkage parity (commit `bd9b0f5`):** champion selection now applies the live edge-shrinkage fit (β floored at `crypto_edge_shrinkage_beta_floor`, raw ~0.125 — realized live edge ≈12.5% of predicted) inside the trainer candidate simulation, gated by `crypto_model_selection_apply_edge_shrinkage` (default true). Before this, selection optimized an edge ~5× larger than what reaches the book and promoted models that traded $0 live (BTC 15m lightgbm showed "+$1.99/11 trades" in sim but placed **0 live fills** — all decisions blocked at the $0.45 entry cap / fee-edge floor). Expect most assets to honestly select `market_mid_baseline` until a candidate has edge that survives the brake. The brier-vs-mid deploy ceiling (`crypto_model_max_brier_regression_vs_mid`) is the companion guard.
+- **Analytic vol fair-value candidate `vol_normal_fair_value` (commit `5c59782`):** mechanism-based `Φ(ln(S/K)/(σ√τ))` from existing spot features + isotonic calibration; competes in the champion pool against the curve-fit heads (from `docs/research/kalshi_15m_market_making_plan.md` §4.2).
+- **Trading evaluation:** use `kalshi-bot-cli crypto-report` (decision funnel + live champion) alongside `crypto-pnl-report` (fee-accurate fill economics). As of 2026-06-17 all 7 assets trade $0 on 15m (every decision blocked at the entry cap / fee-edge floor; even "eligible" decisions don't fill — see the eligible→0-fill gap). Touch20 (`btc15m_touch20`, `1h_touch20`) is a separate, fully disabled strategy — `RULES_ENABLED=false`, `RULES_TRADING_ENABLED=false`, containers disabled. Do not conflate touch20 with the model path. The 1h model path is also currently disabled (insufficient OOS data). Promotion process and per-asset gate/model artifact history: `docs/operations/crypto-live-asset-promotion.md`.
 
 ### Persistence (`db/`)
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.

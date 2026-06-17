@@ -108,3 +108,33 @@ The gate is `_crypto_candidate_guardrail_failures` ([services.py:11863](../../sr
 - **No fading of the market's near-expiry overconfidence** as an edge — favorite-longshot / NO-side taker edge was REFUTED in the external research; only act via an OOS-replay-validated, fee-net strategy.
 - **No manual edge-gate threshold edits** — `autonomous_gate_tuning` is the sole authority; revisit only after a real model is live on an asset.
 - **No heavy training/materialize on the host** — P1 runs in the trainer ([host-OOM guardrails](2026-06-14-crypto-calibration-empirical-study.md)).
+
+---
+
+## 2026-06-17 update — sim/live parity was the missing piece
+
+The diagnosis above explained why the *majors* fell back to mid in-sample, but a
+deeper issue surfaced when BTC 15m finally produced a non-mid champion: the
+trainer's champion P&L simulation applied the market-price anchor but **omitted
+live edge-shrinkage**. BTC's lightgbm champion showed `+$1.99 / 11 trades` in
+sim yet placed **0 live fills** — every live decision was blocked at the $0.45
+entry cap / fee-edge floor because the live gate shrinks edge by β (floored at
+0.2; raw fit ≈ 0.125, i.e. realized live edge ≈ 12.5% of predicted). Selection
+was optimizing an edge ~5× larger than what reaches the book.
+
+**Fix (commit `bd9b0f5`):** thread the live edge-shrinkage fit into the trainer
+candidate simulation (`crypto_model_selection_apply_edge_shrinkage`, default
+true), so "beats mid" means "beats mid *after* the live brake." Expect most
+assets to honestly select `market_mid_baseline` until a candidate has edge that
+survives shrinkage.
+
+**New mechanism-based candidate (commit `5c59782`):** `vol_normal_fair_value` =
+`Φ(ln(S/K)/(σ√τ))` from existing spot features + isotonic calibration, competing
+in the champion pool against the curve-fit heads (per
+`kalshi_15m_market_making_plan.md` §4.2). If anything beats mid after shrinkage,
+a derived analytic probability is the most likely candidate; if nothing does,
+that is itself evidence the 15m book is efficient.
+
+**Evaluation tooling (commit `8756337`):** `kalshi-bot-cli crypto-report` shows
+the decision funnel + live champion per asset; pair it with `crypto-pnl-report`
+for fee-accurate fill economics. As of 2026-06-17 all 7 assets trade $0 on 15m.

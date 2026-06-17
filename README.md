@@ -139,6 +139,12 @@ kalshi-bot-cli reconcile
 kalshi-bot-cli status
 kalshi-bot-cli kill-switch on
 infra/scripts/promote.sh demo green
+
+# Crypto trading evaluation
+kalshi-bot-cli crypto-status --frequency 15m                 # model/data readiness per asset
+kalshi-bot-cli crypto-report --frequency 15m --days 7        # decision funnel (block reasons → eligible → fills) + live champion per asset
+kalshi-bot-cli crypto-pnl-report --days 14                   # fee-accurate fill P&L (gross/net/fees, by market)
+kalshi-bot-cli crypto-maker-markout-report --days 14         # maker fill quality / adverse selection
 ```
 
 Kalshi's social leaderboard may require a logged-in first-party web session. Set
