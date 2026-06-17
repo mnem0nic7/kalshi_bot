@@ -3920,6 +3920,14 @@ class CryptoForecastService:
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            selection_edge_shrinkage: dict[str, Any] | None = None
+            if bool(self.settings.crypto_model_selection_apply_edge_shrinkage):
+                control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+                selection_edge_shrinkage = _crypto_edge_shrinkage_from_notes(
+                    getattr(control, "notes", None),
+                    frequency=freq,
+                    settings=self.settings,
+                )
             trained_from = "crypto_training_feature_rows"
             if feature_records:
                 decision_rows = [_crypto_training_row_payload(record) for record in reversed(feature_records)]
@@ -3972,7 +3980,12 @@ class CryptoForecastService:
 
         # Compute phase — no DB connection held open.
         sample_count = len(decision_rows)
-        payload = _fit_crypto_calibration(decision_rows, settings=self.settings, crypto_policy=crypto_policy)
+        payload = _fit_crypto_calibration(
+            decision_rows,
+            settings=self.settings,
+            crypto_policy=crypto_policy,
+            edge_shrinkage=selection_edge_shrinkage,
+        )
         metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings, crypto_policy=crypto_policy)
         training_quality_blockers = _crypto_training_quality_blockers(
             decision_rows,
@@ -4194,6 +4207,14 @@ class CryptoForecastService:
             )
             active_pack = await self.agent_pack_service.get_active_pack(repo)
             crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            report_edge_shrinkage: dict[str, Any] | None = None
+            if bool(self.settings.crypto_model_selection_apply_edge_shrinkage):
+                control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+                report_edge_shrinkage = _crypto_edge_shrinkage_from_notes(
+                    getattr(control, "notes", None),
+                    frequency=freq,
+                    settings=self.settings,
+                )
             await session.commit()
         dataset_source = "crypto_training_feature_rows" if feature_decision_rows else "settled_snapshots_rebuilt"
         if feature_decision_rows:
@@ -4209,6 +4230,7 @@ class CryptoForecastService:
             decision_rows,
             settings=self.settings,
             crypto_policy=crypto_policy,
+            edge_shrinkage=report_edge_shrinkage,
         )
         quality_report = _crypto_candidate_quality_report(decision_rows, model_payload, settings=self.settings)
         quality_dataset = quality_report.get("dataset") if isinstance(quality_report.get("dataset"), dict) else {}
@@ -11314,6 +11336,7 @@ def _fit_crypto_calibration(
     settings: Settings | None = None,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     include_candidate_report: bool = True,
+    edge_shrinkage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fallback = _fit_crypto_heuristic_calibration(rows)
     if not rows:
@@ -11331,9 +11354,12 @@ def _fit_crypto_calibration(
             settings=settings,
             crypto_policy=crypto_policy,
             full_candidate_status=candidates,
+            edge_shrinkage=edge_shrinkage,
         )
         if include_candidate_report
-        else _crypto_in_sample_candidate_report(rows, candidates, settings=settings, crypto_policy=crypto_policy)
+        else _crypto_in_sample_candidate_report(
+            rows, candidates, settings=settings, crypto_policy=crypto_policy, edge_shrinkage=edge_shrinkage
+        )
     )
     champion_name = str(candidate_report.get("champion_name") or "sklearn_logistic")
     if champion_name == "calibrated_weighted_ensemble":
@@ -12632,6 +12658,7 @@ def _crypto_in_sample_candidate_report(
     *,
     settings: Settings | None = None,
     crypto_policy: RuntimeCryptoPolicy | None = None,
+    edge_shrinkage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     market_metrics: dict[str, Any] | None = None
@@ -12643,7 +12670,13 @@ def _crypto_in_sample_candidate_report(
             predictions = _crypto_predictions_for_model(rows, status["model"])
             if settings is not None:
                 for row, (prediction, _label) in zip(rows, predictions, strict=True):
-                    trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
+                    trade = _simulate_crypto_trade(
+                        row,
+                        prediction,
+                        settings=settings,
+                        crypto_policy=crypto_policy,
+                        edge_shrinkage=edge_shrinkage,
+                    )
                     if trade["status"] == "fillable":
                         trade_rows_by_name[name].append({**row, "simulation": trade})
             metrics = _probability_metrics_decimal(predictions)
@@ -12683,6 +12716,7 @@ def _crypto_in_sample_candidate_report(
                 prediction,
                 settings=settings,
                 crypto_policy=crypto_policy,
+                edge_shrinkage=edge_shrinkage,
             )
             if trade["status"] == "fillable":
                 trade_rows_by_name["calibrated_weighted_ensemble"].append({**row, "simulation": trade})
@@ -12734,6 +12768,7 @@ def _crypto_model_candidate_report(
     settings: Settings | None,
     crypto_policy: RuntimeCryptoPolicy | None = None,
     full_candidate_status: dict[str, dict[str, Any]] | None = None,
+    edge_shrinkage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     min_train_rows = max(2, min(settings.crypto_min_training_samples, 20)) if settings is not None else max(2, min(len(rows) // 2, 20))
     max_folds = _crypto_model_candidate_report_max_folds(settings)
@@ -12743,6 +12778,7 @@ def _crypto_model_candidate_report(
             full_candidate_status or _fit_crypto_model_candidates(rows, settings=settings),
             settings=settings,
             crypto_policy=crypto_policy,
+            edge_shrinkage=edge_shrinkage,
         )
         report["status"] = "walk_forward_disabled"
         report["reason"] = "crypto_model_candidate_report_max_walk_forward_folds=0"
@@ -12754,6 +12790,7 @@ def _crypto_model_candidate_report(
             full_candidate_status or _fit_crypto_model_candidates(rows, settings=settings),
             settings=settings,
             crypto_policy=crypto_policy,
+            edge_shrinkage=edge_shrinkage,
         )
         report["status"] = "insufficient_walk_forward_data"
         report["reason"] = "need_settled_point_in_time_crypto_rows_across_market_days"
@@ -12781,6 +12818,7 @@ def _crypto_model_candidate_report(
             candidate_status,
             settings=settings,
             crypto_policy=crypto_policy,
+            edge_shrinkage=edge_shrinkage,
         )
         weights = dict(train_report.get("ensemble_weights") or {})
         if len(weights) >= 2:
@@ -12788,7 +12826,13 @@ def _crypto_model_candidate_report(
             for row, prediction in zip(test_rows, ensemble_test_preds):
                 predictions_by_candidate["calibrated_weighted_ensemble"].append((prediction, int(row["label_yes"])))
                 if settings is not None:
-                    trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
+                    trade = _simulate_crypto_trade(
+                        row,
+                        prediction,
+                        settings=settings,
+                        crypto_policy=crypto_policy,
+                        edge_shrinkage=edge_shrinkage,
+                    )
                     if trade["status"] == "fillable":
                         trade_rows_by_candidate["calibrated_weighted_ensemble"].append({**row, "simulation": trade})
         else:
@@ -12803,7 +12847,13 @@ def _crypto_model_candidate_report(
             for row, (prediction, label) in zip(test_rows, batch_preds, strict=True):
                 predictions_by_candidate[name].append((prediction, label))
                 if settings is not None:
-                    trade = _simulate_crypto_trade(row, prediction, settings=settings, crypto_policy=crypto_policy)
+                    trade = _simulate_crypto_trade(
+                        row,
+                        prediction,
+                        settings=settings,
+                        crypto_policy=crypto_policy,
+                        edge_shrinkage=edge_shrinkage,
+                    )
                     if trade["status"] == "fillable":
                         trade_rows_by_candidate[name].append({**row, "simulation": trade})
         fold_summaries.append(
@@ -15685,6 +15735,7 @@ def _simulate_crypto_trade(
     enforce_empirical_bucket_gate: bool = False,
     empirical_bucket_requested_assets: list[str] | None = None,
     force_empirical_bucket_for_requested_assets: bool = False,
+    edge_shrinkage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     label_yes = int(row["label_yes"])
     candidates = _crypto_trade_candidates(
@@ -15697,6 +15748,7 @@ def _simulate_crypto_trade(
         enforce_empirical_bucket_gate=enforce_empirical_bucket_gate,
         empirical_bucket_requested_assets=empirical_bucket_requested_assets,
         force_empirical_bucket_for_requested_assets=force_empirical_bucket_for_requested_assets,
+        edge_shrinkage=edge_shrinkage,
     )
     allowed_statuses = {CRYPTO_LIVE_QUALITY}
     if policy == CRYPTO_EXPLORATORY_SHADOW:

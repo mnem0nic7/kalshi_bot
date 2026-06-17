@@ -268,6 +268,13 @@ class Settings(BaseSettings):
     # simulation artifact, e.g. v11 XRP/DOGE/HYPE sklearn at brier 0.17-0.19 vs
     # mid ~0.15). Genuine edge keeps Brier at/below mid (BTC/SOL/BNB).
     crypto_model_max_brier_regression_vs_mid: float = 0.07
+    # Selection/live parity: apply the same live edge-shrinkage fit (loaded from
+    # the deployment-control note, beta floored at crypto_edge_shrinkage_beta_floor)
+    # inside the trainer candidate simulation so champion selection optimizes the
+    # post-shrinkage edge that actually reaches the order book. Without this the
+    # trainer over-states edge ~5x and promotes models that trade $0 live
+    # (BTC 15m lightgbm "+$1.99/11 trades" -> 0 live fills, 2026-06-17).
+    crypto_model_selection_apply_edge_shrinkage: bool = True
     # Optional override for model-selection reporting inside training. The
     # replay gate still uses crypto_model_candidate_max_walk_forward_folds.
     crypto_model_candidate_report_max_walk_forward_folds: int | None = None
