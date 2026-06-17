@@ -106,7 +106,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v10"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v11"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -10234,6 +10234,18 @@ def _spot_context_for_decision(
     spot_exchange_spread = best_bid_ask.get("spread_bps")
     spot_exchange_latest_trade_size = _optional_decimal(latest_trade.get("size"))
     spot_exchange_recent_trade_count = microstructure.get("recent_trade_count")
+    # Order-book depth imbalance: the directional short-horizon microstructure
+    # signal. (bid_size - ask_size)/(bid_size + ask_size) in [-1, 1]; positive =
+    # bid-heavy (upward pressure). None when sizes are unavailable.
+    spot_exchange_bid_size = _optional_decimal(best_bid_ask.get("best_bid_size"))
+    spot_exchange_ask_size = _optional_decimal(best_bid_ask.get("best_ask_size"))
+    spot_exchange_depth_imbalance = None
+    if spot_exchange_bid_size is not None and spot_exchange_ask_size is not None:
+        _depth_total = spot_exchange_bid_size + spot_exchange_ask_size
+        if _depth_total > 0:
+            spot_exchange_depth_imbalance = float(
+                (spot_exchange_bid_size - spot_exchange_ask_size) / _depth_total
+            )
     return {
         "spot_feature_status": "available" if not stale else "stale",
         "spot_provider": current.provider,
@@ -10259,6 +10271,7 @@ def _spot_context_for_decision(
         "spot_exchange_spread_bps": int(spot_exchange_spread) if spot_exchange_spread not in (None, "") else None,
         "spot_exchange_latest_trade_size": spot_exchange_latest_trade_size,
         "spot_exchange_recent_trade_count": int(spot_exchange_recent_trade_count) if spot_exchange_recent_trade_count not in (None, "") else None,
+        "spot_exchange_depth_imbalance": spot_exchange_depth_imbalance,
         "spot_return_12_pct": spot_return_12_pct,
         "spot_return_24_pct": spot_return_24_pct,
         "spot_realized_volatility_32": volatility_32,
@@ -10963,6 +10976,7 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "market_age_ratio",
         "spot_exchange_spread_bps",
         "spot_exchange_recent_trade_count",
+        "spot_exchange_depth_imbalance",
         "spot_return_12_pct",
         "spot_return_24_pct",
         "spot_realized_volatility_32",
@@ -11075,6 +11089,7 @@ def _crypto_raw_feature_vector(
     spot_stale_seconds = max(0.0, float(row.get("spot_stale_seconds") or 0))
     spot_exchange_spread = max(0.0, float(row.get("spot_exchange_spread_bps") or 0))
     spot_exchange_trade_count = max(0.0, float(row.get("spot_exchange_recent_trade_count") or 0))
+    spot_exchange_depth_imbalance = float(_decimal(row.get("spot_exchange_depth_imbalance") or Decimal("0")))
     market_mid_change = float(_decimal(row.get("market_mid_change_1") or Decimal("0")))
     market_mid_velocity = float(_decimal(row.get("market_mid_velocity_per_min") or Decimal("0")))
     spread_change = float(row.get("spread_change_bps_1") or 0)
@@ -11132,6 +11147,8 @@ def _crypto_raw_feature_vector(
         # assets (BTC always has 50+ recent trades), flattening the feature to a
         # constant. log1p keeps low-end resolution and ceilings at ~500 trades.
         "spot_exchange_recent_trade_count": min(math.log1p(spot_exchange_trade_count) / math.log1p(500.0), 1.0),
+        # Already in [-1, 1] by construction; clamp defensively.
+        "spot_exchange_depth_imbalance": max(-1.0, min(1.0, spot_exchange_depth_imbalance)),
         "spot_return_12_pct": max(-0.20, min(0.20, spot_return_12)) * 5.0,
         "spot_return_24_pct": max(-0.30, min(0.30, spot_return_24)) * (10.0 / 3.0),
         "spot_realized_volatility_32": max(0.0, min(0.20, spot_volatility_32)) * 5.0,
