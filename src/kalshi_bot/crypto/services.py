@@ -3890,6 +3890,62 @@ class CryptoForecastService:
         self.agent_pack_service = agent_pack_service or AgentPackService(settings)
         self.spot_service = spot_service
 
+    async def evaluate_vol_fair_value(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        days: int | None = None,
+        max_folds: int | None = None,
+    ) -> dict[str, Any]:
+        """Light, training-free OOS evaluation of the analytic vol fair-value
+        strategy (no tree fits, no GPU). Loads feature-store rows, then per asset
+        walk-forward-scores `vol_normal_fair_value` vs the market mid after fees +
+        live edge-shrinkage. Use this to iterate the σ estimator / calibration in
+        seconds instead of behind the full candidate trainer."""
+        freq = normalize_frequency(frequency) or "15m"
+        requested_assets = normalize_asset_symbols(asset_symbols)
+        lookback_days = max(1, int(days if days is not None else self.settings.crypto_train_lookback_days))
+        since = datetime.now(UTC) - timedelta(days=lookback_days)
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session)
+            feature_records = await repo.list_crypto_training_feature_rows(
+                frequency=freq,
+                kalshi_env=self.settings.kalshi_env,
+                asset_symbols=requested_assets or None,
+                since=since,
+                limit=self.settings.crypto_train_max_snapshots,
+            )
+            active_pack = await self.agent_pack_service.get_active_pack(repo)
+            crypto_policy = self.agent_pack_service.runtime_crypto_policy(active_pack)
+            edge_shrinkage: dict[str, Any] | None = None
+            if bool(self.settings.crypto_model_selection_apply_edge_shrinkage):
+                control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+                edge_shrinkage = _crypto_edge_shrinkage_from_notes(
+                    getattr(control, "notes", None), frequency=freq, settings=self.settings
+                )
+        decision_rows = [_crypto_training_row_payload(record) for record in reversed(feature_records)]
+        folds = max_folds if max_folds is not None else _crypto_model_candidate_report_max_folds(self.settings)
+        assets_report: dict[str, Any] = {}
+        for asset in requested_assets or sorted({str(row.get("asset_symbol")) for row in decision_rows if row.get("asset_symbol")}):
+            asset_rows = _filter_crypto_dict_rows(decision_rows, [asset])
+            assets_report[asset] = _crypto_vol_fair_value_oos_eval(
+                asset_rows,
+                settings=self.settings,
+                crypto_policy=crypto_policy,
+                edge_shrinkage=edge_shrinkage,
+                max_folds=folds,
+            )
+        return {
+            "status": "ok",
+            "kalshi_env": self.settings.kalshi_env,
+            "frequency": freq,
+            "days": lookback_days,
+            "edge_shrinkage_applied": bool(edge_shrinkage),
+            "edge_shrinkage_beta": (edge_shrinkage or {}).get("beta"),
+            "assets": assets_report,
+        }
+
     async def train(
         self,
         *,
@@ -11563,6 +11619,79 @@ def _fit_crypto_vol_fair_value_model(rows: list[dict[str, Any]], *, fallback: di
         [int(row["label_yes"]) for row in rows],
     )
     return model
+
+
+def _crypto_vol_fair_value_oos_eval(
+    rows: list[dict[str, Any]],
+    *,
+    settings: Settings,
+    crypto_policy: RuntimeCryptoPolicy | None = None,
+    edge_shrinkage: dict[str, Any] | None = None,
+    max_folds: int | None = None,
+) -> dict[str, Any]:
+    """Light walk-forward OOS evaluation of ONLY the analytic vol fair-value
+    candidate vs the market mid, after fees + live edge-shrinkage.
+
+    Fits nothing but the per-fold isotonic calibration map (no tree models, no
+    GPU) so the σ estimator and calibration can be iterated cheaply. Mirrors the
+    selection scoring used by the full candidate report, restricted to vol + mid.
+    """
+    min_train_rows = max(2, min(settings.crypto_min_training_samples, 20))
+    folds = _crypto_walk_forward_folds(rows, min_train_rows=min_train_rows, max_folds=max_folds)
+    if not folds:
+        return {"status": "insufficient_walk_forward_data", "fold_count": 0, "sample_count": len(rows)}
+    mid_model = {"model_type": "market_mid_baseline"}
+    vol_preds: list[tuple[Decimal, int]] = []
+    mid_preds: list[tuple[Decimal, int]] = []
+    vol_trades: list[dict[str, Any]] = []
+    mid_trades: list[dict[str, Any]] = []
+    for fold in folds:
+        train_rows = fold["train_rows"]
+        test_rows = fold["test_rows"]
+        fallback = _fit_crypto_heuristic_calibration(train_rows)
+        vol_model = _fit_crypto_vol_fair_value_model(train_rows, fallback=fallback)
+        for row in test_rows:
+            label = int(row["label_yes"])
+            vol_p = _predict_crypto_probability(row, vol_model)
+            mid_p = _predict_crypto_probability(row, mid_model)
+            vol_preds.append((vol_p, label))
+            mid_preds.append((mid_p, label))
+            vol_trade = _simulate_crypto_trade(
+                row, vol_p, settings=settings, crypto_policy=crypto_policy, edge_shrinkage=edge_shrinkage
+            )
+            if vol_trade["status"] == "fillable":
+                vol_trades.append({**row, "simulation": vol_trade})
+            mid_trade = _simulate_crypto_trade(
+                row, mid_p, settings=settings, crypto_policy=crypto_policy, edge_shrinkage=edge_shrinkage
+            )
+            if mid_trade["status"] == "fillable":
+                mid_trades.append({**row, "simulation": mid_trade})
+    vol_metrics = _probability_metrics_decimal(vol_preds)
+    mid_metrics = _probability_metrics_decimal(mid_preds)
+    vol_policy = _crypto_policy_metrics("vol_normal_fair_value", vol_trades, settings=settings)
+    mid_policy = _crypto_policy_metrics("market_mid_baseline", mid_trades, settings=settings)
+    vol_net = _decimal(vol_policy["net_pnl"])
+    mid_net = _decimal(mid_policy["net_pnl"])
+    vol_brier = vol_metrics.get("brier")
+    mid_brier = mid_metrics.get("brier")
+    beats_mid_brier = (
+        vol_brier is not None and mid_brier is not None and Decimal(str(vol_brier)) <= Decimal(str(mid_brier))
+    )
+    return {
+        "status": "ok",
+        "fold_count": len(folds),
+        "sample_count": len(rows),
+        "test_count": len(vol_preds),
+        "vol_brier": vol_brier,
+        "mid_brier": mid_brier,
+        "beats_mid_brier": bool(beats_mid_brier),
+        "vol_net_pnl": str(vol_net.quantize(Decimal("0.0001"))),
+        "mid_net_pnl": str(mid_net.quantize(Decimal("0.0001"))),
+        "advantage_vs_mid": str((vol_net - mid_net).quantize(Decimal("0.0001"))),
+        "vol_selected_count": int(vol_policy["selected_count"]),
+        "vol_win_rate": vol_policy.get("win_rate"),
+        "edge_shrinkage_applied": bool(edge_shrinkage),
+    }
 
 
 def _fit_crypto_spot_distance_contrarian_model(rows: list[dict[str, Any]], *, fallback: dict[str, Any]) -> dict[str, Any]:

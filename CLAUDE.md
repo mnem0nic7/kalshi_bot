@@ -40,6 +40,7 @@ kalshi-bot-cli <subcommand>   # see README for the full list
 kalshi-bot-cli crypto-report --frequency 15m --days 7        # decision funnel (blocks→eligible→fills) + live champion per asset
 kalshi-bot-cli crypto-pnl-report --days 14                   # fee-accurate FILL economics (gross/net/fees, by market)
 kalshi-bot-cli crypto-maker-markout-report --days 14         # maker fill quality / adverse selection
+kalshi-bot-cli crypto-vol-eval --frequency 15m              # light, training-free OOS eval of the analytic vol fair-value strategy vs mid (no GPU/tree fits)
 ```
 
 No linter/formatter is configured in `pyproject.toml`. Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. The global `conftest.py` sets `WEB_AUTH_ENABLED=false` as an autouse fixture, so integration tests skip HTTP basic-auth without extra setup.

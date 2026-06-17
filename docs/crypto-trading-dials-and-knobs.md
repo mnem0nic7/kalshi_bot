@@ -267,6 +267,7 @@ python -m kalshi_bot.cli crypto-maker-markout-report --kalshi-env production --f
 | `crypto-report --frequency 15m --days 7` | Per-asset decision funnel (decisions → block reasons → eligible → fills), win rate, gross realized + simulated P&L, and the live champion `model_type`/status. Surfaces *why* the system is/ isn't trading. |
 | `crypto-pnl-report --days 14` | Fee-accurate fill economics (gross/net/fees, wins/losses, by market and cell). |
 | `crypto-maker-markout-report --days 14` | Maker fill quality / adverse-selection markout. |
+| `crypto-vol-eval --frequency 15m` | Light, **training-free** OOS evaluation of the analytic `vol_normal_fair_value` strategy vs the market mid, after fees + live edge-shrinkage. Fits only the per-fold isotonic calibration (no tree models, no GPU), so the σ estimator and calibration can be iterated in seconds instead of behind the full candidate trainer. Reports vol vs mid Brier (`beats_mid_brier`), OOS net P&L, advantage vs mid, and trade count per asset. |
 
 Training depends on both market history and spot history. A model can be trained
 but still fail replay if the replay window does not produce enough strict

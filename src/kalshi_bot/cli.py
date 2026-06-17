@@ -132,6 +132,7 @@ CRYPTO_ENV_COMMANDS = {
     "crypto-asset-mode",
     "crypto-policy",
     "crypto-live-path",
+    "crypto-vol-eval",
     "crypto-report",
     "crypto-pnl-report",
     "crypto-maker-markout-report",
@@ -746,6 +747,41 @@ async def _run_crypto_spot_command(args: argparse.Namespace, container: AppConta
     if args.crypto_spot_command in {"collect-funding-rates", "backfill-funding-rates"}:
         return 0 if not any(v.get("error") for v in (result.get("per_asset") or {result.get("asset_symbol", ""): result}).values()) else 1
     return 0 if result.get("status") in {"ok", "warn"} else 1
+
+
+def _format_crypto_vol_eval(report: dict[str, Any]) -> str:
+    lines = [
+        f"crypto-vol-eval env={report.get('kalshi_env')} freq={report.get('frequency')} "
+        f"days={report.get('days')} shrinkage={'β=' + str(report.get('edge_shrinkage_beta')) if report.get('edge_shrinkage_applied') else 'off'}",
+        "  (analytic Φ(ln(S/K)/(σ√τ)) + isotonic calibration vs market mid, OOS, after fees+shrinkage — no model training)",
+    ]
+    for asset in sorted(report.get("assets", {})):
+        a = report["assets"][asset]
+        if a.get("status") != "ok":
+            lines.append(f"{asset}: {a.get('status')} (folds={a.get('fold_count', 0)}, samples={a.get('sample_count', 0)})")
+            continue
+        beats = "YES" if a.get("beats_mid_brier") else "no"
+        lines.append(
+            f"{asset}: folds={a['fold_count']} test={a['test_count']} | "
+            f"vol_brier={a['vol_brier']} mid_brier={a['mid_brier']} beats_mid_brier={beats} | "
+            f"vol_net=${a['vol_net_pnl']} adv_vs_mid=${a['advantage_vs_mid']} "
+            f"trades={a['vol_selected_count']} win_rate={a.get('vol_win_rate')}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+async def _run_crypto_vol_eval_command(args: argparse.Namespace, container: AppContainer) -> int:
+    report = await container.crypto_forecast_service.evaluate_vol_fair_value(
+        frequency=getattr(args, "frequency", "15m"),
+        asset_symbols=getattr(args, "assets", None),
+        days=getattr(args, "days", None),
+        max_folds=getattr(args, "max_folds", None),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print(_format_crypto_vol_eval(report), end="")
+    return 0
 
 
 async def _run_crypto_model_command(args: argparse.Namespace, container: AppContainer) -> int:
@@ -3728,6 +3764,9 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if args.command == "crypto-policy":
             return await _run_crypto_policy_command(args, container)
 
+        if args.command == "crypto-vol-eval":
+            return await _run_crypto_vol_eval_command(args, container)
+
         if args.command == "crypto-report":
             return await _run_crypto_report_command(args, container)
 
@@ -5433,6 +5472,17 @@ def build_parser() -> argparse.ArgumentParser:
     funnel_report.add_argument("--frequency", default="15m")
     funnel_report.add_argument("--assets", nargs="*", default=None)
     funnel_report.add_argument("--json", action="store_true")
+
+    crypto_vol_eval = subparsers.add_parser(
+        "crypto-vol-eval",
+        help="Light, training-free OOS eval of the analytic vol fair-value strategy vs market mid (no GPU/tree fits).",
+    )
+    crypto_vol_eval.add_argument("--kalshi-env", choices=["demo", "production"], default="production")
+    crypto_vol_eval.add_argument("--frequency", default="15m")
+    crypto_vol_eval.add_argument("--assets", nargs="*", default=None)
+    crypto_vol_eval.add_argument("--days", type=int, default=None)
+    crypto_vol_eval.add_argument("--max-folds", type=int, default=None, dest="max_folds")
+    crypto_vol_eval.add_argument("--json", action="store_true")
 
     crypto_report = subparsers.add_parser(
         "crypto-report",
