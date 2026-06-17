@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
-from kalshi_bot.mm.fair_value import fair_up_normal, infer_step_seconds, realized_vol
+from kalshi_bot.mm.fair_value import ewma_vol, fair_up_normal, infer_step_seconds, realized_vol
 
 
 def _phi(z: float) -> float:
@@ -58,3 +58,28 @@ def test_realized_vol_positive_for_varying_series_and_none_when_flat():
     v = realized_vol(prices)
     assert v is not None and v > 0
     assert realized_vol([Decimal("100")]) is None
+
+
+def test_ewma_vol_none_when_insufficient_and_positive_when_varying():
+    # Same minimum-data contract as realized_vol: needs >=3 usable prices.
+    assert ewma_vol([Decimal("100")]) is None
+    assert ewma_vol([Decimal("100"), Decimal("101")]) is None
+    v = ewma_vol([Decimal("100"), Decimal("101"), Decimal("100"), Decimal("102")])
+    assert v is not None and v > 0
+
+
+def test_ewma_vol_lower_lambda_is_more_sensitive_to_a_late_spike():
+    # A calm series with a single late jump. Lower lambda weights the recent
+    # return more, so it reacts more to the end spike than a high-lambda (smoother,
+    # "stable") estimate. This is the knob that trades responsiveness vs noise.
+    series = [Decimal("100"), Decimal("100.05"), Decimal("100.00"), Decimal("100.05"),
+              Decimal("100.00"), Decimal("100.05"), Decimal("103.00")]
+    responsive = ewma_vol(series, lam=0.80)
+    smooth = ewma_vol(series, lam=0.97)
+    assert responsive is not None and smooth is not None
+    assert responsive > smooth
+
+
+def test_ewma_vol_flat_series_is_zero_or_none():
+    # No variation → no volatility (mirrors realized_vol's flat-series contract).
+    assert (ewma_vol([Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")]) or Decimal("0")) == Decimal("0")

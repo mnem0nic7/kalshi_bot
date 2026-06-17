@@ -279,6 +279,9 @@ python -m kalshi_bot.cli crypto-maker-markout-report --kalshi-env production --f
 | `mm_frequency` | `15m` | Market frequency the loop logs/evaluates. |
 | `mm_eval_interval_seconds` | `900` | How often the loop runs the vol fair-value OOS eval between spine-logging ticks. |
 | `mm_idle_seconds` | `5` | Sleep between loop iterations. |
+| `mm_vol_estimator` | `ewma` | σ̂ used for fair value: `ewma` (RiskMetrics-style, smoother / less per-row ranking noise — the "stable" σ) or `realized` (equal-weight stdev). The spine logs **both** (`sigma_realized`, `sigma_ewma`) per tick regardless, for OOS comparison. |
+| `mm_vol_window` | `64` | Spot lookback (samples) for the σ̂. Larger = more stable, slower to react. |
+| `mm_vol_ewma_lambda` | `0.97` | EWMA decay λ (effective memory ≈ 1/(1−λ) ≈ 33 samples). Higher = smoother; lower = more responsive. The documented sigma lever — iterate here. |
 
 The container is triple-guarded non-trading (`CRYPTO_TRADING_ENABLED=false`, `APP_SHADOW_MODE=true`, `APP_ENABLE_KILL_SWITCH=true`); it never reaches `ExecutionService`. See `docs/operations/crypto-mm-research-stack.md`.
 

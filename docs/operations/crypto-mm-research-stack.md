@@ -26,9 +26,16 @@ evaluates; there is no order-placement path in `mm/`.
 1. **Data spine** (`data_spine.py`) — discovers active 15m markets (anchored to
    `floor_strike` = `target_price_dollars`), joins the latest consolidated spot,
    normalizes to a tick row, appends to the day's JSONL partition.
-2. **Fair value** (`fair_value.py`) — `Φ(ln(S/K)/(σ√τ))` with a realized-vol σ̂.
-   **σ is the lever** (`crypto-vol-eval` showed the analytic edge stands or falls
-   on it); iterate the σ estimator (EWMA/HAR, intraday seasonality) here.
+2. **Fair value** (`fair_value.py`) — `Φ(ln(S/K)/(σ√τ))` with a configurable σ̂:
+   `ewma_vol` (RiskMetrics-style, smoother/less per-row ranking noise — the
+   default "stable" σ) or `realized_vol` (equal-weight stdev), selected via
+   `mm_vol_estimator` / `mm_vol_window` / `mm_vol_ewma_lambda`. **σ is the lever**
+   (`crypto-vol-eval` showed the analytic edge stands or falls on it). Each spine
+   tick logs **both** `sigma_realized` and `sigma_ewma` so the two σ̂'s can be
+   OOS-compared offline from the JSONL once markets settle (no prod-host DB load).
+   Next σ steps: HAR / intraday-seasonality, and the **spot-vs-settlement basis
+   check** (does our spot agree with Kalshi's `settlement_result` near close?),
+   computed from the accumulating spine — NOT a heavy scan of `crypto_market_snapshots`.
 3. **Backtest** (`backtest.py`) — maker entry rule (avoid the 45–55¢ peak-fee
    band), realistic fill (only when the market trades to the resting limit),
    settlement P&L (no maker rebate) so adverse selection is reflected.

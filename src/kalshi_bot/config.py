@@ -283,6 +283,12 @@ class Settings(BaseSettings):
     mm_frequency: str = "15m"
     mm_eval_interval_seconds: float = 900.0
     mm_idle_seconds: float = 5.0
+    # σ̂ estimator for the sigma research spine. "ewma" (RiskMetrics-style,
+    # smoother/less per-row noise) or "realized" (equal-weight stdev). The
+    # window/λ is the documented sigma lever — iterate here, not in the live path.
+    mm_vol_estimator: str = "ewma"
+    mm_vol_window: int = 64
+    mm_vol_ewma_lambda: float = 0.97
     # Optional override for model-selection reporting inside training. The
     # replay gate still uses crypto_model_candidate_max_walk_forward_folds.
     crypto_model_candidate_report_max_walk_forward_folds: int | None = None

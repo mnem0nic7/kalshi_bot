@@ -18,13 +18,14 @@ from kalshi_bot.config import Settings
 from kalshi_bot.crypto.services import CryptoForecastService, CryptoMarketService, normalize_asset_symbols
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.mm.data_spine import VenueQuote, build_market_tick, consolidate_spot, seconds_to_close
-from kalshi_bot.mm.fair_value import fair_up_normal, infer_step_seconds, realized_vol
+from kalshi_bot.mm.fair_value import ewma_vol, fair_up_normal, infer_step_seconds, realized_vol
 from kalshi_bot.mm.loop import MarketMakingLoop, MmLoopConfig
 from kalshi_bot.mm.storage import TickStore
 
 logger = logging.getLogger(__name__)
 
-_VOL_WINDOW = 33
+# Headroom over the configured σ̂ window so EWMA has enough returns to settle.
+_VOL_WINDOW_FLOOR = 33
 _DEFAULT_MM_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE")
 
 
@@ -57,6 +58,15 @@ class MarketMakingResearchService:
         self.assets = resolve_mm_assets(settings.crypto_model_nightly_assets)
         self.store = tick_store or TickStore(base_dir=settings.mm_data_dir)
         self._config = MmLoopConfig(eval_interval_seconds=eval_interval_seconds, idle_seconds=idle_seconds)
+        self._vol_window = max(_VOL_WINDOW_FLOOR, int(getattr(settings, "mm_vol_window", 64)) + 1)
+        self._vol_estimator = str(getattr(settings, "mm_vol_estimator", "ewma")).strip().lower()
+        self._vol_lambda = float(getattr(settings, "mm_vol_ewma_lambda", 0.97))
+
+    def _estimate_sigma(self, closes: list) -> Any:
+        """The configured σ̂ — the documented sigma lever (iterate here)."""
+        if self._vol_estimator == "realized":
+            return realized_vol(closes)
+        return ewma_vol(closes, lam=self._vol_lambda)
 
     async def _collect_ticks(self) -> list[dict[str, Any]]:
         now = datetime.now(UTC)
@@ -76,7 +86,7 @@ class MarketMakingResearchService:
             for asset in {m.asset_symbol for m in markets}:
                 try:
                     rows = await repo.list_crypto_spot_ohlc(
-                        asset_symbol=asset, kalshi_env=self.settings.kalshi_env, limit=_VOL_WINDOW
+                        asset_symbol=asset, kalshi_env=self.settings.kalshi_env, limit=self._vol_window
                     )
                 except Exception:
                     continue
@@ -86,14 +96,22 @@ class MarketMakingResearchService:
                     continue
                 stamps = [getattr(r, "end_ts", None) for r in ordered]
                 step = infer_step_seconds([s.timestamp() for s in stamps if s is not None]) or 60.0
-                spot_by_asset[asset] = (closes[-1], realized_vol(closes), step)
+                # σ used for fair value is the configured estimator; log both so the
+                # spine can OOS-compare stable (ewma) vs equal-weight (realized) σ̂.
+                spot_by_asset[asset] = (
+                    closes[-1],
+                    self._estimate_sigma(closes),
+                    step,
+                    realized_vol(closes),
+                    ewma_vol(closes, lam=self._vol_lambda),
+                )
         ticks: list[dict[str, Any]] = []
         for market in markets:
             strike = market.target_price_dollars
             spot_info = spot_by_asset.get(market.asset_symbol)
             if strike is None or strike <= 0 or spot_info is None:
                 continue
-            spot_price, sigma, step_seconds = spot_info
+            spot_price, sigma, step_seconds, sigma_realized, sigma_ewma = spot_info
             spot = consolidate_spot([VenueQuote(venue="coinbase", price=spot_price, age_seconds=0.0)])
             if spot is None or market.close_time is None:
                 continue
@@ -111,6 +129,9 @@ class MarketMakingResearchService:
                 observed_ts=now_ts,
             )
             tick["realized_vol"] = None if sigma is None else str(sigma)
+            tick["sigma_estimator"] = self._vol_estimator
+            tick["sigma_realized"] = None if sigma_realized is None else str(sigma_realized)
+            tick["sigma_ewma"] = None if sigma_ewma is None else str(sigma_ewma)
             tick["step_interval_seconds"] = step_seconds
             fair = (
                 fair_up_normal(

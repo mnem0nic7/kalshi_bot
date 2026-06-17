@@ -47,6 +47,30 @@ def realized_vol(prices: list[Decimal]) -> Decimal | None:
     return Decimal(str(math.sqrt(var)))
 
 
+def ewma_vol(prices: list[Decimal], *, lam: float = 0.94) -> Decimal | None:
+    """Exponentially weighted std of simple returns (RiskMetrics-style σ̂).
+
+    σ²_t = λ·σ²_{t-1} + (1−λ)·r²_t, seeded at the first squared return. A higher
+    ``lam`` lengthens the effective memory (smoother, less per-row ranking noise —
+    the "stable" estimate); a lower ``lam`` reacts faster to recent moves. Same
+    minimum-data contract as ``realized_vol`` (needs ≥3 usable prices); None when
+    the series is degenerate or flat.
+    """
+    valid = [p for p in prices if p is not None and p > 0]
+    if len(valid) < 3:
+        return None
+    rets = [float((b - a) / a) for a, b in zip(valid, valid[1:]) if a > 0]
+    if len(rets) < 2:
+        return None
+    decay = min(max(float(lam), 0.0), 0.999999)
+    var = rets[0] * rets[0]
+    for r in rets[1:]:
+        var = decay * var + (1.0 - decay) * (r * r)
+    if var <= 0:
+        return None
+    return Decimal(str(math.sqrt(var)))
+
+
 def fair_up_normal(
     *,
     spot: Decimal,

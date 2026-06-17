@@ -123,7 +123,7 @@ All 7 assets are *configured* on the **CRYPTO_15M model path**. The champion set
 ### Market-making research stack (`mm/`)
 A self-contained, **NON-TRADING** research subsystem implementing `docs/research/kalshi_15m_market_making_plan.md` as a continuous loop, isolated in its own container (`crypto_mm_production`, CPU-only, `mem_limit 8g`, `oom_score_adj 500`). It **never places orders** — execution stays in `ExecutionService`; the container is triple-guarded (`CRYPTO_TRADING_ENABLED=false`, shadow on, kill switch on).
 - `data_spine.py` — multi-venue spot consolidation (volume/recency weighted, staleness + outlier guards), market-tick normalization anchored to `floor_strike`.
-- `fair_value.py` — analytic `Φ(ln(S/K)/(σ√τ))` + the σ̂ estimator (`realized_vol`). **σ is the lever** — `crypto-vol-eval` showed the analytic edge stands or falls on it; iterate σ here.
+- `fair_value.py` — analytic `Φ(ln(S/K)/(σ√τ))` + a configurable σ̂ estimator: `ewma_vol` (default, RiskMetrics-style stable σ) or `realized_vol` (equal-weight), via `mm_vol_estimator`/`mm_vol_window`/`mm_vol_ewma_lambda`. **σ is the lever** — `crypto-vol-eval` showed the analytic edge stands or falls on it; iterate σ here. The spine logs both σ̂'s per tick for offline OOS comparison.
 - `backtest.py` — maker entry rule (avoid the 45–55¢ band) + realistic-fill / settlement P&L (no maker rebate).
 - `storage.py` — append-only per-day JSONL on the `mm_data` volume (+ optional Parquet compaction).
 - `loop.py` / `service.py` — the continuous loop (log every tick; OOS-evaluate every `MM_EVAL_INTERVAL_SECONDS`), assembled with real collaborators. Run via `crypto-mm run`.
