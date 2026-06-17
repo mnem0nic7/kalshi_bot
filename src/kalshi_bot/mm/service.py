@@ -25,6 +25,15 @@ from kalshi_bot.mm.storage import TickStore
 logger = logging.getLogger(__name__)
 
 _VOL_WINDOW = 33
+_DEFAULT_MM_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE")
+
+
+def resolve_mm_assets(raw: str | list[str] | None) -> list[str]:
+    """Parse the configured assets (a comma-separated string or a list) into
+    normalized symbols, falling back to the default 7 when empty."""
+    items = raw.split(",") if isinstance(raw, str) else list(raw or [])
+    resolved = normalize_asset_symbols([str(item).strip() for item in items if str(item).strip()])
+    return resolved or list(_DEFAULT_MM_ASSETS)
 
 
 class MarketMakingResearchService:
@@ -45,7 +54,7 @@ class MarketMakingResearchService:
         self.market_service = market_service
         self.forecast_service = forecast_service
         self.frequency = frequency
-        self.assets = normalize_asset_symbols(None) or list(settings.crypto_model_nightly_assets or [])
+        self.assets = resolve_mm_assets(settings.crypto_model_nightly_assets)
         self.store = tick_store or TickStore(base_dir=settings.mm_data_dir)
         self._config = MmLoopConfig(eval_interval_seconds=eval_interval_seconds, idle_seconds=idle_seconds)
 
