@@ -591,9 +591,12 @@ services:
       # before the worker broadcast (~35x smaller) so it stays under the cap.
       CRYPTO_TRAIN_MICROSTRUCTURE_FEATURES_ENABLED: "true"
       # The build partitions a single asset BY MARKET across workers, but each
-      # worker receives the dense spot window. Keep this conservative so the
-      # trainer finishes under its 32g cgroup instead of stalling at the limit.
-      CRYPTO_TRAIN_BUILD_WORKERS: "2"
+      # worker receives the FULL dense spot window (pickled per worker). At 30d
+      # full volume (~1060 markets / ~502k spot rows) that broadcast multiplies
+      # memory and pins the 32g cgroup. Serial (1) removes the per-worker copies
+      # so 30d fits; slower per asset. Proper fix to re-enable parallelism:
+      # partition spot/snapshots per worker instead of broadcasting all of it.
+      CRYPTO_TRAIN_BUILD_WORKERS: "1"
       # Override the global .env CRYPTO_TRAIN_LOOKBACK_DAYS=180. Restored from 3d
       # to 30d so candidate selection + the now-OOS report folds have a robust,
       # multi-regime window (3d was too thin for trustworthy walk-forward folds).
