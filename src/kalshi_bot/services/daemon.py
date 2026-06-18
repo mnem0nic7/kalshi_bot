@@ -58,6 +58,11 @@ from kalshi_bot.weather.mapping import WeatherMarketDirectory
 
 logger = logging.getLogger(__name__)
 
+# Deployment-control note key holding the continuous-train resume cursor
+# (last completed {"pair": [asset, frequency]}). DB-backed so it survives
+# container restarts/recreates and the loop picks up where it left off.
+_CRYPTO_TRAIN_CURSOR_KEY = "crypto_continuous_train_cursor"
+
 
 class DaemonService:
     def __init__(
@@ -1477,6 +1482,11 @@ class DaemonService:
         training + gating each individually so peak memory stays bounded.
         """
         from kalshi_bot.crypto.services import normalize_frequency as _normalize_frequency
+        from kalshi_bot.crypto.train_loop import (
+            build_train_work_order,
+            frequency_last_indices,
+            resume_index,
+        )
 
         assets_csv = self.settings.crypto_continuous_train_assets or self.settings.crypto_model_nightly_assets
         assets = [a.strip().upper() for a in assets_csv.split(",") if a.strip()]
@@ -1497,29 +1507,46 @@ class DaemonService:
             while True:
                 await asyncio.sleep(300)
 
+        # Asset-major interleave so 1h is attempted right after each asset's 15m
+        # (the old frequency-major order ran the whole 15m pass first, so 1h never
+        # got a turn before a restart). A persisted cursor lets a restart resume at
+        # the next item instead of re-training the 15m pass from scratch.
+        work_order = build_train_work_order(assets, frequencies)
+        freq_last = frequency_last_indices(work_order)
+        total = len(work_order)
+        cursor = await self._read_crypto_train_cursor()
+        idx = resume_index(work_order, cursor)
         logger.info(
-            "crypto_continuous_train loop starting assets=%s frequencies=%s idle_seconds=%d",
+            "crypto_continuous_train loop starting assets=%s frequencies=%s idle_seconds=%d "
+            "resume_index=%d/%d (cursor=%s)",
             assets,
             frequencies,
             idle,
+            idx,
+            total,
+            cursor,
         )
         while True:
-            for frequency in frequencies:
-                for asset in assets:
-                    try:
-                        status = await self._train_one_crypto_asset(frequency=frequency, asset=asset)
-                    except Exception:
-                        status = "error"
-                        logger.warning(
-                            "crypto_continuous_train error asset=%s freq=%s",
-                            asset,
-                            frequency,
-                            exc_info=True,
-                        )
-                    logger.info("crypto_continuous_train asset=%s freq=%s status=%s", asset, frequency, status)
-                    if idle > 0:
-                        await asyncio.sleep(idle)
-                # Refresh the pooled gate + sizing policy after each full pass.
+            asset, frequency = work_order[idx]
+            try:
+                status = await self._train_one_crypto_asset(frequency=frequency, asset=asset)
+            except Exception:
+                status = "error"
+                logger.warning(
+                    "crypto_continuous_train error asset=%s freq=%s",
+                    asset,
+                    frequency,
+                    exc_info=True,
+                )
+            logger.info("crypto_continuous_train asset=%s freq=%s status=%s", asset, frequency, status)
+            # Advance the cursor only after the item RETURNS (success or handled
+            # error). An item killed mid-run (e.g. a restart during the first 1h
+            # cold materialize) leaves the cursor on the previous item, so it is
+            # retried rather than skipped — while completed items are never redone.
+            await self._write_crypto_train_cursor(asset, frequency)
+            # Refresh this frequency's pooled gate + sizing once its final asset
+            # for the sweep completes (preserves per-frequency refresh semantics).
+            if freq_last.get(idx) == frequency:
                 try:
                     await self.crypto_replay_service.gate(frequency=frequency, asset_symbols=list(assets))
                 except Exception:
@@ -1532,6 +1559,47 @@ class DaemonService:
                     )
                 except Exception:
                     logger.warning("crypto_continuous_train sizing policy error freq=%s", frequency, exc_info=True)
+            if idle > 0:
+                await asyncio.sleep(idle)
+            idx = (idx + 1) % total
+
+    async def _read_crypto_train_cursor(self) -> tuple[str, str] | None:
+        """Last completed (asset, frequency) from the deployment-control note.
+
+        Survives container recreates (DB-backed), so the loop resumes across
+        restarts. Returns None on any read failure -> safe restart from index 0.
+        """
+        try:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                control = await repo.get_deployment_control(kalshi_env=self.settings.kalshi_env)
+                raw = (control.notes or {}).get(_CRYPTO_TRAIN_CURSOR_KEY)
+                await session.commit()
+            pair = raw.get("pair") if isinstance(raw, dict) else None
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                return (str(pair[0]), str(pair[1]))
+        except Exception:
+            logger.warning("crypto_continuous_train: cursor read failed", exc_info=True)
+        return None
+
+    async def _write_crypto_train_cursor(self, asset: str, frequency: str) -> None:
+        """Persist the last completed (asset, frequency) so a restart resumes next."""
+        try:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                await repo.update_deployment_note_key(
+                    _CRYPTO_TRAIN_CURSOR_KEY,
+                    lambda _prev: {"pair": [asset, frequency]},
+                    kalshi_env=self.settings.kalshi_env,
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "crypto_continuous_train: cursor write failed asset=%s freq=%s",
+                asset,
+                frequency,
+                exc_info=True,
+            )
 
     async def _maybe_run_settlement_follow_up(self) -> dict[str, Any] | None:
         if self.training_corpus_service is None:
