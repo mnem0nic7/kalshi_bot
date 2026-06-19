@@ -4041,13 +4041,22 @@ class CryptoForecastService:
                 )
                 trained_from = "point_in_time_crypto_snapshots_and_candles"
 
-        # Compute phase — no DB connection held open.
+        # Compute phase — no DB connection held open. Run the heavy model fit in a
+        # thread so the asyncio event loop stays responsive (liveness heartbeats,
+        # signal handling, graceful shutdown) during the multi-minute fit — matching
+        # the materialize compute phase above. Without this the synchronous fit
+        # blocks the loop, so a SIGTERM arriving mid-fit can't shut down/resume
+        # cleanly (1h fit-phase stall investigation, 2026-06-19).
         sample_count = len(decision_rows)
-        payload = _fit_crypto_calibration(
-            decision_rows,
-            settings=self.settings,
-            crypto_policy=crypto_policy,
-            edge_shrinkage=selection_edge_shrinkage,
+        loop = asyncio.get_event_loop()
+        payload = await loop.run_in_executor(
+            None,
+            lambda: _fit_crypto_calibration(
+                decision_rows,
+                settings=self.settings,
+                crypto_policy=crypto_policy,
+                edge_shrinkage=selection_edge_shrinkage,
+            ),
         )
         metrics = _crypto_model_metrics(decision_rows, payload, settings=self.settings, crypto_policy=crypto_policy)
         training_quality_blockers = _crypto_training_quality_blockers(
