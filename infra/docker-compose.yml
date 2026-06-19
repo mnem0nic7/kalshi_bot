@@ -572,8 +572,18 @@ services:
       CRYPTO_TRAINING_PREFLIGHT_SETTLED_DAYS: "10"
       CRYPTO_TRAINING_PREFLIGHT_HISTORY_DAYS: "10"
       CRYPTO_TRAINING_PREFLIGHT_SPOT_DAYS: "10"
-      CRYPTO_TRAIN_INCREMENTAL_WARMUP_HOURS: "264"
-      CRYPTO_TRAIN_INCREMENTAL_LABEL_REFRESH_HOURS: "240"
+      # 2026-06-19: reduced from 264h/240h (which made every "incremental" pass
+      # re-read+re-commit ~10 days -> a near-full rebuild, >2h, the 1h-training
+      # long pole). 72h warmup is ample recency context for 15m/1h (>>20-market
+      # lookback) and 24h refresh catches every same-day settlement, so steady-
+      # state passes are now cheap. Pairs with chunked materialize below so the
+      # initial catch-up commits per chunk and survives an interruption.
+      CRYPTO_TRAIN_INCREMENTAL_WARMUP_HOURS: "72"
+      CRYPTO_TRAIN_INCREMENTAL_LABEL_REFRESH_HOURS: "24"
+      # Chunked/resumable materialize (A1): run a wide catch-up as 48h bounded
+      # passes, each committing so a kill only loses the current chunk and the
+      # next pass resumes from the committed watermark (no full-window redo).
+      CRYPTO_TRAIN_MATERIALIZE_MAX_STEP_HOURS: "48"
       CRYPTO_XGBOOST_DEVICE: cuda
       # Keep per-asset candidate selection moving through the full 15m/1h
       # rotation. Replay gates still enforce profitability before live use.
