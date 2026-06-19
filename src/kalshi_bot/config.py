@@ -222,6 +222,14 @@ class Settings(BaseSettings):
     crypto_train_incremental_warmup_hours: int = 72
     crypto_train_incremental_max_gap_hours: int = 168
     crypto_train_incremental_label_refresh_hours: int = 24
+    # Chunked/resumable materialize: when > 0, a materialize over a wide window is
+    # run as successive bounded passes of this many hours each (oldest first).
+    # Each pass commits, advancing the implicit watermark (max committed
+    # decision_time), so a kill mid-materialize only loses the current chunk and
+    # the next pass resumes from the committed frontier instead of redoing the
+    # whole (e.g. 11-day) window — the 2026-06-19 1h durability fix. 0 == disabled
+    # (single unbounded pass, legacy behavior). Set on the trainer.
+    crypto_train_materialize_max_step_hours: float = 0.0
     crypto_train_build_workers: int = 1  # 1 = serial (today); >1 = ProcessPool over assets (trainer only)
     # Populate orderbook microstructure features (spot_exchange_spread_bps,
     # recent_trade_count, exchange bid/ask) during the build. Loads the spot

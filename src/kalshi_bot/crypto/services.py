@@ -725,6 +725,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
     kalshi_env: str,
     requested_assets: list[str] | None,
     since: datetime | None,
+    until: datetime | None = None,
     limit: int,
     defer_payload: bool = False,
     microstructure_projection: bool = False,
@@ -745,6 +746,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
         kalshi_env=kalshi_env,
         asset_symbols=requested_assets or None,
         since=since,
+        until=until,
         limit=limit,
         defer_payload=defer_payload,
         microstructure_projection=microstructure_projection,
@@ -760,6 +762,7 @@ async def _list_crypto_spot_rows_with_cross_assets(
         kalshi_env=kalshi_env,
         asset_symbols=cross,
         since=since,
+        until=until,
         limit=limit,
         defer_payload=defer_payload,
         microstructure_projection=microstructure_projection,
@@ -3399,7 +3402,7 @@ class CryptoTrainingBackfillService:
             if delay > 0:
                 await asyncio.sleep(delay)
             try:
-                return await self._materialize_once(
+                return await self._materialize_stepped(
                     frequency=frequency,
                     asset_symbols=asset_symbols,
                     materialize_microstructure=materialize_microstructure,
@@ -3417,7 +3420,7 @@ class CryptoTrainingBackfillService:
                 )
         raise RuntimeError("crypto training materialize retry loop exited unexpectedly")
 
-    async def _materialize_once(
+    async def _materialize_stepped(
         self,
         *,
         frequency: str = "15m",
@@ -3425,6 +3428,90 @@ class CryptoTrainingBackfillService:
         materialize_microstructure: bool = True,
         materialize_settlement_windows: bool = True,
     ) -> dict[str, Any]:
+        """Run materialize as successive bounded passes when chunking is enabled.
+
+        Each chunk commits, advancing the implicit watermark (max committed
+        decision_time), so a kill mid-run only loses the current chunk — the next
+        pass resumes from the committed frontier rather than redoing the whole
+        wide window (the 1h durability fix). Falls back to a single unbounded pass
+        when chunking is disabled (``crypto_train_materialize_max_step_hours`` <= 0)
+        or the window already fits within one step.
+        """
+        step_hours = float(getattr(self.settings, "crypto_train_materialize_max_step_hours", 0) or 0)
+        if step_hours <= 0:
+            return await self._materialize_once(
+                frequency=frequency,
+                asset_symbols=asset_symbols,
+                materialize_microstructure=materialize_microstructure,
+                materialize_settlement_windows=materialize_settlement_windows,
+            )
+        from kalshi_bot.crypto.train_loop import materialize_window_bounds
+
+        freq = normalize_frequency(frequency) or "15m"
+        lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
+        now_utc = datetime.now(UTC)
+        full_since = now_utc - timedelta(days=lookback_days)
+        watermark = None
+        if self.settings.crypto_train_incremental_materialize_enabled:
+            async with self.session_factory() as session:
+                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                watermark = await repo.get_crypto_training_feature_watermark(
+                    frequency=freq,
+                    kalshi_env=self.settings.kalshi_env,
+                    feature_schema_version=CRYPTO_RICH_FEATURE_SCHEMA_VERSION,
+                )
+                await session.commit()
+        frontier = watermark or full_since
+        bounds = materialize_window_bounds(frontier, now_utc, step_hours)
+        if not bounds:
+            return await self._materialize_once(
+                frequency=frequency,
+                asset_symbols=asset_symbols,
+                materialize_microstructure=materialize_microstructure,
+                materialize_settlement_windows=materialize_settlement_windows,
+            )
+        total = len(bounds)
+        logger.info(
+            "crypto_materialize_chunked freq=%s chunks=%d step_hours=%s frontier=%s now=%s",
+            freq,
+            total,
+            step_hours,
+            frontier.isoformat(),
+            now_utc.isoformat(),
+        )
+        last_result: dict[str, Any] = {"status": "skipped", "reason": "no_chunks"}
+        for i, edge in enumerate(bounds, start=1):
+            last_result = await self._materialize_once(
+                frequency=frequency,
+                asset_symbols=asset_symbols,
+                materialize_microstructure=materialize_microstructure,
+                materialize_settlement_windows=materialize_settlement_windows,
+                window_end=edge,
+            )
+            logger.info(
+                "crypto_materialize_chunk freq=%s chunk=%d/%d window_end=%s status=%s",
+                freq,
+                i,
+                total,
+                edge.isoformat(),
+                last_result.get("status"),
+            )
+        return last_result
+
+    async def _materialize_once(
+        self,
+        *,
+        frequency: str = "15m",
+        asset_symbols: list[str] | None = None,
+        materialize_microstructure: bool = True,
+        materialize_settlement_windows: bool = True,
+        window_end: datetime | None = None,
+    ) -> dict[str, Any]:
+        # window_end caps the upper edge of a CHUNKED materialize pass: reads stop
+        # at window_end and only rows with decision_ts <= window_end are committed,
+        # so the implicit watermark (max committed decision_time) advances to ~that
+        # bound. A kill then only loses the current chunk; the next pass resumes
+        # from the committed frontier. None == unbounded (legacy single pass).
         freq = normalize_frequency(frequency) or "15m"
         requested_assets = normalize_asset_symbols(asset_symbols)
         lookback_days = max(1, int(self.settings.crypto_train_lookback_days))
@@ -3484,6 +3571,7 @@ class CryptoTrainingBackfillService:
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
                 since=since,
+                until=window_end,
                 limit=self.settings.crypto_train_max_snapshots,
                 defer_payload=True,
             )
@@ -3492,6 +3580,7 @@ class CryptoTrainingBackfillService:
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
                 since=since,
+                until=window_end,
                 limit=self.settings.crypto_train_max_snapshots,
                 defer_payload=True,
             )
@@ -3502,6 +3591,7 @@ class CryptoTrainingBackfillService:
                 kalshi_env=self.settings.kalshi_env,
                 asset_symbols=requested_assets or None,
                 since=since,
+                until=window_end,
                 limit=self.settings.crypto_train_max_candlesticks,
                 defer_payload=True,
             )
@@ -3516,6 +3606,7 @@ class CryptoTrainingBackfillService:
                 kalshi_env=self.settings.kalshi_env,
                 requested_assets=requested_assets,
                 since=since,
+                until=window_end,
                 limit=self.settings.crypto_train_max_spot_rows,
                 defer_payload=not microstructure_features,
                 microstructure_projection=microstructure_features,
@@ -3561,6 +3652,11 @@ class CryptoTrainingBackfillService:
             feature_row_values: list[dict[str, Any]] = []
             for row in decision_rows:
                 if upsert_floor is not None and _as_utc_datetime(row.get("decision_ts")) <= upsert_floor:
+                    continue
+                # Chunked materialize: never commit rows past this chunk's upper
+                # edge, so the watermark advances to exactly ~window_end and the
+                # next pass resumes cleanly from there.
+                if window_end is not None and _as_utc_datetime(row.get("decision_ts")) > window_end:
                     continue
                 payload = _crypto_training_json_ready(row)
                 feature_hash = _crypto_training_build_id(payload)

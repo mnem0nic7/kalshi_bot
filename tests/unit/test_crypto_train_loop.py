@@ -9,11 +9,48 @@ re-training.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from kalshi_bot.crypto.train_loop import (
     build_train_work_order,
     frequency_last_indices,
+    materialize_window_bounds,
     resume_index,
 )
+
+
+def _dt(day: int, hour: int = 0) -> datetime:
+    return datetime(2026, 6, day, hour, tzinfo=UTC)
+
+
+def test_materialize_window_bounds_steps_forward_in_chunks():
+    # frontier=day1, now=day1+10d, step=48h -> 5 even 2-day chunks ending at now.
+    bounds = materialize_window_bounds(_dt(1), _dt(11), step_hours=48)
+    assert bounds == [_dt(3), _dt(5), _dt(7), _dt(9), _dt(11)]
+
+
+def test_materialize_window_bounds_last_bound_is_exactly_now():
+    # Partial final chunk: day1..day6 at 2-day step -> [day3, day5, day6].
+    bounds = materialize_window_bounds(_dt(1), _dt(6), step_hours=48)
+    assert bounds == [_dt(3), _dt(5), _dt(6)]
+    assert bounds[-1] == _dt(6)  # never overshoots `now`
+
+
+def test_materialize_window_bounds_disabled_returns_empty():
+    # step_hours<=0 disables chunking -> caller does a single unbounded pass.
+    assert materialize_window_bounds(_dt(1), _dt(11), step_hours=0) == []
+    assert materialize_window_bounds(_dt(1), _dt(11), step_hours=-5) == []
+
+
+def test_materialize_window_bounds_already_caught_up_returns_empty():
+    assert materialize_window_bounds(_dt(11), _dt(11), step_hours=48) == []
+    assert materialize_window_bounds(_dt(12), _dt(11), step_hours=48) == []
+
+
+def test_materialize_window_bounds_single_short_window_caps_to_now():
+    # Window smaller than one step -> a single chunk capped at now.
+    bounds = materialize_window_bounds(_dt(1), _dt(1, 1), step_hours=48)
+    assert bounds == [_dt(1, 1)]
 
 
 def test_work_order_is_asset_major_interleave():

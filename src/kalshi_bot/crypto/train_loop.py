@@ -8,6 +8,38 @@ it left off instead of re-training the 15m pass from scratch and starving 1h.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
+
+def materialize_window_bounds(
+    frontier: datetime, now: datetime, step_hours: float
+) -> list[datetime]:
+    """Forward-stepping window-end boundaries for a CHUNKED materialize.
+
+    A single materialize pass reads ``[watermark-warmup, now]`` and commits its
+    rows in ONE upsert at the very end, so a kill mid-pass loses the whole (e.g.
+    11-day) window and the restart redoes it. Chunking instead runs a bounded pass
+    per sub-window: each commits, advancing the implicit watermark (max committed
+    ``decision_time``), so a kill only loses the current chunk and the next pass
+    resumes from the committed frontier.
+
+    Returns the successive window-end timestamps stepping from ``frontier`` to
+    ``now`` in ``step_hours`` increments, the last bound being exactly ``now`` (so
+    the final chunk equals the tail of an unbounded pass). Returns ``[]`` when
+    chunking is disabled (``step_hours <= 0`` — caller does a single unbounded
+    pass, the legacy behavior) or already caught up (``frontier >= now``).
+    """
+    if step_hours <= 0 or frontier >= now:
+        return []
+    step = timedelta(hours=step_hours)
+    bounds: list[datetime] = []
+    edge = frontier + step
+    while edge < now:
+        bounds.append(edge)
+        edge += step
+    bounds.append(now)  # final chunk always lands exactly on now
+    return bounds
+
 
 def build_train_work_order(
     assets: list[str], frequencies: list[str]

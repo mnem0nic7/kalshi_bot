@@ -89,8 +89,12 @@ async def test_continuous_cycle_trains_each_asset_via_feature_store(tmp_path):
         "use_feature_store": True,
         "feature_store_only": True,
     }) in calls
-    # Per-asset replay run + gate for each asset.
-    assert ("replay.run", {"frequency": "15m", "asset_symbols": ["BTC"]}) in calls
+    # Per-asset replay run (bounded by the continuous-train replay window/limit)
+    # + per-asset gate for each asset.
+    assert (
+        "replay.run",
+        {"frequency": "15m", "asset_symbols": ["BTC"], "days": 10, "limit": 40_000},
+    ) in calls
     assert ("replay.gate", {"frequency": "15m", "asset_symbols": ["ETH"]}) in calls
     # Pooled gate over all assets + sizing policy refresh once per cycle.
     assert ("replay.gate", {"frequency": "15m", "asset_symbols": ["BTC", "ETH"]}) in calls

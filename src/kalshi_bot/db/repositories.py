@@ -1705,6 +1705,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbol: str | None = None,
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
+        until: datetime | None = None,
         limit: int = 1000,
     ) -> list[CryptoMarketCandlestickRecord]:
         stmt = select(CryptoMarketCandlestickRecord).where(
@@ -1721,6 +1722,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
+        if until is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts <= until)
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
         return list((await self.session.execute(stmt)).scalars())
 
@@ -1731,6 +1734,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         kalshi_env: str | None = None,
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
+        until: datetime | None = None,
         limit: int = 1000,
         defer_payload: bool = False,
     ) -> list[CryptoMarketSnapshotRecord]:
@@ -1756,6 +1760,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketSnapshotRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at >= since)
+        if until is not None:
+            stmt = stmt.where(CryptoMarketSnapshotRecord.observed_at <= until)
         if defer_payload:
             stmt = stmt.options(defer(CryptoMarketSnapshotRecord.payload))
         stmt = stmt.order_by(CryptoMarketSnapshotRecord.observed_at.desc()).limit(limit)
@@ -1788,6 +1794,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         kalshi_env: str | None = None,
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
+        until: datetime | None = None,
         limit: int = 50000,
         defer_payload: bool = False,
     ) -> list[CryptoMarketSnapshotRecord]:
@@ -1824,6 +1831,9 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         if since is not None:
             where_parts.append("observed_at >= :since")
             params["since"] = since
+        if until is not None:
+            where_parts.append("observed_at <= :until")
+            params["until"] = until
         duration_bounds = _crypto_frequency_duration_bounds(frequency)
 
         bind = self.session.get_bind()
@@ -2705,6 +2715,7 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
         asset_symbol: str | None = None,
         asset_symbols: list[str] | None = None,
         since: datetime | None = None,
+        until: datetime | None = None,
         limit: int = 1000,
         defer_payload: bool = False,
     ) -> list[CryptoMarketCandlestickRecord]:
@@ -2722,6 +2733,8 @@ class PlatformRepository(DeploymentControlRepositoryMixin, WebAuthRepositoryMixi
             stmt = stmt.where(CryptoMarketCandlestickRecord.asset_symbol.in_(symbols))
         if since is not None:
             stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts >= since)
+        if until is not None:
+            stmt = stmt.where(CryptoMarketCandlestickRecord.end_period_ts <= until)
         if defer_payload:
             stmt = stmt.options(defer(CryptoMarketCandlestickRecord.payload))
         stmt = stmt.order_by(CryptoMarketCandlestickRecord.end_period_ts.desc()).limit(limit)
