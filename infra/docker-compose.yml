@@ -566,7 +566,14 @@ services:
       # rather than loading raw snapshots + cross-asset spot into memory.
       CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "false"
       CRYPTO_CONTINUOUS_TRAIN_ENABLED: "true"
-      CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m,1h"
+      # 2026-06-19: 1h TEMPORARILY DISABLED. With materialize unblocked (warmup
+      # cut + chunking), the loop reached the 1h candidate report, which fits all
+      # models x4 walk-forward folds on the large 1h sample set and OOMs the 32g
+      # cgroup (hung at 99.5%, unhealthy, wedging the whole loop at BTC 1h). 15m
+      # trains fine. Run 15m-only to keep the live-relevant champions re-selecting
+      # while the 1h-fit memory blowup is fixed separately (smaller 1h sample cap
+      # / fewer folds / chunked fit). Restore "15m,1h" after that fix.
+      CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m"
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
       CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
       CRYPTO_TRAINING_PREFLIGHT_SETTLED_DAYS: "10"
