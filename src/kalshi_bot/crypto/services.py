@@ -12737,12 +12737,29 @@ def _crypto_candidate_brier_ok_vs_mid(
     return float(brier) <= mid_brier * (1.0 + float(max_brier_regression_vs_mid))
 
 
+def _crypto_live_champion_allowlist(settings: Settings | None) -> set[str] | None:
+    """Model_types allowed to become the LIVE/deployable champion, or None.
+
+    Operator "sigma only" directive (2026-06-19): keep training every model but
+    let ONLY the listed types deploy live (set to ``vol_normal_fair_value``).
+    Empty/unset == no restriction (legacy: any candidate may win). This is an
+    operational trading-scope toggle, not a gate threshold, so it lives in
+    settings (not the autonomous-gate-tuning threshold authority).
+    """
+    if settings is None:
+        return None
+    raw = getattr(settings, "crypto_live_champion_allowlist", "") or ""
+    allow = {name.strip() for name in raw.replace(";", ",").split(",") if name.strip()}
+    return allow or None
+
+
 def _crypto_select_champion(
     candidates: list[dict[str, Any]],
     *,
     min_selected_count: int = 1,
     allow_guardrail_failed_profit_candidates: bool = False,
     max_brier_regression_vs_mid: float | None = None,
+    live_champion_allowlist: set[str] | None = None,
 ) -> str:
     mid_brier = _crypto_market_mid_brier(candidates)
 
@@ -12753,6 +12770,16 @@ def _crypto_select_champion(
             max_brier_regression_vs_mid=max_brier_regression_vs_mid,
         )
 
+    def _allowed_live(candidate: dict[str, Any]) -> bool:
+        # When an allowlist is set (operator "sigma only" directive), only the
+        # listed model_types may become the deployable/live champion. Non-listed
+        # models still train + report; they just fall through to the mid baseline
+        # (stand down) here. Baselines are never in the profit lists anyway, and
+        # the final baseline fallback below is intentionally left unfiltered.
+        if not live_champion_allowlist:
+            return True
+        return candidate.get("name") in live_champion_allowlist
+
     profit_candidates = [
         candidate
         for candidate in candidates
@@ -12762,6 +12789,7 @@ def _crypto_select_champion(
         )
         and _crypto_candidate_has_profit_metrics(candidate)
         and candidate.get("name") not in CRYPTO_MODEL_BASELINE_CANDIDATES
+        and _allowed_live(candidate)
     ]
     supported_profit_candidates = [
         candidate
@@ -12787,6 +12815,7 @@ def _crypto_select_champion(
         if _crypto_model_selection_usable(candidate)
         and _crypto_candidate_has_min_policy_support(candidate, min_selected_count=min_selected_count)
         and _brier_ok(candidate)
+        and _allowed_live(candidate)
         and (
             not _crypto_candidate_has_profit_metrics(candidate)
             or _crypto_candidate_is_profit_deployable(
@@ -12935,6 +12964,7 @@ def _crypto_in_sample_candidate_report(
         max_brier_regression_vs_mid=(
             settings.crypto_model_max_brier_regression_vs_mid if settings is not None else None
         ),
+        live_champion_allowlist=_crypto_live_champion_allowlist(settings),
     )
     champion_entry = _crypto_candidate_entry_by_name(guarded_entries, champion)
     return {
@@ -13111,6 +13141,7 @@ def _crypto_model_candidate_report(
         max_brier_regression_vs_mid=(
             settings.crypto_model_max_brier_regression_vs_mid if settings is not None else None
         ),
+        live_champion_allowlist=_crypto_live_champion_allowlist(settings),
     )
     champion_entry = _crypto_candidate_entry_by_name(entries, champion)
     return {

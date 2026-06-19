@@ -275,6 +275,15 @@ class Settings(BaseSettings):
     # trainer over-states edge ~5x and promotes models that trade $0 live
     # (BTC 15m lightgbm "+$1.99/11 trades" -> 0 live fills, 2026-06-17).
     crypto_model_selection_apply_edge_shrinkage: bool = True
+    # Live-champion allowlist (operator "sigma only" directive, 2026-06-19): a CSV
+    # of model_types permitted to become the LIVE/deployable champion. Empty == no
+    # restriction (any candidate may win). Set to "vol_normal_fair_value" to trade
+    # SIGMA only — every model still TRAINS + reports, but ML champions
+    # (xgboost/lightgbm/sklearn_logistic/spot_distance/...) never deploy live; they
+    # fall through to the market-mid baseline (stand down). The existing profit /
+    # brier-vs-mid / replay gates still apply on top, so sigma only goes live where
+    # it passes. Operational trading-scope toggle, NOT a gate threshold.
+    crypto_live_champion_allowlist: str = ""
     # Market-making research stack (src/kalshi_bot/mm/) — a NON-TRADING continuous
     # loop that logs the data spine and periodically OOS-evaluates the analytic
     # vol fair value. Runs in its own container; never places orders.
