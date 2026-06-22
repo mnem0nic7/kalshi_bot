@@ -20,6 +20,7 @@ from kalshi_bot.weather.high_so_far import (
     reconstruct_high_so_far,
     remaining_rise,
     terminal_high_ge_probability,
+    terminal_high_in_bracket_probability,
 )
 
 
@@ -114,3 +115,56 @@ def test_remaining_rise_fallback_for_unseen_bucket() -> None:
     mean, sigma = remaining_rise(model, season="winter", hour=3)
     assert isinstance(mean, float) and isinstance(sigma, float)
     assert sigma > 0.0  # unknown -> non-degenerate uncertainty
+
+
+# --- bracketed contract probability (fix #2: KXHIGH is bracketed, not >=strike) ---
+
+def test_bracket_prob_locked_no_when_already_above_bracket() -> None:
+    # high-so-far already above the bracket's upper edge -> bracket can't settle YES
+    p = terminal_high_in_bracket_probability(
+        high_so_far_f=80.0, bracket_lo_f=74.0, bracket_hi_f=76.0,
+        remaining_rise_mean_f=0.0, remaining_rise_sigma_f=0.0,
+    )
+    assert p == 0.0
+
+
+def test_bracket_prob_locked_yes_in_band_after_peak() -> None:
+    # high-so-far inside the band AND peak passed (no further rise) -> locked YES
+    p = terminal_high_in_bracket_probability(
+        high_so_far_f=75.0, bracket_lo_f=74.0, bracket_hi_f=76.0,
+        remaining_rise_mean_f=0.0, remaining_rise_sigma_f=0.0,
+    )
+    assert p == 1.0
+
+
+def test_bracket_prob_is_difference_of_thresholds() -> None:
+    # P(high in [lo,hi)) = P(high>=lo) - P(high>=hi); below band, with remaining rise
+    lo, hi = 74.0, 76.0
+    hsf, mean, sigma = 70.0, 4.0, 3.0
+    p = terminal_high_in_bracket_probability(
+        high_so_far_f=hsf, bracket_lo_f=lo, bracket_hi_f=hi,
+        remaining_rise_mean_f=mean, remaining_rise_sigma_f=sigma,
+    )
+    expected = (
+        terminal_high_ge_probability(high_so_far_f=hsf, strike_f=lo, remaining_rise_mean_f=mean, remaining_rise_sigma_f=sigma)
+        - terminal_high_ge_probability(high_so_far_f=hsf, strike_f=hi, remaining_rise_mean_f=mean, remaining_rise_sigma_f=sigma)
+    )
+    assert abs(p - expected) < 1e-9
+    assert 0.0 <= p <= 1.0
+
+
+def test_bracket_prob_open_ended_edges() -> None:
+    # upper edge bracket (>= lo): hi=None -> P(high >= lo)
+    p_hi_edge = terminal_high_in_bracket_probability(
+        high_so_far_f=70.0, bracket_lo_f=74.0, bracket_hi_f=None,
+        remaining_rise_mean_f=6.0, remaining_rise_sigma_f=2.0,
+    )
+    assert abs(p_hi_edge - terminal_high_ge_probability(
+        high_so_far_f=70.0, strike_f=74.0, remaining_rise_mean_f=6.0, remaining_rise_sigma_f=2.0)) < 1e-9
+    # lower edge bracket (<= hi): lo=None -> P(high <= hi) = 1 - P(high >= hi)
+    p_lo_edge = terminal_high_in_bracket_probability(
+        high_so_far_f=70.0, bracket_lo_f=None, bracket_hi_f=76.0,
+        remaining_rise_mean_f=2.0, remaining_rise_sigma_f=2.0,
+    )
+    assert abs(p_lo_edge - (1.0 - terminal_high_ge_probability(
+        high_so_far_f=70.0, strike_f=76.0, remaining_rise_mean_f=2.0, remaining_rise_sigma_f=2.0))) < 1e-9

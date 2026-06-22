@@ -73,6 +73,38 @@ def terminal_high_ge_probability(
     return min(1.0, max(0.0, 1.0 - _phi(z)))
 
 
+def terminal_high_in_bracket_probability(
+    *,
+    high_so_far_f: float,
+    bracket_lo_f: float | None,
+    bracket_hi_f: float | None,
+    remaining_rise_mean_f: float,
+    remaining_rise_sigma_f: float,
+) -> float:
+    """P(daily_high in the contract bracket), for Kalshi's bracketed KXHIGH markets.
+
+    Kalshi daily-high markets are 6 brackets: the middle 4 are 2°F-wide bands and the
+    two edges are open-ended (<= hi / >= lo). A bracket [lo, hi) probability is the
+    difference of two threshold probabilities, which inherits the high-so-far lock-in
+    automatically: once high-so-far >= hi the band is locked NO (both thresholds = 1 ->
+    diff 0); once high-so-far is inside [lo, hi) and the peak has passed it is locked
+    YES (P>=lo = 1, P>=hi = 0). Pass bracket_lo_f=None for the lower open edge (<= hi)
+    or bracket_hi_f=None for the upper open edge (>= lo).
+    """
+    kwargs = {"remaining_rise_mean_f": remaining_rise_mean_f, "remaining_rise_sigma_f": remaining_rise_sigma_f}
+    if bracket_lo_f is None and bracket_hi_f is None:
+        return 1.0  # degenerate "any value" bracket
+    if bracket_lo_f is None:  # lower open edge: high <= hi
+        return min(1.0, max(0.0, 1.0 - terminal_high_ge_probability(
+            high_so_far_f=high_so_far_f, strike_f=float(bracket_hi_f), **kwargs)))
+    if bracket_hi_f is None:  # upper open edge: high >= lo
+        return terminal_high_ge_probability(
+            high_so_far_f=high_so_far_f, strike_f=float(bracket_lo_f), **kwargs)
+    p_ge_lo = terminal_high_ge_probability(high_so_far_f=high_so_far_f, strike_f=float(bracket_lo_f), **kwargs)
+    p_ge_hi = terminal_high_ge_probability(high_so_far_f=high_so_far_f, strike_f=float(bracket_hi_f), **kwargs)
+    return min(1.0, max(0.0, p_ge_lo - p_ge_hi))
+
+
 def _mean_std(values: list[float]) -> tuple[float, float]:
     n = len(values)
     if n == 0:
