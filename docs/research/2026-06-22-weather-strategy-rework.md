@@ -86,8 +86,26 @@ exactly like crypto, since it has never traded live.**
   — same small-bankroll, fee-constrained regime as crypto.
 - Do not re-enable live trading until the shadow + gate prove fee-survivable OOS profit.
 
+## Data assessment (2026-06-22) — the high-so-far input is missing but backfillable
+`historical_weather_snapshots`: **1,380 rows, 2026-05-29→06-21, 20 stations, ONE source_kind**
+(`external_forecast_archive_weather_bundle` = Open-Meteo *forecast* archive). **Zero NWS intraday
+*observation* snapshots** (`checkpoint_archived_weather_bundle`) — so there is **no observed-high-
+so-far time series**, which is the ENTIRE verified edge. Current data is also too thin/single-source
+to train a meaningful intraday model (needs ≥500 train + ≥100 holdout; the high-so-far feature is
+absent). `historical_settlement_labels`: 918 rows, recent (06-21), 99.8% crosscheck — labels are fine.
+
+**KEY (more tractable than crypto):** the high-so-far signal needs intraday HOURLY temperatures, and
+**Open-Meteo serves historical hourly temperature** → observed-high-so-far is **reconstructable by
+backfill** (no multi-week forward wait, unlike crypto's multi-venue gap). So the data blocker is
+removable now. For LIVE, real-time intraday NWS observations must be re-enabled (weather obs
+collection is currently off).
+
 ## Staged plan
-- **Stage 0 (done):** evaluate + map + research.
+- **Stage 0 (done):** evaluate + map + research + data assessment.
+- **Stage 0.5 (data, next):** backfill historical HOURLY temperature (Open-Meteo) per station and
+  reconstruct observed-high-so-far for past market days → the training/backtest substrate for the
+  terminal-certainty model. (Mirror the crypto backfill; verify the forecast_archive client can
+  fetch hourly obs or add a small hourly fetch.)
 - **Stage 1 (code, TDD):** intraday terminal-certainty model (adaptive diurnal peak + HRRR
   hourly) replacing the `max()`; EMOS/NGR calibrated layer; isotonic/CORP per-station calibration.
 - **Stage 2 (dedicated container):** re-enable weather training in the trainer (build the models);
