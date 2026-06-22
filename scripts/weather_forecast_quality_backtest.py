@@ -20,6 +20,7 @@ from datetime import date, datetime
 
 import yaml
 
+from kalshi_bot.integrations.asos_archive import IemAsosClient
 from kalshi_bot.integrations.weather_archive import OpenMeteoArchiveClient
 from kalshi_bot.weather.high_so_far import (
     fit_remaining_rise_model,
@@ -39,7 +40,10 @@ def load_stations() -> dict[str, dict]:
     out = {}
     for t in doc.get("series_templates", []):
         city = str(t["series_ticker"]).replace("KXHIGH", "")
-        out[city] = {"lat": float(t["latitude"]), "lon": float(t["longitude"]), "tz": t["timezone_name"]}
+        out[city] = {
+            "lat": float(t["latitude"]), "lon": float(t["longitude"]), "tz": t["timezone_name"],
+            "asos": str(t.get("station_id", "")).lstrip("K"),  # KNYC -> NYC for IEM ASOS
+        }
     return out
 
 
@@ -75,19 +79,35 @@ async def main(settle_csv: str) -> None:
             continue
         markets[city].append((d, strike, 1 if parts[1] == "yes" else 0))
 
-    # fetch observed hourly per city; build per-local-day high-so-far series
-    client = OpenMeteoArchiveClient()
+    # fetch observed hourly per city; build per-local-day high-so-far series.
+    # source: "asos" (official NWS settlement station via IEM, fix #1) or "openmeteo".
+    source = sys.argv[2] if len(sys.argv) > 2 else "openmeteo"
+    use_asos = source == "asos"
+    client = IemAsosClient() if use_asos else OpenMeteoArchiveClient()
+    print(f"observed-high source = {'IEM ASOS (official station, fix #1)' if use_asos else 'Open-Meteo gridpoint'}")
     # day -> list[(hour, high_so_far)] per city
     hsf_by_city_day: dict[tuple[str, date], dict[int, float]] = {}
     daily_high_by_city_day: dict[tuple[str, date], float] = {}
+    city_cap = int(sys.argv[3]) if len(sys.argv) > 3 else 999
     try:
-        for city, rows in markets.items():
+        for idx, (city, rows) in enumerate(sorted(markets.items())):
+            if idx >= city_cap:
+                break
             days = [d for d, _, _ in rows]
             st = stations[city]
-            hourly = await client.fetch_observed_hourly(
-                latitude=st["lat"], longitude=st["lon"],
-                start=min(days), end=max(days), timezone=st["tz"],
-            )
+            if use_asos:
+                if not st["asos"]:
+                    continue
+                if idx > 0:
+                    await asyncio.sleep(5.0)  # IEM ASOS is rate-limited (429s)
+                hourly = await client.fetch_hourly(
+                    station=st["asos"], start=min(days), end=max(days), timezone=st["tz"],
+                )
+            else:
+                hourly = await client.fetch_observed_hourly(
+                    latitude=st["lat"], longitude=st["lon"],
+                    start=min(days), end=max(days), timezone=st["tz"],
+                )
             by_day: dict[date, list[tuple[datetime, float]]] = defaultdict(list)
             for ts, temp in hourly:
                 by_day[ts.date()].append((ts, temp))

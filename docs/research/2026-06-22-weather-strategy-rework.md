@@ -147,6 +147,21 @@ causes (both fixable, the backtest's whole point — caught before any live mone
 reformulate terminal probability to brackets → re-backtest → (if it passes) shadow for market-edge →
 gate → live. Weather is NOT viable until the re-backtest passes.
 
+### Fix #1 isolated (2026-06-22) — ASOS alone does NOT fix it; fix #2 is dominant
+Built `integrations/asos_archive.py` (IEM ASOS official-station hourly, fix #1's substrate) and
+re-ran the backtest with ASOS data (6 cities, 276 markets, threshold model): **still confidently
+wrong — Brier 0.327→0.486 (08→18h), base rate 0.091, baseline 0.082.** So the settlement-source
+swap alone does NOT calibrate the model. The dominant bug is **fix #2 (contract shape)**: a
+≥-threshold model on a BRACKETED contract is structurally wrong — when high-so-far clears the lower
+strike the threshold model says YES, but the bracket settles YES only if the high lands IN the band;
+summer highs overshoot into a higher bracket → confidently-wrong YES, ~6–9% base rate.
+`terminal_high_in_bracket_probability` (fix #2, shipped) is the right form.
+**BLOCKER to the bracket re-backtest:** it needs each market's exact bracket bounds [lo,hi), i.e. the
+precise KXHIGH "T{n}" → bracket mapping (the contract-terms detail not fully retrieved) AND the full
+per-day strike ladder (our settlement labels hold only ~2 strikes/day, not all 6 brackets). Next:
+pull the exact KXHIGH contract spec + a complete strike ladder (Kalshi API), map T{n}→[lo,hi),
+re-backtest with the bracket model on ASOS data. Until then the bracket model is built but unvalidated.
+
 ## Staged plan
 - **Stage 0 (done):** evaluate + map + research + data assessment + feasibility + first backtest (failed informatively).
 - **Stage 0.9 (next): the BACKTEST** — build the harness over the 4 shipped primitives; answer
