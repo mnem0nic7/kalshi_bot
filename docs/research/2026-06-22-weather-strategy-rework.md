@@ -102,10 +102,16 @@ collection is currently off).
 
 ## Staged plan
 - **Stage 0 (done):** evaluate + map + research + data assessment.
-- **Stage 0.5 (data, next):** backfill historical HOURLY temperature (Open-Meteo) per station and
-  reconstruct observed-high-so-far for past market days → the training/backtest substrate for the
-  terminal-certainty model. (Mirror the crypto backfill; verify the forecast_archive client can
-  fetch hourly obs or add a small hourly fetch.)
+- **Stage 0.5 (data, next — requires NEW CODE, not turnkey):** the high-so-far substrate does not
+  exist and is not recoverable from existing tables: `raw_weather_events` and
+  `weather_bootstrap_events` are **both EMPTY (0 rows)**, so `historical-backfill weather-archive`
+  (which only repackages raw events) has nothing to work with; and our `OpenMeteoForecastArchiveClient`
+  hits the *single-runs* (forecast) API, not the *observed* archive. To get observed hourly temps for
+  high-so-far reconstruction, build a small fetch against **Open-Meteo archive-api**
+  (`archive-api.open-meteo.com/v1/archive`, `hourly=temperature_2m`) per station/date → reconstruct
+  observed-high-so-far per market day → store as the training/backtest substrate. Bounded code build
+  (~1 new client method + a reconstruction pass), mind host I/O. For LIVE, separately re-enable
+  real-time NWS observation collection.
 - **Stage 1 (code, TDD):** intraday terminal-certainty model (adaptive diurnal peak + HRRR
   hourly) replacing the `max()`; EMOS/NGR calibrated layer; isotonic/CORP per-station calibration.
 - **Stage 2 (dedicated container):** re-enable weather training in the trainer (build the models);
