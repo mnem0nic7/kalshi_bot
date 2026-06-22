@@ -87,6 +87,33 @@ def test_score_weather_market_locks_no_when_below_threshold_is_already_breached(
     assert signal.resolution_state == WeatherResolutionState.LOCKED_NO
 
 
+def test_score_weather_market_yes_lock_persists_when_temp_falls_after_high_so_far_crosses() -> None:
+    """Lock-in correctness: the daily high is a running max, so once observed high-so-far
+    crosses an above-threshold strike the contract is LOCKED_YES permanently. The afternoon
+    temp falling back below the strike must NOT revert the lock to UNRESOLVED. The lock must
+    key off high-so-far, not the latest current temperature."""
+    mapping = WeatherMarketMapping(
+        market_ticker="WX-LOCK-YES-PERSIST",
+        station_id="KNYC",
+        location_name="NYC",
+        latitude=40.0,
+        longitude=-73.0,
+        threshold_f=80,
+        operator=">",
+    )
+    forecast = {"properties": {"updated": "2026-04-10T00:00:00+00:00", "periods": []}}
+    # current temp 24.0C = 75.2F (below the 80F strike) at 20:00 — the day peaked then cooled.
+    observation = {"properties": {"temperature": {"value": 24.0}, "timestamp": "2026-04-10T20:00:00+00:00"}}
+
+    signal = score_weather_market(
+        mapping, forecast, observation, observed_high_so_far_f=82.0
+    )
+
+    assert signal.resolution_state == WeatherResolutionState.LOCKED_YES
+    assert signal.fair_yes_dollars == 1
+    assert signal.confidence == 1.0
+
+
 def test_score_weather_market_clamps_extreme_unresolved_low_probability() -> None:
     mapping = WeatherMarketMapping(
         market_ticker="KXHIGHTBOS-26APR22-T80",

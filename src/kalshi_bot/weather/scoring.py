@@ -608,15 +608,21 @@ def score_weather_market(
         and high_so_far_applies
     ):
         forecast_high_f = max(forecast_high_f, effective_observed_high_so_far_f)
+    # Lock-in keys off the observed HIGH-SO-FAR (the day's running max), not the latest
+    # current temp. The daily high is monotonic, so once it crosses an above-threshold
+    # strike the YES contract is locked permanently — the afternoon temp falling back below
+    # the strike must not revert the lock. effective_observed_high_so_far_f falls back to
+    # current_temp_f when no explicit high-so-far is supplied, preserving prior behavior.
+    lock_temp_f = effective_observed_high_so_far_f
     resolution_state = WeatherResolutionState.UNRESOLVED
-    if current_temp_f is not None and current_observation_applies:
-        if mapping.operator == ">" and current_temp_f > mapping.threshold_f:
+    if lock_temp_f is not None and high_so_far_applies:
+        if mapping.operator == ">" and lock_temp_f > mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_YES
-        elif mapping.operator == ">=" and current_temp_f >= mapping.threshold_f:
+        elif mapping.operator == ">=" and lock_temp_f >= mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_YES
-        elif mapping.operator == "<" and current_temp_f >= mapping.threshold_f:
+        elif mapping.operator == "<" and lock_temp_f >= mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_NO
-        elif mapping.operator == "<=" and current_temp_f > mapping.threshold_f:
+        elif mapping.operator == "<=" and lock_temp_f > mapping.threshold_f:
             resolution_state = WeatherResolutionState.LOCKED_NO
 
     snapshot_stand_down_reason: StandDownReason | None = None
@@ -635,7 +641,7 @@ def score_weather_market(
         fair = Decimal("1.0000")
         confidence = 1.0
         summary = (
-            f"Current observed temperature {current_temp_f:.1f}F has already met or exceeded "
+            f"Observed high-so-far {lock_temp_f:.1f}F has already met or exceeded "
             f"the {mapping.threshold_f:.1f}F threshold, so the contract is locked yes."
         )
     elif resolution_state == WeatherResolutionState.LOCKED_NO:
@@ -643,7 +649,7 @@ def score_weather_market(
         confidence = 1.0
         locked_no_verb = "met or exceeded" if mapping.operator == "<" else "exceeded"
         summary = (
-            f"Current observed temperature {current_temp_f:.1f}F has already {locked_no_verb} "
+            f"Observed high-so-far {lock_temp_f:.1f}F has already {locked_no_verb} "
             f"the {mapping.threshold_f:.1f}F ceiling, so the contract is locked no."
         )
     elif forecast_high_f is None:
