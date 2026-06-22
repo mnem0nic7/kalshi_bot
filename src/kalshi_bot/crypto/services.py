@@ -74,9 +74,11 @@ from kalshi_bot.db.repositories import (
 from kalshi_bot.integrations.crypto_spot import (
     COINGECKO_IDS,
     COINBASE_PRODUCT_IDS,
+    GEMINI_PAIRS,
     KRAKEN_PAIRS,
     CoinbaseSpotClient,
     CoinGeckoSpotClient,
+    GeminiSpotClient,
     KrakenSpotClient,
     SpotOHLC,
     interval_seconds_for_frequency,
@@ -2855,6 +2857,39 @@ class CryptoSpotService:
         provider_stats["kraken"]["assets"].append(asset)
         return stored
 
+    def _gemini_client(self) -> GeminiSpotClient | None:
+        if not self.settings.crypto_spot_gemini_enabled:
+            return None
+        return GeminiSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds)
+
+    async def _collect_gemini_rows(
+        self,
+        repo: PlatformRepository,
+        gemini: GeminiSpotClient | None,
+        asset: str,
+        *,
+        frequency: str,
+        interval_seconds: int,
+        start: datetime,
+        end: datetime,
+        provider_stats: dict[str, dict[str, Any]],
+    ) -> int:
+        """Additive tertiary venue; Gemini failures never affect Coinbase/Kraken."""
+        if gemini is None or not GEMINI_PAIRS.get(asset):
+            return 0
+        try:
+            rows = await gemini.fetch_ohlc(asset, start=start, end=end, interval_seconds=interval_seconds)
+            if not rows:
+                return 0
+            stored = await self._store_rows(repo, rows, frequency=frequency, interval_seconds=interval_seconds)
+        except Exception as exc:
+            logger.debug("gemini spot collection failed", extra={"asset_symbol": asset, "error": str(exc)})
+            provider_stats["gemini"]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+            return 0
+        provider_stats["gemini"]["stored"] += stored
+        provider_stats["gemini"]["assets"].append(asset)
+        return stored
+
     async def coinbase_products(
         self,
         *,
@@ -2902,6 +2937,7 @@ class CryptoSpotService:
         proxy_fallback_enabled = bool(self.settings.crypto_spot_proxy_fallback_enabled)
         coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds) if proxy_fallback_enabled else None
         kraken = self._kraken_client()
+        gemini = self._gemini_client()
         kraken_interval_seconds = interval_seconds_for_frequency(freq)
         kraken_window_end = datetime.now(UTC)
         try:
@@ -2925,6 +2961,16 @@ class CryptoSpotService:
                     stored_total += await self._collect_kraken_rows(
                         repo,
                         kraken,
+                        asset,
+                        frequency=freq,
+                        interval_seconds=kraken_interval_seconds,
+                        start=kraken_window_end - timedelta(seconds=kraken_interval_seconds * 3),
+                        end=kraken_window_end,
+                        provider_stats=provider_stats,
+                    )
+                    stored_total += await self._collect_gemini_rows(
+                        repo,
+                        gemini,
                         asset,
                         frequency=freq,
                         interval_seconds=kraken_interval_seconds,
@@ -3003,6 +3049,7 @@ class CryptoSpotService:
         proxy_fallback_enabled = bool(self.settings.crypto_spot_proxy_fallback_enabled)
         coingecko = CoinGeckoSpotClient(timeout_seconds=self.settings.crypto_spot_request_timeout_seconds) if proxy_fallback_enabled else None
         kraken = self._kraken_client()
+        gemini = self._gemini_client()
         try:
             async with self.session_factory() as session:
                 repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
@@ -3034,6 +3081,16 @@ class CryptoSpotService:
                     stored_total += await self._collect_kraken_rows(
                         repo,
                         kraken,
+                        asset,
+                        frequency=freq,
+                        interval_seconds=interval_seconds,
+                        start=start,
+                        end=end,
+                        provider_stats=provider_stats,
+                    )
+                    stored_total += await self._collect_gemini_rows(
+                        repo,
+                        gemini,
                         asset,
                         frequency=freq,
                         interval_seconds=interval_seconds,

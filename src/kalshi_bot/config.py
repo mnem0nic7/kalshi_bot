@@ -346,6 +346,7 @@ class Settings(BaseSettings):
     coinbase_advanced_trade_authenticated_enabled: bool = True
     crypto_spot_proxy_fallback_enabled: bool = False
     crypto_spot_kraken_enabled: bool = True
+    crypto_spot_gemini_enabled: bool = True
     crypto_spot_coinbase_max_stale_seconds: int = 180
     crypto_spot_coingecko_max_stale_seconds: int = 90
     crypto_spot_current_auto_enabled: bool = True

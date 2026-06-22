@@ -56,6 +56,39 @@ KRAKEN_PAIRS: dict[str, str | None] = {
     "XRP": "XRPUSD",
 }
 
+# Gemini spot symbol per asset (US-accessible CF-Benchmarks constituent venue).
+# None means the asset is not listed on Gemini and must be skipped (never
+# proxied) — Gemini does not list BNB or HYPE.
+GEMINI_PAIRS: dict[str, str | None] = {
+    "ADA": "adausd",
+    "BCH": "bchusd",
+    "BNB": None,
+    "BTC": "btcusd",
+    "DOGE": "dogeusd",
+    "ETH": "ethusd",
+    "HYPE": None,
+    "SOL": "solusd",
+    "XRP": "xrpusd",
+}
+
+# Gemini v2 candles time-frame buckets: interval_seconds -> API token.
+GEMINI_TIME_FRAMES: dict[int, str] = {
+    60: "1m",
+    300: "5m",
+    900: "15m",
+    1800: "30m",
+    3600: "1hr",
+    21600: "6hr",
+    86400: "1day",
+}
+
+
+def _gemini_time_frame(interval_seconds: int) -> str:
+    token = GEMINI_TIME_FRAMES.get(int(interval_seconds))
+    if token is None:
+        raise ValueError(f"gemini unsupported interval_seconds: {interval_seconds}")
+    return token
+
 
 @dataclass(slots=True)
 class SpotOHLC:
@@ -772,6 +805,102 @@ def _parse_kraken_ohlc_payload(
         )
     rows.sort(key=lambda row: row.end_ts)
     return rows
+
+
+def _parse_gemini_ohlc_payload(
+    payload: Any,
+    *,
+    symbol: str,
+    requested_symbol: str,
+    interval_seconds: int,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[SpotOHLC]:
+    """Parse Gemini v2 candles ([time_ms, open, high, low, close, volume]).
+
+    Gemini returns candles most-recent-first with MILLISECOND timestamps; the
+    timestamp marks the candle open. Output is sorted ascending by end_ts.
+    """
+    if not isinstance(payload, list):
+        return []
+    rows: list[SpotOHLC] = []
+    for item in payload:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            continue
+        try:
+            start_ts = datetime.fromtimestamp(int(float(item[0])) // 1000, UTC)
+        except Exception:
+            continue
+        end_ts = start_ts + timedelta(seconds=interval_seconds)
+        if start is not None and end_ts <= _utc(start):
+            continue
+        if end is not None and end_ts > _utc(end) + timedelta(seconds=interval_seconds):
+            continue
+        close = _decimal(item[4])
+        if close is None:
+            continue
+        rows.append(
+            SpotOHLC(
+                provider="gemini",
+                asset_symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                open_dollars=_decimal(item[1]),
+                high_dollars=_decimal(item[2]),
+                low_dollars=_decimal(item[3]),
+                close_dollars=close,
+                volume=_decimal(item[5]),
+                source_kind="spot_ohlc",
+                source_id=requested_symbol,
+                payload={"symbol": requested_symbol},
+            )
+        )
+    rows.sort(key=lambda row: row.end_ts)
+    return rows
+
+
+class GeminiSpotClient:
+    base_url = "https://api.gemini.com"
+
+    def __init__(self, *, timeout_seconds: float = 30.0) -> None:
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout_seconds,
+            headers={"Accept": "application/json", "User-Agent": "kalshi-bot/crypto-spot"},
+        )
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+    async def fetch_ohlc(
+        self,
+        asset_symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        interval_seconds: int,
+    ) -> list[SpotOHLC]:
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        pair = GEMINI_PAIRS.get(symbol)
+        if pair is None:
+            raise KeyError(f"gemini unsupported asset: {symbol}")
+        start_utc = _utc(start)
+        end_utc = _utc(end)
+        if start_utc >= end_utc:
+            return []
+        # Gemini's candles endpoint returns a fixed recent window (no range
+        # params), so `start`/`end` only trim what was returned.
+        time_frame = _gemini_time_frame(interval_seconds)
+        response = await self.client.get(f"/v2/candles/{pair}/{time_frame}")
+        response.raise_for_status()
+        return _parse_gemini_ohlc_payload(
+            response.json(),
+            symbol=symbol,
+            requested_symbol=pair,
+            interval_seconds=interval_seconds,
+            start=start_utc,
+            end=end_utc,
+        )
 
 
 class KrakenSpotClient:

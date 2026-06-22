@@ -51,6 +51,17 @@ API caps ~720 candles/request, so this is light — not a host stressor).
   better BRTI approximation. **Respect host disk-I/O fragility** (see [[project_host_oom_guardrails]],
   [[project_live_trading_state]] compose-hang root cause): stagger collection, never run
   concurrently with a recreate/retrain.
+  - **DONE 2026-06-22 — Gemini venue shipped** (`GeminiSpotClient`, `GEMINI_PAIRS`,
+    `_parse_gemini_ohlc_payload`, `_gemini_time_frame` in `integrations/crypto_spot.py`;
+    `_gemini_client`/`_collect_gemini_rows` wired into `backfill()`+`collect_current()` in
+    `crypto/services.py`; `crypto_spot_gemini_enabled=True` in config; TDD tests in
+    `tests/unit/test_crypto_spot_gemini.py`). Gemini is a US-accessible CF constituent → adds a
+    **3rd venue for BTC/ETH/SOL/XRP/DOGE/ADA/BCH**. Like Kraken, **does NOT list BNB or HYPE**
+    (GEMINI_PAIRS None) — so BNB still has no 2nd venue, HYPE still none. Takes effect on next
+    app/daemon deploy (running containers need the new image). Accumulates forward; Gemini v2
+    candles return a fixed recent window (no deep historical backfill).
+  - Still open: Bitstamp/LMAX clients; a venue that lists BNB (only Binance does — not
+    US-accessible → BNB likely stays single-venue).
 
 ### Stage 2 — Build the basis-aligned feature (code, TDD)
 - Compute a **multi-venue volume/recency-weighted aggregate spot** (reuse `mm/data_spine.py`
