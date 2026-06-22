@@ -100,8 +100,22 @@ backfill** (no multi-week forward wait, unlike crypto's multi-venue gap). So the
 removable now. For LIVE, real-time intraday NWS observations must be re-enabled (weather obs
 collection is currently off).
 
+## Backtest feasibility (2026-06-22) — GOOD: prices exist, fee-edge go/no-go is offline-runnable
+Unlike crypto (needs weeks of forward multi-venue accrual), the weather fee-edge backtest can run
+NOW: `historical_market_snapshots` has **~3,400 KXHIGH* price snapshots (yes_bid/ask, last) across
+~900 markets, recent to 06-22**, plus 918 `historical_settlement_labels`. Combined with the
+Open-Meteo archive fetch (observed hourly), the full chain is runnable offline:
+fetch_observed_hourly → reconstruct_high_so_far → fit_remaining_rise_model →
+terminal_high_ge_probability → compare to the snapshot's market quote, apply rate·p(1−p) fee,
+settle vs kalshi_result → fee-adjusted P&L. **Caveat:** coverage is sparse (~3.8 snapshots/market),
+so this is a first-pass edge/calibration check, not a fine intraday-timing study. The four rework
+primitives are shipped+tested (commits 6262a31, c5e9297, 8badb40); the backtest harness (ticker→
+station/strike parse + station-coord map + the eval loop) is the next build.
+
 ## Staged plan
-- **Stage 0 (done):** evaluate + map + research + data assessment.
+- **Stage 0 (done):** evaluate + map + research + data assessment + backtest feasibility.
+- **Stage 0.9 (next): the BACKTEST** — build the harness over the 4 shipped primitives; answer
+  "does the high-so-far lock-in beat the KXHIGH market after fees?" This is the weather go/no-go.
 - **Stage 0.5 (data, next — requires NEW CODE, not turnkey):** the high-so-far substrate does not
   exist and is not recoverable from existing tables: `raw_weather_events` and
   `weather_bootstrap_events` are **both EMPTY (0 rows)**, so `historical-backfill weather-archive`
