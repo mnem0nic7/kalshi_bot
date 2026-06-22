@@ -131,8 +131,21 @@ causes (both fixable, the backtest's whole point — caught before any live mone
    "≥n" (that would yield a far higher base rate); likely tail/extreme thresholds or buckets.
    `terminal_high_ge_probability` assumed plain ≥strike and must be reformulated to the true contract.
 **The high-so-far PRIMITIVES remain valid;** the terminal model + the data basis are what's wrong.
-Next: confirm the exact KXHIGH contract spec + the official settling station, align the observed-high
-source to it, reformulate the terminal probability, re-backtest. Until then weather is NOT viable.
+
+### Both fixes CONFIRMED via Kalshi docs (2026-06-22)
+- **Fix #1 settlement source:** Kalshi weather markets settle on the **NWS Daily Climate Report**
+  (official `daily_summary_station`, local STANDARD time) — NOT the Open-Meteo gridpoint we fetched.
+  Re-source the observed/high-so-far series to the NWS Daily Climate Report (or its station feed).
+  (sources: help.kalshi.com/en/articles/13823837-weather-markets;
+  kalshi-public-docs.s3.amazonaws.com/contract_terms/NHIGH.pdf)
+- **Fix #2 contract shape:** daily-high markets are **bracketed — 6 brackets, the middle 4 are 2°F
+  wide, the 2 edges are open-ended (≤lo / ≥hi)**; "greater than" strikes are strict. So the terminal
+  probability must be a BRACKET probability `P(high∈[a,b)) = Φ-terms` (difference of two thresholds),
+  not a single ≥strike. Confirm the exact KXHIGH "T{n}" bracket mapping from the KXHIGH contract-terms
+  PDF before reformulating.
+**Remaining (multi-step):** source historical NWS Daily Climate Report highs per station →
+reformulate terminal probability to brackets → re-backtest → (if it passes) shadow for market-edge →
+gate → live. Weather is NOT viable until the re-backtest passes.
 
 ## Staged plan
 - **Stage 0 (done):** evaluate + map + research + data assessment + feasibility + first backtest (failed informatively).
