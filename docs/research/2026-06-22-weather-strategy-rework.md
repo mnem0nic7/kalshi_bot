@@ -100,20 +100,42 @@ backfill** (no multi-week forward wait, unlike crypto's multi-venue gap). So the
 removable now. For LIVE, real-time intraday NWS observations must be re-enabled (weather obs
 collection is currently off).
 
-## Backtest feasibility (2026-06-22) — GOOD: prices exist, fee-edge go/no-go is offline-runnable
-Unlike crypto (needs weeks of forward multi-venue accrual), the weather fee-edge backtest can run
-NOW: `historical_market_snapshots` has **~3,400 KXHIGH* price snapshots (yes_bid/ask, last) across
-~900 markets, recent to 06-22**, plus 918 `historical_settlement_labels`. Combined with the
-Open-Meteo archive fetch (observed hourly), the full chain is runnable offline:
-fetch_observed_hourly → reconstruct_high_so_far → fit_remaining_rise_model →
-terminal_high_ge_probability → compare to the snapshot's market quote, apply rate·p(1−p) fee,
-settle vs kalshi_result → fee-adjusted P&L. **Caveat:** coverage is sparse (~3.8 snapshots/market),
-so this is a first-pass edge/calibration check, not a fine intraday-timing study. The four rework
+## Backtest feasibility (2026-06-22) — CORRECTED: market-edge needs shadow; only forecast-quality is offline
+`historical_market_snapshots` has ~3,400 KXHIGH* price snapshots — BUT a date-alignment check
+showed **ALL 3,634 were captured AFTER the market settled (0 on the market day, 0 before).** They
+are post-hoc archival prices, NOT live intraday quotes, so the **fee-edge-vs-market backtest is NOT
+offline-runnable** (no intraday/pre-settlement price series). Like crypto, the market-edge go/no-go
+requires **SHADOW** to collect live intraday KXHIGH quotes first. (Earlier "offline fee-edge
+feasible" was wrong — corrected.)
+**What IS offline-runnable: FORECAST-QUALITY validation** (no market prices needed) — fetch
+observed hourly (Open-Meteo) → reconstruct_high_so_far → terminal_high_ge_probability at intraday
+checkpoints → Brier/calibration/sharpness vs the 918 settlements, by hour. This proves whether the
+model is sound and quantifies the lock-in (sharpness should rise through the day). If it fails, weather
+is dead cheaply; if it passes, proceed to shadow for the market-edge question. The four rework
 primitives are shipped+tested (commits 6262a31, c5e9297, 8badb40); the backtest harness (ticker→
 station/strike parse + station-coord map + the eval loop) is the next build.
 
+## ⭐ Forecast-quality backtest RESULT (2026-06-22) — model mis-specified; two structural bugs found
+Ran `scripts/weather_forecast_quality_backtest.py` (Open-Meteo observed hourly + 918 settlements,
+20 cities). **The naive terminal-≥-strike model FAILED — confidently wrong:** YES base rate **0.060**;
+baseline Brier (predict base rate) **0.0568**; our model Brier **0.264 @08:00 rising to 0.410 @18:00**
+with sharpness rising 0.29→0.50. It gets *more confident and less accurate* through the day — i.e. it
+increasingly predicts YES (high-so-far ≥ strike in our data) while markets settle NO. Two structural
+causes (both fixable, the backtest's whole point — caught before any live money):
+1. **SETTLEMENT-BASIS MISMATCH (weather twin of crypto's CF-index issue):** the market map gives each
+   city a separate `daily_summary_station_id` (the official NOAA climate station Kalshi settles on,
+   e.g. NYC `USW00094728`) DISTINCT from the forecast `station_id`/Open-Meteo gridpoint we fetched.
+   Our observed high can exceed the strike while the OFFICIAL high didn't → confidently-wrong YES.
+   Must fetch/settle against the daily-summary station, not the gridpoint.
+2. **STRIKE SEMANTICS:** only ~2 strikes/day, 7°F apart, ~0.12 YES/day → KXHIGH "T{n}" is NOT a simple
+   "≥n" (that would yield a far higher base rate); likely tail/extreme thresholds or buckets.
+   `terminal_high_ge_probability` assumed plain ≥strike and must be reformulated to the true contract.
+**The high-so-far PRIMITIVES remain valid;** the terminal model + the data basis are what's wrong.
+Next: confirm the exact KXHIGH contract spec + the official settling station, align the observed-high
+source to it, reformulate the terminal probability, re-backtest. Until then weather is NOT viable.
+
 ## Staged plan
-- **Stage 0 (done):** evaluate + map + research + data assessment + backtest feasibility.
+- **Stage 0 (done):** evaluate + map + research + data assessment + feasibility + first backtest (failed informatively).
 - **Stage 0.9 (next): the BACKTEST** — build the harness over the 4 shipped primitives; answer
   "does the high-so-far lock-in beat the KXHIGH market after fees?" This is the weather go/no-go.
 - **Stage 0.5 (data, next — requires NEW CODE, not turnkey):** the high-so-far substrate does not
