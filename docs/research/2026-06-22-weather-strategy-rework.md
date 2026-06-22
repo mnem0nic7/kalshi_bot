@@ -162,8 +162,27 @@ per-day strike ladder (our settlement labels hold only ~2 strikes/day, not all 6
 pull the exact KXHIGH contract spec + a complete strike ladder (Kalshi API), map T{n}→[lo,hi),
 re-backtest with the bracket model on ASOS data. Until then the bracket model is built but unvalidated.
 
+## ⭐⭐ ORIENTED RE-BACKTEST PASSED (2026-06-22) — both fixes work; forecast-quality validated
+Cracked the real contract spec via the Kalshi API: KXHIGH is a two-sided ladder —
+`strike_type` ∈ {**less** (≤cap), **greater** (≥floor), **between** (2°F band)} (counts on NY+AUS:
+536 between / 134 greater / 134 less). The earlier "confidently wrong" result was a **sign-orientation
+bug**: the model computed P(high≥strike) but most low-strike markets are "less" (YES = high BELOW
+strike) — the exact complement. `terminal_high_in_bracket_probability(floor, cap)` handles all three
+orientations (less→1−P(≥cap); greater→P(≥floor); between→difference).
+Ran `scripts/weather_oriented_backtest.py` with ASOS official-station data + per-market orientation
+(NY+AUS, 792 markets, base rate 0.167, baseline Brier 0.1389):
+**ORIENTED model Brier 0.182 @08:00 → 0.146 @11 → 0.099 @14 → 0.0745 @17:00** (FALLS through the day,
+sharpness rises 0.40→0.50 — the high-so-far lock-in working as designed). By type: greater 0.038
+(excellent), between 0.136 (~baseline), less 0.170 (weaker). **Forecast-quality GO** — late-day the
+model is ~46% better than the base-rate baseline and well-calibrated. Both bugs fixed + validated.
+**Caveats:** still FORECAST-quality (Brier vs settlement), NOT yet fee-edge-vs-market (needs live
+intraday quotes → SHADOW; historical weather prices are all post-settlement); 2 cities, in-sample
+diurnal fit (low overfit risk — high-so-far is mostly mechanical); "less" markets underperform
+baseline (improve later). NEXT: wire the oriented model into scoring.py → shadow to collect live
+quotes + measure market-edge after fees → gate → live per-station/contract-type.
+
 ## Staged plan
-- **Stage 0 (done):** evaluate + map + research + data assessment + feasibility + first backtest (failed informatively).
+- **Stage 0 (done):** evaluate + map + research + data assessment + feasibility + first backtest (failed informatively) + oriented re-backtest (PASSED forecast-quality).
 - **Stage 0.9 (next): the BACKTEST** — build the harness over the 4 shipped primitives; answer
   "does the high-so-far lock-in beat the KXHIGH market after fees?" This is the weather go/no-go.
 - **Stage 0.5 (data, next — requires NEW CODE, not turnkey):** the high-so-far substrate does not
