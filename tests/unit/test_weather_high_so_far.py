@@ -16,7 +16,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from kalshi_bot.weather.high_so_far import (
+    fit_remaining_rise_model,
     reconstruct_high_so_far,
+    remaining_rise,
     terminal_high_ge_probability,
 )
 
@@ -81,3 +83,34 @@ def test_terminal_prob_clamped_unit_interval() -> None:
         high_so_far_f=60.0, strike_f=75.0, remaining_rise_mean_f=1.0, remaining_rise_sigma_f=0.0
     )
     assert p0 == 0.0  # deterministic rise far short
+
+
+# --- adaptive diurnal remaining-rise model (data-driven, fit from samples) ---
+
+def _sample(season: str, hour: int, high_so_far: float, daily_high: float) -> dict:
+    return {"season": season, "hour": hour, "high_so_far_f": high_so_far, "daily_high_f": daily_high}
+
+
+def test_fit_remaining_rise_recovers_bucket_mean() -> None:
+    # summer, 9am: daily high is consistently +5F above the 9am high-so-far
+    samples = [_sample("summer", 9, 65.0 + i, 70.0 + i) for i in range(20)]
+    model = fit_remaining_rise_model(samples)
+    mean, sigma = remaining_rise(model, season="summer", hour=9)
+    assert abs(mean - 5.0) < 1e-6
+    assert sigma >= 0.0 and sigma < 0.01  # no variance in the synthetic rise
+
+
+def test_fit_remaining_rise_locks_after_peak() -> None:
+    # summer, 18:00 (after peak): daily high already equals high-so-far -> no remaining rise
+    samples = [_sample("summer", 18, 80.0 + i, 80.0 + i) for i in range(15)]
+    model = fit_remaining_rise_model(samples)
+    mean, sigma = remaining_rise(model, season="summer", hour=18)
+    assert mean == 0.0 and sigma == 0.0  # locked: nothing more to come
+
+
+def test_remaining_rise_fallback_for_unseen_bucket() -> None:
+    model = fit_remaining_rise_model([_sample("summer", 9, 65.0, 70.0)])
+    # unseen (winter, 3am): must return a safe fallback, not crash
+    mean, sigma = remaining_rise(model, season="winter", hour=3)
+    assert isinstance(mean, float) and isinstance(sigma, float)
+    assert sigma > 0.0  # unknown -> non-degenerate uncertainty

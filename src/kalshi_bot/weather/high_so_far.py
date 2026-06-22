@@ -14,6 +14,11 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
+from typing import Any
+
+# Fallback uncertainty (°F) for an unseen (season, hour) bucket: stay non-degenerate
+# so the terminal probability never over-commits where we have no climatology.
+_DEFAULT_FALLBACK_SIGMA_F = 5.0
 
 
 def reconstruct_high_so_far(
@@ -66,3 +71,47 @@ def terminal_high_ge_probability(
         return 1.0 if remaining_rise_mean_f >= needed else 0.0
     z = (needed - remaining_rise_mean_f) / remaining_rise_sigma_f
     return min(1.0, max(0.0, 1.0 - _phi(z)))
+
+
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    n = len(values)
+    if n == 0:
+        return 0.0, 0.0
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n  # population variance
+    return mean, math.sqrt(var)
+
+
+def fit_remaining_rise_model(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fit the empirical remaining-rise distribution per (season, hour) bucket.
+
+    Each sample: {season, hour, high_so_far_f, daily_high_f}. The observed remaining
+    rise = max(0, daily_high - high_so_far). Data-driven (NOT a hard-coded diurnal
+    clock — peak timing varies by season/cloud, which the research refuted as fixed).
+    Returns {"buckets": {(season,hour): (mean, sigma, n)}, "global": (mean, sigma)}.
+    """
+    grouped: dict[tuple[str, int], list[float]] = {}
+    all_rises: list[float] = []
+    for s in samples:
+        try:
+            season = str(s["season"])
+            hour = int(s["hour"])
+            rise = max(0.0, float(s["daily_high_f"]) - float(s["high_so_far_f"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        grouped.setdefault((season, hour), []).append(rise)
+        all_rises.append(rise)
+    buckets = {key: (*_mean_std(vals), len(vals)) for key, vals in grouped.items()}
+    return {"buckets": buckets, "global": _mean_std(all_rises)}
+
+
+def remaining_rise(model: dict[str, Any], *, season: str, hour: int) -> tuple[float, float]:
+    """(expected remaining rise °F, sigma °F) for a (season, hour); safe fallback if unseen."""
+    bucket = (model.get("buckets") or {}).get((str(season), int(hour)))
+    if bucket is not None:
+        mean, sigma, _n = bucket
+        return float(mean), float(sigma)
+    g_mean, g_sigma = model.get("global", (0.0, 0.0))
+    # Unknown bucket: keep the (climatological) mean but inflate sigma so we never
+    # over-commit where we lack data.
+    return float(g_mean), float(max(g_sigma, _DEFAULT_FALLBACK_SIGMA_F))
