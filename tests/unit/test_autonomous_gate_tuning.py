@@ -966,16 +966,19 @@ async def test_autonomous_crypto_gate_tuning_stages_per_asset_policy(tmp_path, m
 
     monkeypatch.setattr(service, "_build_crypto_recommendation", fake_crypto_recommendation)
 
-    result = await service.run(domain="crypto", dry_run=False, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
+    result = await service.run(domain="crypto", crypto_assets=["BTC"], dry_run=False, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
 
+    asset_result = result["assets"]["BTC"]
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        candidate = await repo.get_agent_pack(result["candidate_version"])
-        checkpoint = await repo.get_checkpoint("autonomous_gate_tuning:crypto:demo")
+        candidate = await repo.get_agent_pack(asset_result["candidate_version"])
+        checkpoint = await repo.get_checkpoint("autonomous_gate_tuning:crypto:demo:BTC")
         await session.commit()
 
     assert result["status"] == "staged"
     assert result["domain"] == "crypto"
+    assert asset_result["status"] == "staged"
+    assert asset_result["domain"] == "crypto"
     assert candidate is not None
     crypto_policy = candidate.payload["crypto_policy"]
     assert crypto_policy["live"]["trading_enabled"] is True
@@ -993,12 +996,13 @@ async def test_autonomous_crypto_gate_tuning_stages_per_asset_policy(tmp_path, m
 async def test_autonomous_crypto_gate_tuning_reports_zero_row_data_gap(tmp_path) -> None:
     _settings, engine, _session_factory, _agent_pack_service, service = await _service(tmp_path)
 
-    result = await service.run(domain="crypto", dry_run=True, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
+    result = await service.run(domain="crypto", crypto_assets=["BTC"], dry_run=True, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
 
     assert result["status"] == "no_candidate"
-    assert result["data_gap_reason"] == "no_crypto_market_snapshots_for_env_window"
-    assert result["reason"] == "no_crypto_market_snapshots_for_env_window"
-    assert result["recommendation"]["row_counts"]["snapshot_rows"] == 0
+    asset_result = result["assets"]["BTC"]
+    assert asset_result["data_gap_reason"] == "no_crypto_market_snapshots_for_env_window"
+    assert asset_result["reason"] == "no_crypto_market_snapshots_for_env_window"
+    assert asset_result["recommendation"]["row_counts"]["snapshot_rows"] == 0
 
     await engine.dispose()
 
@@ -1052,15 +1056,15 @@ async def test_autonomous_crypto_gate_tuning_requires_model_and_replay_artifacts
 
     monkeypatch.setattr(service, "_build_crypto_recommendation", fake_crypto_recommendation)
 
-    result = await service.run(domain="crypto", dry_run=False, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
+    result = await service.run(domain="crypto", crypto_assets=["BTC"], dry_run=False, min_support=1, now=datetime(2026, 5, 10, tzinfo=UTC))
 
     async with session_factory() as session:
         repo = PlatformRepository(session)
-        checkpoint = await repo.get_checkpoint("autonomous_gate_tuning:crypto:demo")
+        checkpoint = await repo.get_checkpoint("autonomous_gate_tuning:crypto:demo:BTC")
         await session.commit()
 
     assert result["status"] == "validation_failed"
-    assert result["validation"]["failures"] == ["crypto_replay_gate_not_passed"]
+    assert result["assets"]["BTC"]["validation"]["failures"] == ["crypto_replay_gate_not_passed"]
     assert checkpoint is None
 
     await engine.dispose()
@@ -1194,5 +1198,79 @@ async def test_autonomous_gate_tuning_no_candidate_when_no_changes(tmp_path) -> 
 
     assert result["status"] == "no_candidate"
     assert result["reason"] == "no_gate_changes_promoted"
+
+    await engine.dispose()
+
+
+def test_checkpoint_name_scopes_crypto_per_asset() -> None:
+    from kalshi_bot.services.autonomous_gate_tuning import _checkpoint_name
+
+    assert _checkpoint_name("demo") == "autonomous_gate_tuning:demo"
+    assert _checkpoint_name("demo", domain="crypto") == "autonomous_gate_tuning:crypto:demo"
+    assert _checkpoint_name("demo", domain="crypto:BNB") == "autonomous_gate_tuning:crypto:demo:BNB"
+    assert _checkpoint_name("production", domain="crypto:DOGE") == "autonomous_gate_tuning:crypto:production:DOGE"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_crypto_gate_tuning_fans_out_per_asset(tmp_path, monkeypatch) -> None:
+    _settings, engine, _session_factory, _agent_pack_service, service = await _service(tmp_path)
+
+    calls: list[list[str]] = []
+
+    async def fake_run_crypto(*, asset_symbols, **_kwargs):
+        calls.append(list(asset_symbols or []))
+        return {"status": "no_candidate", "domain": "crypto", "asset_symbols": list(asset_symbols or [])}
+
+    monkeypatch.setattr(service, "_run_crypto", fake_run_crypto)
+
+    result = await service.run(
+        domain="crypto",
+        crypto_assets=["BTC", "ETH", "DOGE"],
+        dry_run=True,
+        min_support=1,
+        now=datetime(2026, 5, 10, tzinfo=UTC),
+    )
+
+    # one single-asset call per requested asset (no pooled call); order is normalized/sorted
+    assert all(len(c) == 1 for c in calls)
+    assert sorted(c[0] for c in calls) == ["BTC", "DOGE", "ETH"]
+    assert result["domain"] == "crypto"
+    assert set(result["assets"].keys()) == {"BTC", "ETH", "DOGE"}
+    assert result["status"] == "no_candidate"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_crypto_gate_tuning_serializes_staging(tmp_path, monkeypatch) -> None:
+    _settings, engine, _session_factory, _agent_pack_service, service = await _service(tmp_path)
+
+    calls: list[str] = []
+
+    async def fake_run_crypto(*, asset_symbols, **_kwargs):
+        asset = (asset_symbols or ["?"])[0]
+        calls.append(asset)
+        # first asset stages a candidate; the pack holds one candidate at a time
+        if asset == "BTC":
+            return {"status": "staged", "domain": "crypto", "candidate_version": "v1"}
+        return {"status": "no_candidate", "domain": "crypto"}
+
+    monkeypatch.setattr(service, "_run_crypto", fake_run_crypto)
+
+    result = await service.run(
+        domain="crypto",
+        crypto_assets=["BTC", "ETH", "DOGE"],
+        dry_run=False,
+        min_support=1,
+        now=datetime(2026, 5, 10, tzinfo=UTC),
+    )
+
+    # BTC stages -> ETH/DOGE skipped this pass (only BTC actually evaluated)
+    assert calls == ["BTC"]
+    assert result["status"] == "staged"
+    assert result["assets"]["BTC"]["status"] == "staged"
+    assert result["assets"]["ETH"]["status"] == "skipped"
+    assert result["assets"]["ETH"]["reason"] == "another_crypto_candidate_in_flight"
+    assert result["assets"]["DOGE"]["status"] == "skipped"
 
     await engine.dispose()

@@ -249,6 +249,10 @@ class AutonomousGateTuningService:
             await self.agent_pack_service.ensure_initialized(repo)
             checkpoint = await repo.get_checkpoint(_checkpoint_name(env))
             crypto_checkpoint = await repo.get_checkpoint(_checkpoint_name(env, domain="crypto"))
+            crypto_asset_checkpoints: dict[str, dict[str, Any] | None] = {}
+            for crypto_asset in _crypto_tuning_assets(self.settings, None):
+                asset_cp = await repo.get_checkpoint(_checkpoint_name(env, domain=f"crypto:{crypto_asset}"))
+                crypto_asset_checkpoints[crypto_asset] = asset_cp.payload if asset_cp is not None else None
             control = await repo.get_deployment_control()
             active_pack = await self.agent_pack_service.get_pack_for_color(repo, control.active_color)
             active_thresholds = _threshold_values(self.agent_pack_service.runtime_thresholds(active_pack))
@@ -351,10 +355,31 @@ class AutonomousGateTuningService:
             "last_promotion": _promotion_summary(checkpoint_payload),
         }
         if normalized_domain in {"crypto", "all"}:
+            # Per-asset crypto tuning: surface each asset's checkpoint plus a rolled-up status.
+            # The legacy pooled checkpoint is kept under "checkpoint" for back-compat.
             crypto_payload = crypto_checkpoint.payload if crypto_checkpoint is not None else None
+            asset_summaries = {
+                asset: {
+                    "status": (cp or {}).get("status") if cp is not None else "not_started",
+                    "checkpoint": cp,
+                    "last_stage": _stage_summary(cp),
+                    "last_canary": (cp or {}).get("canary") if cp else None,
+                    "last_promotion": _promotion_summary(cp),
+                }
+                for asset, cp in crypto_asset_checkpoints.items()
+            }
+            per_asset_status = {
+                asset: {"status": summary["status"]} for asset, summary in asset_summaries.items()
+            }
+            crypto_status = _combined_crypto_status(per_asset_status)
+            if crypto_status == "no_candidate" and not any(
+                cp is not None for cp in crypto_asset_checkpoints.values()
+            ):
+                crypto_status = (crypto_payload or {}).get("status", "not_started") if crypto_payload else "not_started"
             payload["crypto"] = {
-                "status": (crypto_payload or {}).get("status") if crypto_payload is not None else "not_started",
+                "status": crypto_status,
                 "checkpoint": crypto_payload,
+                "assets": asset_summaries,
                 "last_stage": _stage_summary(crypto_payload),
                 "last_canary": (crypto_payload or {}).get("canary") if crypto_payload else None,
                 "last_promotion": _promotion_summary(crypto_payload),
@@ -440,7 +465,7 @@ class AutonomousGateTuningService:
     ) -> dict[str, Any]:
         normalized_domain = _normalize_domain(domain)
         if normalized_domain == "crypto":
-            return await self._run_crypto(
+            return await self._run_crypto_assets(
                 kalshi_env=kalshi_env,
                 days=days,
                 min_support=min_support,
@@ -466,7 +491,7 @@ class AutonomousGateTuningService:
                 lane=lane,
                 bootstrap_promote_from_historical=bootstrap_promote_from_historical,
             )
-            crypto = await self._run_crypto(
+            crypto = await self._run_crypto_assets(
                 kalshi_env=kalshi_env,
                 days=days,
                 min_support=min_support,
@@ -1264,6 +1289,72 @@ class AutonomousGateTuningService:
             "historical_gate": historical_gate,
         }
 
+    async def _run_crypto_assets(
+        self,
+        *,
+        kalshi_env: str | None,
+        days: int | None,
+        min_support: int | None,
+        dry_run: bool,
+        triggered_by: str,
+        now: datetime | None,
+        asset_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Fan out crypto gate tuning PER ASSET.
+
+        The trainer writes per-asset model/replay-gate artifacts only, so a pooled run can never
+        pass the artifact-check; each asset must be evaluated against its own artifacts and staged
+        under its own checkpoint. Staging is serialized: the agent pack holds one candidate at a
+        time, so once an asset is staged (this pass or a prior one) we only progress that asset's
+        canary and skip building new candidates for the rest until it resolves.
+        """
+        env = kalshi_env or self.settings.kalshi_env
+        assets = _crypto_tuning_assets(self.settings, asset_symbols)
+        if not assets:
+            return {"status": "no_candidate", "kalshi_env": env, "domain": "crypto", "assets": {}}
+
+        in_flight: str | None = None
+        async with self.session_factory() as session:
+            repo = PlatformRepository(session, kalshi_env=env)
+            for asset in assets:
+                checkpoint = await repo.get_checkpoint(_checkpoint_name(env, domain=f"crypto:{asset}"))
+                if checkpoint is not None and (checkpoint.payload or {}).get("status") == "staged":
+                    in_flight = asset
+                    break
+            await session.commit()
+
+        per_asset: dict[str, dict[str, Any]] = {}
+        blocking_asset = in_flight
+        for asset in assets:
+            if blocking_asset is not None and asset != blocking_asset:
+                per_asset[asset] = {
+                    "status": "skipped",
+                    "kalshi_env": env,
+                    "domain": "crypto",
+                    "reason": "another_crypto_candidate_in_flight",
+                    "in_flight_asset": blocking_asset,
+                    "asset_symbols": [asset],
+                }
+                continue
+            result = await self._run_crypto(
+                kalshi_env=env,
+                days=days,
+                min_support=min_support,
+                dry_run=dry_run,
+                triggered_by=triggered_by,
+                now=now,
+                asset_symbols=[asset],
+            )
+            per_asset[asset] = result
+            if not dry_run and result.get("status") in {"staged", "canary_pending"}:
+                blocking_asset = asset
+        return {
+            "status": _combined_crypto_status(per_asset),
+            "kalshi_env": env,
+            "domain": "crypto",
+            "assets": per_asset,
+        }
+
     async def _run_crypto(
         self,
         *,
@@ -1277,12 +1368,13 @@ class AutonomousGateTuningService:
     ) -> dict[str, Any]:
         env = kalshi_env or self.settings.kalshi_env
         requested_assets = normalize_asset_symbols(asset_symbols)
+        checkpoint_domain = f"crypto:{requested_assets[0]}" if len(requested_assets) == 1 else "crypto"
         run_days = int(days if days is not None else self.settings.autonomous_gate_tuning_days)
         support = int(min_support if min_support is not None else self.settings.autonomous_gate_tuning_min_support)
         now_utc = _as_utc(now) or datetime.now(UTC)
         async with self.session_factory() as session:
             repo = PlatformRepository(session, kalshi_env=env)
-            checkpoint = await repo.get_checkpoint(_checkpoint_name(env, domain="crypto"))
+            checkpoint = await repo.get_checkpoint(_checkpoint_name(env, domain=checkpoint_domain))
             payload = dict(checkpoint.payload if checkpoint is not None else {})
             if payload.get("status") == "staged":
                 result = await self._evaluate_crypto_canary(
@@ -1291,6 +1383,7 @@ class AutonomousGateTuningService:
                     kalshi_env=env,
                     dry_run=dry_run,
                     now=now_utc,
+                    checkpoint_domain=checkpoint_domain,
                 )
                 await session.commit()
                 return result
@@ -1395,6 +1488,7 @@ class AutonomousGateTuningService:
                 triggered_by=triggered_by,
                 now=now_utc,
                 history=list(payload.get("evidence_fingerprint_history") or []),
+                checkpoint_domain=checkpoint_domain,
             )
             await session.commit()
             return staged
@@ -1640,6 +1734,7 @@ class AutonomousGateTuningService:
         triggered_by: str,
         now: datetime,
         history: list[str],
+        checkpoint_domain: str = "crypto",
     ) -> dict[str, Any]:
         version = f"crypto-gate-tuning-{now.strftime('%Y%m%dT%H%M%SZ')}"
         candidate_pack = current_pack.model_copy(
@@ -1718,7 +1813,7 @@ class AutonomousGateTuningService:
                 "promoted_assets": sorted(changes),
             },
         }
-        await repo.set_checkpoint(_checkpoint_name(kalshi_env, domain="crypto"), cursor=None, payload=checkpoint_payload)
+        await repo.set_checkpoint(_checkpoint_name(kalshi_env, domain=checkpoint_domain), cursor=None, payload=checkpoint_payload)
         await repo.log_ops_event(
             severity="info",
             summary=f"Autonomous crypto gate tuning staged {version} for {len(changes)} asset(s)",
@@ -1746,6 +1841,7 @@ class AutonomousGateTuningService:
         kalshi_env: str,
         dry_run: bool,
         now: datetime,
+        checkpoint_domain: str = "crypto",
     ) -> dict[str, Any]:
         staged_at = _as_utc(checkpoint_payload.get("staged_at")) or now
         snapshots = await repo.list_crypto_market_snapshots(
@@ -1822,6 +1918,7 @@ class AutonomousGateTuningService:
                 reason="canary_support_timeout",
                 canary=canary,
                 now=now,
+                checkpoint_domain=checkpoint_domain,
             )
         passed = (
             candidate_score["net_pnl"] > current_score["net_pnl"]
@@ -1844,6 +1941,7 @@ class AutonomousGateTuningService:
                 reason="canary_pnl_or_drawdown_regression",
                 canary=canary,
                 now=now,
+                checkpoint_domain=checkpoint_domain,
             )
         return await self._promote_crypto_candidate(
             repo,
@@ -1851,6 +1949,7 @@ class AutonomousGateTuningService:
             kalshi_env=kalshi_env,
             canary=canary,
             now=now,
+            checkpoint_domain=checkpoint_domain,
         )
 
     async def _promote_crypto_candidate(
@@ -1861,6 +1960,7 @@ class AutonomousGateTuningService:
         kalshi_env: str,
         canary: dict[str, Any],
         now: datetime,
+        checkpoint_domain: str = "crypto",
     ) -> dict[str, Any]:
         result = await self._promote_candidate(
             repo,
@@ -1868,7 +1968,7 @@ class AutonomousGateTuningService:
             kalshi_env=kalshi_env,
             canary=canary,
             now=now,
-            checkpoint_domain="crypto",
+            checkpoint_domain=checkpoint_domain,
         )
         result["domain"] = "crypto"
         return result
@@ -1882,6 +1982,7 @@ class AutonomousGateTuningService:
         reason: str,
         canary: dict[str, Any],
         now: datetime,
+        checkpoint_domain: str = "crypto",
     ) -> dict[str, Any]:
         result = await self._reject_candidate(
             repo,
@@ -1890,7 +1991,7 @@ class AutonomousGateTuningService:
             reason=reason,
             canary=canary,
             now=now,
-            checkpoint_domain="crypto",
+            checkpoint_domain=checkpoint_domain,
         )
         result["domain"] = "crypto"
         return result
@@ -2524,7 +2625,44 @@ class AutonomousGateTuningService:
 def _checkpoint_name(kalshi_env: str, *, domain: str = "weather") -> str:
     if domain == "crypto":
         return f"{CHECKPOINT_PREFIX}:crypto:{kalshi_env}"
+    if domain.startswith("crypto:"):
+        # Per-asset crypto scoping: domain == "crypto:BNB" -> distinct checkpoint so each
+        # asset stages/canaries independently (the daemon-path pooled run never passes the
+        # artifact-check because the trainer only writes per-asset model/replay-gate artifacts).
+        asset = domain.split(":", 1)[1]
+        return f"{CHECKPOINT_PREFIX}:crypto:{kalshi_env}:{asset}"
     return f"{CHECKPOINT_PREFIX}:{kalshi_env}"
+
+
+_CRYPTO_STATUS_PRIORITY = (
+    "staged",
+    "promoted",
+    "canary_passed",
+    "canary_pending",
+    "canary_failed",
+    "rejected",
+    "validation_failed",
+    "dry_run",
+    "duplicate_evidence",
+    "no_candidate",
+)
+
+
+def _combined_crypto_status(per_asset: dict[str, dict[str, Any]]) -> str:
+    """Roll per-asset crypto tuning results into one headline status (most significant wins)."""
+    seen = {str(result.get("status")) for result in per_asset.values() if result}
+    for status in _CRYPTO_STATUS_PRIORITY:
+        if status in seen:
+            return status
+    return "no_candidate" if per_asset else "not_started"
+
+
+def _crypto_tuning_assets(settings: Settings, asset_symbols: list[str] | None) -> list[str]:
+    """Resolve the per-asset fan-out list: explicit request, else the configured nightly assets."""
+    requested = normalize_asset_symbols(asset_symbols)
+    if requested:
+        return requested
+    return [a.strip().upper() for a in settings.crypto_model_nightly_assets.split(",") if a.strip()]
 
 
 def _normalize_domain(domain: str | None) -> str:
