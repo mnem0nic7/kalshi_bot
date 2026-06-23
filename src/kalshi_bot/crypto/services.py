@@ -108,7 +108,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v11"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v12"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -131,7 +131,8 @@ CRYPTO_SPOT_MAX_STALE_SECONDS_BY_PROVIDER = {
 CRYPTO_SPOT_PROVIDER_PREFERENCE = {
     "coinbase": 0,
     "kraken": 1,
-    "coingecko": 2,
+    "gemini": 2,
+    "coingecko": 3,
 }
 CRYPTO_ORDER_BOOK_TOP_LEVELS = 5
 CRYPTO_SPOT_CONTEXT_HISTORICAL = "historical"
@@ -10281,6 +10282,85 @@ def _dedup_spot_rows_by_provider_preference(rows: list[CryptoSpotOHLCRecord]) ->
     return [best_by_key[key][1] for key in keys_in_order]
 
 
+# Reference-venue order for the signed cross-venue basis: our single-venue moneyness
+# is Coinbase-based, so basis = (Coinbase - cross-venue mean) when Coinbase is present.
+_CRYPTO_BASIS_REFERENCE_ORDER = ("coinbase", "kraken", "gemini", "coingecko")
+_CRYPTO_BASIS_DEFAULT: dict[str, Any] = {
+    "spot_cross_venue_count": 0,
+    "spot_cross_venue_basis_pct": None,
+    "spot_cross_venue_spread_pct": None,
+}
+
+
+def _crypto_cross_venue_basis_features(provider_closes: dict[str, float]) -> dict[str, Any]:
+    """Cross-venue settlement-basis features for one spot period.
+
+    ``provider_closes`` maps provider -> close price for a single (end_ts, interval)
+    period across venues. Returns the signed basis of our reference venue vs the
+    cross-venue mean (≈ distance from the multi-venue index Kalshi settles to) and
+    the venue-disagreement spread, both as % of the mean. Single-venue periods carry
+    zero spread/basis (no disagreement observable); empty periods carry None.
+    """
+    closes = {
+        str(provider or "").strip().lower(): float(close)
+        for provider, close in provider_closes.items()
+        if close is not None and float(close) > 0
+    }
+    count = len(closes)
+    if count == 0:
+        return dict(_CRYPTO_BASIS_DEFAULT)
+    mean = sum(closes.values()) / count
+    if count < 2 or mean <= 0:
+        return {"spot_cross_venue_count": count, "spot_cross_venue_basis_pct": 0.0, "spot_cross_venue_spread_pct": 0.0}
+    # Stored as FRACTIONS to match the spot_*_pct convention (moneyness_pct = moneyness/target).
+    spread_pct = (max(closes.values()) - min(closes.values())) / mean
+    reference = next((closes[p] for p in _CRYPTO_BASIS_REFERENCE_ORDER if p in closes), None)
+    basis_pct = ((reference - mean) / mean) if reference is not None else 0.0
+    return {
+        "spot_cross_venue_count": count,
+        "spot_cross_venue_basis_pct": basis_pct,
+        "spot_cross_venue_spread_pct": spread_pct,
+    }
+
+
+def _crypto_basis_index(rows: list[CryptoSpotOHLCRecord]) -> tuple[list[int], list[dict[str, Any]]]:
+    """Build a per-period cross-venue basis index from PRE-dedup multi-venue rows.
+
+    Returns (sorted end_ts epochs, basis-feature dicts) so a decision can bisect to the
+    latest period <= decision_ts. Computed before the provider dedup so the cross-venue
+    signal (which the dedup discards for momentum-feature safety) is preserved here.
+    """
+    by_period: dict[int, dict[str, float]] = {}
+    for row in rows:
+        if row.close_dollars is None:
+            continue
+        epoch = int(_as_utc_datetime(row.end_ts).timestamp())
+        by_period.setdefault(epoch, {})[str(row.provider or "").strip().lower()] = float(row.close_dollars)
+    end_times = sorted(by_period)
+    features = [_crypto_cross_venue_basis_features(by_period[epoch]) for epoch in end_times]
+    return end_times, features
+
+
+def _crypto_basis_for_decision(
+    spot_rows: list[CryptoSpotOHLCRecord],
+    *,
+    decision_ts: datetime,
+    prepared: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Cross-venue basis features for the latest spot period at/<= the decision time."""
+    if prepared is not None:
+        end_times = prepared.get("basis_end_times") or []
+        features = prepared.get("basis_features") or []
+    else:
+        end_times, features = _crypto_basis_index(spot_rows)
+    if not end_times:
+        return dict(_CRYPTO_BASIS_DEFAULT)
+    idx = bisect_right(end_times, int(_as_utc_datetime(decision_ts).timestamp()))
+    if idx <= 0:
+        return dict(_CRYPTO_BASIS_DEFAULT)
+    return dict(features[idx - 1])
+
+
 def _spot_payload(row: CryptoSpotOHLCRecord) -> dict[str, Any]:
     try:
         payload = row.payload
@@ -10303,9 +10383,11 @@ def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[
     feature building O(rows x spot) — hours over a 180d lookback. Prepared
     once per asset, each row needs only a bisect plus a <=40-row tail.
     """
-    clean = _dedup_spot_rows_by_provider_preference(
-        [row for row in spot_rows if row.close_dollars is not None]
-    )
+    close_rows = [row for row in spot_rows if row.close_dollars is not None]
+    # Basis index is built from the PRE-dedup rows so the cross-venue signal survives
+    # the provider dedup below (which keeps one venue per period for momentum safety).
+    basis_end_times, basis_features = _crypto_basis_index(close_rows)
+    clean = _dedup_spot_rows_by_provider_preference(close_rows)
     hist = [row for row in clean if str(row.source_kind or "").strip().lower() != "spot_tick"]
     micro_prefix: list[int] = []
     last = -1
@@ -10320,6 +10402,8 @@ def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[
         "hist_rows": hist,
         "hist_end_times": [_as_utc_datetime(row.end_ts) for row in hist],
         "micro_prefix": micro_prefix,
+        "basis_end_times": basis_end_times,
+        "basis_features": basis_features,
     }
 
 
@@ -10340,6 +10424,7 @@ def _spot_context_for_decision(
     prepared: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     decision_utc = _as_utc_datetime(decision_ts)
+    basis_features = _crypto_basis_for_decision(spot_rows, decision_ts=decision_utc, prepared=prepared)
     prepared_microstructure_row: CryptoSpotOHLCRecord | None = None
     if prepared is not None:
         idx = bisect_right(prepared["end_times"], decision_utc)
@@ -10362,6 +10447,7 @@ def _spot_context_for_decision(
         eligible = _dedup_spot_rows_by_provider_preference(eligible)
     if not eligible:
         return {
+            **basis_features,
             "spot_feature_status": "missing",
             "spot_provider": None,
             "spot_source_kind": None,
@@ -10494,6 +10580,7 @@ def _spot_context_for_decision(
                 (spot_exchange_bid_size - spot_exchange_ask_size) / _depth_total
             )
     return {
+        **basis_features,
         "spot_feature_status": "available" if not stale else "stale",
         "spot_provider": current.provider,
         "spot_source_kind": current.source_kind,
@@ -11224,6 +11311,9 @@ def _crypto_feature_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "spot_exchange_spread_bps",
         "spot_exchange_recent_trade_count",
         "spot_exchange_depth_imbalance",
+        "spot_cross_venue_basis_pct",
+        "spot_cross_venue_spread_pct",
+        "spot_cross_venue_count",
         "spot_return_12_pct",
         "spot_return_24_pct",
         "spot_realized_volatility_32",
@@ -11337,6 +11427,9 @@ def _crypto_raw_feature_vector(
     spot_exchange_spread = max(0.0, float(row.get("spot_exchange_spread_bps") or 0))
     spot_exchange_trade_count = max(0.0, float(row.get("spot_exchange_recent_trade_count") or 0))
     spot_exchange_depth_imbalance = float(_decimal(row.get("spot_exchange_depth_imbalance") or Decimal("0")))
+    spot_cross_venue_basis_pct = float(_decimal(row.get("spot_cross_venue_basis_pct") or Decimal("0")))
+    spot_cross_venue_spread_pct = float(_decimal(row.get("spot_cross_venue_spread_pct") or Decimal("0")))
+    spot_cross_venue_count = max(0.0, float(row.get("spot_cross_venue_count") or 0))
     market_mid_change = float(_decimal(row.get("market_mid_change_1") or Decimal("0")))
     market_mid_velocity = float(_decimal(row.get("market_mid_velocity_per_min") or Decimal("0")))
     spread_change = float(row.get("spread_change_bps_1") or 0)
@@ -11396,6 +11489,12 @@ def _crypto_raw_feature_vector(
         "spot_exchange_recent_trade_count": min(math.log1p(spot_exchange_trade_count) / math.log1p(500.0), 1.0),
         # Already in [-1, 1] by construction; clamp defensively.
         "spot_exchange_depth_imbalance": max(-1.0, min(1.0, spot_exchange_depth_imbalance)),
+        # Cross-venue settlement basis (fractions): signed Coinbase-vs-mean and venue
+        # spread. Disagreement is small — clamp at ±0.5% (±0.005) and scale ×200 so a
+        # 0.5% basis maps to ±1.0. Count normalized by the 3-venue ceiling.
+        "spot_cross_venue_basis_pct": max(-0.005, min(0.005, spot_cross_venue_basis_pct)) * 200.0,
+        "spot_cross_venue_spread_pct": min(max(0.0, spot_cross_venue_spread_pct), 0.005) * 200.0,
+        "spot_cross_venue_count": min(spot_cross_venue_count / 3.0, 1.0),
         "spot_return_12_pct": max(-0.20, min(0.20, spot_return_12)) * 5.0,
         "spot_return_24_pct": max(-0.30, min(0.30, spot_return_24)) * (10.0 / 3.0),
         "spot_realized_volatility_32": max(0.0, min(0.20, spot_volatility_32)) * 5.0,

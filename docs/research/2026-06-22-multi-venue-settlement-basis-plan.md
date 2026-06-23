@@ -91,3 +91,20 @@ API caps ~720 candles/request, so this is light — not a host stressor).
 - Re-run the basis-flip metric (light, safe): `crypto_settlement_benchmark_windows`,
   `avg((close≥strike)<>(twap≥strike))` per asset.
 - Milestone to start Stage 2: ≥30 days of dense ≥2-venue coverage on the active alts.
+
+## ⭐ STAGE 2 PLUMBING BUILT 2026-06-23 (operator "build now") — feature lands, validation gated on data
+Built the cross-venue basis FEATURE (not just data accrual). Three model features now computed per
+decision from the PRE-dedup multi-venue spot rows and registered in the feature schema (`crypto-rich-v12`):
+- `spot_cross_venue_basis_pct` — signed (Coinbase − cross-venue mean)/mean ≈ our distance from the
+  multi-venue index Kalshi settles to.
+- `spot_cross_venue_spread_pct` — (max−min)/mean venue-disagreement magnitude.
+- `spot_cross_venue_count` — # venues observed that period (1–3).
+Key correctness point: the existing provider dedup (`_dedup_spot_rows_by_provider_preference`, keeps one
+venue/period for momentum-feature safety) DISCARDS the cross-venue signal, so the basis is computed BEFORE
+dedup (`_crypto_basis_index` in `_prepare_spot_context_series`, bisected per decision via
+`_crypto_basis_for_decision`). Also added **gemini** to `CRYPTO_SPOT_PROVIDER_PREFERENCE` (was missing → its
+rows were dropped). Helpers + extractor in `crypto/services.py`; tests `tests/unit/test_crypto_cross_venue_basis.py`.
+**NOT deployed / NOT retrained** — schema bump to v12 triggers a full feature rebuild on next train, so deploy
+via blue-green when ready; validation still gated on ≥30d dense ≥2-venue coverage (Stage 3). Old feature rows
+(pre-multi-venue) default basis→0 safely. This removes the "unbuilt middle": when the data matures, retrain
+immediately consumes the basis instead of starting feature work then.
