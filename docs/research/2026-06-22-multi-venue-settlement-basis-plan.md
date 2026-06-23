@@ -108,3 +108,14 @@ rows were dropped). Helpers + extractor in `crypto/services.py`; tests `tests/un
 via blue-green when ready; validation still gated on ≥30d dense ≥2-venue coverage (Stage 3). Old feature rows
 (pre-multi-venue) default basis→0 safely. This removes the "unbuilt middle": when the data matures, retrain
 immediately consumes the basis instead of starting feature work then.
+
+### v12 DEPLOYED then v13 GRANULARITY FIX 2026-06-23
+v12 deployed (active=blue, trainer chunked-rebuilt, 19.6k+ rows). Then "are we backfilling?" investigation
+found the basis was near-empty: backfill loop is OFF and Kraken/Gemini can't be deep-backfilled (shallow APIs)
+— overlap only grows forward. Worse, `collect_current` (15s) stores **Coinbase as instantaneous ticks
+(interval=0)** but **Kraken/Gemini as 15-min candles (interval=900)**, so they never shared a basis period →
+BTC 24h: 95% of periods single-venue → basis ≈ constant 0. **v13 fix:** `_crypto_basis_index` now uses
+CANDLE rows only (interval>0), keyed by (epoch, interval), so venues align on the 15-min boundary (which is
+also the 15m settlement reference). ~800 multi-venue periods/day/asset become usable. Schema bumped v12→v13.
+NOT yet redeployed (v13 rebuild operator-gated). Optional further density: collect Kraken/Gemini TICKER at 15s
+to align with Coinbase ticks (denser basis) — not yet built. Tests: tests/unit/test_crypto_cross_venue_basis.py.

@@ -108,7 +108,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v12"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v13"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -10330,14 +10330,23 @@ def _crypto_basis_index(rows: list[CryptoSpotOHLCRecord]) -> tuple[list[int], li
     latest period <= decision_ts. Computed before the provider dedup so the cross-venue
     signal (which the dedup discards for momentum-feature safety) is preserved here.
     """
-    by_period: dict[int, dict[str, float]] = {}
+    # Only CANDLE rows (interval_seconds > 0) align across venues: Coinbase also publishes
+    # instantaneous ticks (interval=0) every 15s, which never share a period with the 15-min
+    # Kraken/Gemini candles and would otherwise flood the index with lone-venue periods. The
+    # candle close at a 15-min boundary is also the settlement-relevant reference for 15m markets.
+    # Key by (epoch, interval) so 15m (900s) and 1h (3600s) candles never mix.
+    by_period: dict[tuple[int, int], dict[str, float]] = {}
     for row in rows:
         if row.close_dollars is None:
             continue
+        interval = int(getattr(row, "interval_seconds", 0) or 0)
+        if interval <= 0:
+            continue
         epoch = int(_as_utc_datetime(row.end_ts).timestamp())
-        by_period.setdefault(epoch, {})[str(row.provider or "").strip().lower()] = float(row.close_dollars)
-    end_times = sorted(by_period)
-    features = [_crypto_cross_venue_basis_features(by_period[epoch]) for epoch in end_times]
+        by_period.setdefault((epoch, interval), {})[str(row.provider or "").strip().lower()] = float(row.close_dollars)
+    keys = sorted(by_period)
+    end_times = [epoch for (epoch, _interval) in keys]
+    features = [_crypto_cross_venue_basis_features(by_period[key]) for key in keys]
     return end_times, features
 
 

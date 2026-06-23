@@ -73,6 +73,26 @@ def test_cross_venue_basis_empty_is_none() -> None:
     assert feats["spot_cross_venue_basis_pct"] is None
 
 
+def test_cross_venue_basis_excludes_ticks_uses_aligned_candles_only() -> None:
+    # Coinbase publishes instantaneous ticks (interval_seconds=0) every 15s; Kraken/Gemini
+    # publish 15-min candles (interval=900). Ticks must be excluded from the basis index so a
+    # lone coinbase tick at decision time doesn't yield count=1 — the basis must come from the
+    # aligned candle period where multiple venues share (end_ts, interval).
+    from kalshi_bot.crypto.services import _crypto_basis_index
+
+    tick = _Row("coinbase", "70100")
+    tick.interval_seconds = 0
+    tick.end_ts = NOW + timedelta(seconds=30)  # most recent, but tick -> excluded
+    cb_candle = _Row("coinbase", "70100")
+    kr_candle = _Row("kraken", "70000")
+    gm_candle = _Row("gemini", "70000")  # all interval_seconds=900, end_ts=NOW
+
+    end_times, features = _crypto_basis_index([tick, cb_candle, kr_candle, gm_candle])
+    # only the one aligned candle period survives; the tick is dropped
+    assert len(end_times) == 1
+    assert features[0]["spot_cross_venue_count"] == 3
+
+
 def test_cross_venue_basis_flows_through_spot_context() -> None:
     rows = [_Row("coinbase", "70100"), _Row("kraken", "70000"), _Row("gemini", "70000")]
     prepared = _prepare_spot_context_series(rows)
