@@ -104,6 +104,26 @@ model, no settlement-basis fragility, validated by the same shadow→gate discip
 NOT skip the shadow proof; it shortens it from "calibrate σ̂ OOS" to "confirm fee-edge on decided
 contracts," which the accruing quotes can answer in days rather than a season.
 
+## ⛔ VERDICT 2026-06-22 — harness ran: NO-GO (market is efficient on locked contracts)
+
+`scripts/weather_lockin_fee_edge_harness.py` (DB quotes + outcomes + ASOS official-station intraday
+temps via `weather_lockin_fetch_asos.py`) ran on 280 settled KXHIGH markets (06-14→06-20, 20 cities):
+
+- **111 markets reached a deterministic lock** (greater: high strictly > floor; less/between: high > cap).
+- **111 of 111 had ZERO fee-edge at any post-lock quote.** The best (lowest) winning-side ask after the
+  lock was **$1.000 in every single case** (median 1.000, min 1.000). The market reprices the lock-in to
+  $1 instantly — you cannot buy the certain side below a dollar, so there is no taker edge to capture.
+- Semantics nailed down: KXHIGH "greater" settles YES iff official high **strictly >** floor_strike
+  (every boundary settle==floor → NO); the first harness run's 2 "trades" were boundary false-locks
+  (one lost). With strict semantics: 0 trades, 0 edge.
+
+This confirms the spec's "honest ceiling": forecast-quality was a GO (Brier 0.0745) but is **profit-
+irrelevant** — our model is confident only where the market is already confident (decided contracts),
+so profit and calibration never co-occur. Same structural lesson as crypto. **Do NOT take the weather
+lock-in live as a taker strategy.** Auto-rooms stay off. Residual angles (all weaker / previously
+refuted): maker resting bids below $1 (adverse-selection dominated — sellers only hit you when wrong),
+or the pre-lock probabilistic regime (deep research already refuted forecast-vs-market edge there).
+
 ## Build order (TDD)
 
 1. RED test: high-so-far YES-lock persistence (gap #1) → GREEN fix in `scoring.py`.
