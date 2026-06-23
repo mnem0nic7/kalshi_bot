@@ -2979,6 +2979,19 @@ class CryptoSpotService:
                         end=kraken_window_end,
                         provider_stats=provider_stats,
                     )
+                    # Instantaneous per-venue ticks (interval=0) so the cross-venue basis aligns
+                    # densely at ~15s instead of only on 15-min candle boundaries. Unsupported
+                    # assets raise KeyError (caught per-venue); a venue outage is non-fatal.
+                    for venue_client, venue_name in ((kraken, "kraken"), (gemini, "gemini")):
+                        try:
+                            venue_tick = await venue_client.fetch_current(asset)
+                        except Exception as exc:  # noqa: BLE001 - per-venue isolation
+                            provider_stats[venue_name]["errors"].append({"asset_symbol": asset, "error": str(exc)})
+                            continue
+                        if venue_tick is not None:
+                            venue_stored = await self._store_rows(repo, [venue_tick], frequency=freq, interval_seconds=0)
+                            provider_stats[venue_name]["stored"] += venue_stored
+                            stored_total += venue_stored
                     if row is None:
                         provider_stats["none"]["errors"].append(
                             {
@@ -10285,6 +10298,9 @@ def _dedup_spot_rows_by_provider_preference(rows: list[CryptoSpotOHLCRecord]) ->
 # Reference-venue order for the signed cross-venue basis: our single-venue moneyness
 # is Coinbase-based, so basis = (Coinbase - cross-venue mean) when Coinbase is present.
 _CRYPTO_BASIS_REFERENCE_ORDER = ("coinbase", "kraken", "gemini", "coingecko")
+# Tick rows arrive per-venue at ~15s with slightly different timestamps; bucket them so
+# near-simultaneous cross-venue ticks align into one basis period.
+CROSS_VENUE_TICK_BUCKET_SECONDS = 60
 _CRYPTO_BASIS_DEFAULT: dict[str, Any] = {
     "spot_cross_venue_count": 0,
     "spot_cross_venue_basis_pct": None,
@@ -10330,20 +10346,24 @@ def _crypto_basis_index(rows: list[CryptoSpotOHLCRecord]) -> tuple[list[int], li
     latest period <= decision_ts. Computed before the provider dedup so the cross-venue
     signal (which the dedup discards for momentum-feature safety) is preserved here.
     """
-    # Only CANDLE rows (interval_seconds > 0) align across venues: Coinbase also publishes
-    # instantaneous ticks (interval=0) every 15s, which never share a period with the 15-min
-    # Kraken/Gemini candles and would otherwise flood the index with lone-venue periods. The
-    # candle close at a 15-min boundary is also the settlement-relevant reference for 15m markets.
-    # Key by (epoch, interval) so 15m (900s) and 1h (3600s) candles never mix.
+    # Two row shapes must align across venues:
+    #  - CANDLE rows (interval>0): keyed by (end_ts, interval) — venues share the 15-min boundary,
+    #    which is also the settlement-relevant reference for 15m markets.
+    #  - TICK rows (interval=0): instantaneous current prices that arrive at ~15s with slightly
+    #    different per-venue timestamps, so they're BUCKETED to CROSS_VENUE_TICK_BUCKET_SECONDS so
+    #    near-simultaneous ticks from different venues land in one period (the latest tick per venue
+    #    in the bucket wins). Sort ascending first so "latest wins" holds.
     by_period: dict[tuple[int, int], dict[str, float]] = {}
-    for row in rows:
+    for row in sorted(rows, key=lambda r: _as_utc_datetime(r.end_ts)):
         if row.close_dollars is None:
             continue
         interval = int(getattr(row, "interval_seconds", 0) or 0)
-        if interval <= 0:
-            continue
         epoch = int(_as_utc_datetime(row.end_ts).timestamp())
-        by_period.setdefault((epoch, interval), {})[str(row.provider or "").strip().lower()] = float(row.close_dollars)
+        if interval > 0:
+            key = (epoch, interval)
+        else:
+            key = (epoch - (epoch % CROSS_VENUE_TICK_BUCKET_SECONDS), 0)
+        by_period.setdefault(key, {})[str(row.provider or "").strip().lower()] = float(row.close_dollars)
     keys = sorted(by_period)
     end_times = [epoch for (epoch, _interval) in keys]
     features = [_crypto_cross_venue_basis_features(by_period[key]) for key in keys]
@@ -10367,6 +10387,11 @@ def _crypto_basis_for_decision(
     idx = bisect_right(end_times, int(_as_utc_datetime(decision_ts).timestamp()))
     if idx <= 0:
         return dict(_CRYPTO_BASIS_DEFAULT)
+    # Prefer the most recent MULTI-VENUE period <= decision: a lone single-venue tick/candle
+    # landing just before the decision must not blank a fresh basis observed moments earlier.
+    for i in range(idx - 1, -1, -1):
+        if int(features[i].get("spot_cross_venue_count") or 0) >= 2:
+            return dict(features[i])
     return dict(features[idx - 1])
 
 

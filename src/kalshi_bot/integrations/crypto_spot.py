@@ -859,6 +859,31 @@ def _parse_gemini_ohlc_payload(
     return rows
 
 
+def _parse_kraken_ticker_payload(payload: Any, *, requested_pair: str) -> Decimal | None:
+    """Last-trade price from Kraken /0/public/Ticker (result[pair]['c'][0])."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict) or not result:
+        return None
+    entry = result.get(requested_pair)
+    if entry is None and len(result) == 1:
+        entry = next(iter(result.values()))
+    if not isinstance(entry, dict):
+        return None
+    close = entry.get("c")
+    if isinstance(close, (list, tuple)) and close:
+        return _decimal(close[0])
+    return None
+
+
+def _parse_gemini_ticker_payload(payload: Any) -> Decimal | None:
+    """Current price from Gemini /v2/ticker/{pair} ('close')."""
+    if not isinstance(payload, dict):
+        return None
+    return _decimal(payload.get("close"))
+
+
 class GeminiSpotClient:
     base_url = "https://api.gemini.com"
 
@@ -900,6 +925,33 @@ class GeminiSpotClient:
             interval_seconds=interval_seconds,
             start=start_utc,
             end=end_utc,
+        )
+
+    async def fetch_current(self, asset_symbol: str) -> SpotOHLC | None:
+        """Instantaneous current price (tick, interval=0) for dense cross-venue basis."""
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        pair = GEMINI_PAIRS.get(symbol)
+        if pair is None:
+            raise KeyError(f"gemini unsupported asset: {symbol}")
+        response = await self.client.get(f"/v2/ticker/{pair}")
+        response.raise_for_status()
+        payload = response.json()
+        price = _parse_gemini_ticker_payload(payload)
+        if price is None:
+            return None
+        return SpotOHLC(
+            provider="gemini",
+            asset_symbol=symbol,
+            start_ts=None,
+            end_ts=datetime.now(UTC),
+            open_dollars=None,
+            high_dollars=None,
+            low_dollars=None,
+            close_dollars=price,
+            volume=None,
+            source_kind="spot_tick",
+            source_id=pair,
+            payload={"raw": payload},
         )
 
 
@@ -950,4 +1002,31 @@ class KrakenSpotClient:
             interval_seconds=interval_seconds,
             start=start_utc,
             end=end_utc,
+        )
+
+    async def fetch_current(self, asset_symbol: str) -> SpotOHLC | None:
+        """Instantaneous last-trade price (tick, interval=0) for dense cross-venue basis."""
+        symbol = normalize_spot_asset_symbol(asset_symbol)
+        pair = KRAKEN_PAIRS.get(symbol)
+        if pair is None:
+            raise KeyError(f"kraken unsupported asset: {symbol}")
+        response = await self.client.get("/0/public/Ticker", params={"pair": pair})
+        response.raise_for_status()
+        payload = response.json()
+        price = _parse_kraken_ticker_payload(payload, requested_pair=pair)
+        if price is None:
+            return None
+        return SpotOHLC(
+            provider="kraken",
+            asset_symbol=symbol,
+            start_ts=None,
+            end_ts=datetime.now(UTC),
+            open_dollars=None,
+            high_dollars=None,
+            low_dollars=None,
+            close_dollars=price,
+            volume=None,
+            source_kind="spot_tick",
+            source_id=pair,
+            payload={"raw": payload},
         )

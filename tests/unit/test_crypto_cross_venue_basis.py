@@ -73,24 +73,34 @@ def test_cross_venue_basis_empty_is_none() -> None:
     assert feats["spot_cross_venue_basis_pct"] is None
 
 
-def test_cross_venue_basis_excludes_ticks_uses_aligned_candles_only() -> None:
-    # Coinbase publishes instantaneous ticks (interval_seconds=0) every 15s; Kraken/Gemini
-    # publish 15-min candles (interval=900). Ticks must be excluded from the basis index so a
-    # lone coinbase tick at decision time doesn't yield count=1 — the basis must come from the
-    # aligned candle period where multiple venues share (end_ts, interval).
+def test_cross_venue_basis_buckets_ticks_across_venues() -> None:
+    # All venues publish instantaneous ticks (interval=0) at ~15s, with slightly different
+    # timestamps. They must be bucketed (60s) so the basis aligns them — a single bucket with
+    # all 3 venues -> count=3, not three lone count=1 periods.
     from kalshi_bot.crypto.services import _crypto_basis_index
 
-    tick = _Row("coinbase", "70100")
-    tick.interval_seconds = 0
-    tick.end_ts = NOW + timedelta(seconds=30)  # most recent, but tick -> excluded
-    cb_candle = _Row("coinbase", "70100")
-    kr_candle = _Row("kraken", "70000")
-    gm_candle = _Row("gemini", "70000")  # all interval_seconds=900, end_ts=NOW
+    cb = _Row("coinbase", "70100"); cb.interval_seconds = 0; cb.end_ts = NOW + timedelta(seconds=2)
+    kr = _Row("kraken", "70000"); kr.interval_seconds = 0; kr.end_ts = NOW + timedelta(seconds=9)
+    gm = _Row("gemini", "70050"); gm.interval_seconds = 0; gm.end_ts = NOW + timedelta(seconds=14)
 
-    end_times, features = _crypto_basis_index([tick, cb_candle, kr_candle, gm_candle])
-    # only the one aligned candle period survives; the tick is dropped
-    assert len(end_times) == 1
+    end_times, features = _crypto_basis_index([cb, kr, gm])
+    assert len(end_times) == 1  # one 60s tick bucket
     assert features[0]["spot_cross_venue_count"] == 3
+
+
+def test_cross_venue_basis_for_decision_prefers_freshest_multi_venue() -> None:
+    # A lone coinbase tick AFTER a multi-venue bucket must not blank the basis: the decision
+    # should fall back to the most recent multi-venue period <= decision.
+    from kalshi_bot.crypto.services import _crypto_basis_for_decision
+
+    cb1 = _Row("coinbase", "70100"); cb1.interval_seconds = 0; cb1.end_ts = NOW
+    kr1 = _Row("kraken", "70000"); kr1.interval_seconds = 0; kr1.end_ts = NOW + timedelta(seconds=3)
+    lone = _Row("coinbase", "70080"); lone.interval_seconds = 0; lone.end_ts = NOW + timedelta(seconds=75)
+
+    feats = _crypto_basis_for_decision(
+        [cb1, kr1, lone], decision_ts=NOW + timedelta(seconds=80)
+    )
+    assert feats["spot_cross_venue_count"] == 2  # used the multi-venue bucket, not the lone tick
 
 
 def test_cross_venue_basis_flows_through_spot_context() -> None:

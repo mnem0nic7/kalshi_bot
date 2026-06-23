@@ -119,3 +119,15 @@ CANDLE rows only (interval>0), keyed by (epoch, interval), so venues align on th
 also the 15m settlement reference). ~800 multi-venue periods/day/asset become usable. Schema bumped v12→v13.
 NOT yet redeployed (v13 rebuild operator-gated). Optional further density: collect Kraken/Gemini TICKER at 15s
 to align with Coinbase ticks (denser basis) — not yet built. Tests: tests/unit/test_crypto_cross_venue_basis.py.
+
+### DENSITY UPGRADE BUILT 2026-06-23 (operator "2 then 1") — still v13, then deploy
+Added Kraken/Gemini instantaneous `fetch_current` (ticker endpoints: Kraken `/0/public/Ticker` `c[0]`,
+Gemini `/v2/ticker/{pair}` `close`) + wired `collect_current` (15s loop) to fetch+store them as ticks
+(interval=0) alongside Coinbase. Reworked `_crypto_basis_index` to BUCKET ticks into
+`CROSS_VENUE_TICK_BUCKET_SECONDS`=60 windows (latest tick per venue per bucket) so near-simultaneous
+cross-venue ticks align into one basis period (candles still keyed by (end_ts,interval)).
+`_crypto_basis_for_decision` now returns the freshest MULTI-VENUE period ≤ decision (a lone single-venue
+tick just before the decision no longer blanks a basis observed moments earlier). Net: basis now populates
+at ~15s density (not just 15-min boundaries) once all venues tick. Still schema v13 (undeployed → deploys
+with candle-fix + density together). Tests: test_crypto_venue_ticker.py + test_crypto_cross_venue_basis.py.
+Next: deploy v13 (blue-green + trainer recreate, same as v12).
