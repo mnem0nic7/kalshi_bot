@@ -410,6 +410,13 @@ class Settings(BaseSettings):
     crypto_last_minute_passive_price_ladder: str = "0.01:0.99:0.01"
     crypto_market_price_anchor_enabled: bool = True
     crypto_market_price_anchor_weight: float = 0.75
+    # Mid-anchored stacking: fit label ~ [logit(model), logit(mid)] on holdout so the deployed
+    # forecast is never worse than the mid (the optimizer recovers "just the mid" when the model
+    # adds nothing) and up-weights the model only where it has real signal. Default OFF: when on,
+    # the stack is fit at train time, attached to the champion, applied at inference; validate the
+    # trainer's calibration_brier vs market_mid_brier before relying on it. Quality fix, not a
+    # profit switch (anchoring to the mid removes edge; it pays off when basis adds real signal).
+    crypto_mid_stack_enabled: bool = False
     crypto_autonomy_max_rooms_per_run: int = 7
     crypto_autonomy_max_per_asset_per_run: int = 1
     crypto_autonomy_stale_researching_room_seconds: int = 180

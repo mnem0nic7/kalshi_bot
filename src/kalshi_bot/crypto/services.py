@@ -43,6 +43,7 @@ from kalshi_bot.core.enums import (
 from kalshi_bot.core.fixed_point import make_client_order_id, quantize_count, quantize_price
 from kalshi_bot.core.schemas import ExecReceiptPayload, RoomCreate, RoomMessageCreate, TradeEligibilityVerdict, TradeTicket
 from kalshi_bot.crypto.edge_shrinkage import EDGE_SHRINKAGE_STATUS_OK, fit_edge_shrinkage
+from kalshi_bot.crypto.mid_stacking import apply_mid_stack, fit_mid_stack
 from kalshi_bot.forecast.calibration_metrics import brier_score_decomposition
 from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 from kalshi_bot.crypto.parsing import (
@@ -4661,6 +4662,11 @@ class CryptoForecastService:
         else:
             payload = artifact.payload or {}
             fair = _predict_crypto_probability(market_row, payload)
+            _mid_stack = payload.get("mid_stack") if isinstance(payload, dict) else None
+            if _mid_stack:
+                fair = _clamp_price(
+                    Decimal(str(apply_mid_stack(float(fair), float(_decimal(market_row.get("mid_yes_dollars"))), _mid_stack)))
+                )
             fair, _direction_mismatch = _crypto_model_spot_direction_check(
                 market_row, fair, settings=self.settings
             )
@@ -12807,11 +12813,21 @@ def _crypto_predictions_for_model(rows: list[dict[str, Any]], model: dict[str, A
     model_type = (model or {}).get("model_type")
     if model_type == "xgboost_classifier" and model is not None:
         probs = _xgboost_predict_batch(rows, model)
-        return list(zip(probs, (int(row["label_yes"]) for row in rows)))
-    if model_type == "lightgbm_classifier" and model is not None:
+        preds = list(zip(probs, (int(row["label_yes"]) for row in rows)))
+    elif model_type == "lightgbm_classifier" and model is not None:
         probs = _lightgbm_predict_batch(rows, model)
-        return list(zip(probs, (int(row["label_yes"]) for row in rows)))
-    return [(_predict_crypto_probability(row, model), int(row["label_yes"])) for row in rows]
+        preds = list(zip(probs, (int(row["label_yes"]) for row in rows)))
+    else:
+        preds = [(_predict_crypto_probability(row, model), int(row["label_yes"])) for row in rows]
+    # Apply mid-stacking if the model carries a fitted stack (no-op otherwise). Keeps OOS backtest
+    # metrics consistent with the deployed (stacked) forecast.
+    stack = (model or {}).get("mid_stack")
+    if stack:
+        preds = [
+            (_clamp_price(Decimal(str(apply_mid_stack(float(prob), float(_decimal(row["mid_yes_dollars"])), stack)))), label)
+            for row, (prob, label) in zip(rows, preds)
+        ]
+    return preds
 
 
 def _crypto_model_spot_direction_check(
@@ -13671,6 +13687,23 @@ def _crypto_model_metrics(
         all_predicted = _lightgbm_predict_batch(rows, model)
     else:
         all_predicted = [_predict_crypto_probability(row, model) for row in rows]
+
+    # Mid-anchored stacking (gated, default off): fit label ~ [logit(model), logit(mid)] on these
+    # rows, attach to the champion model so it persists + applies at inference, and use the stacked
+    # predictions for the metrics below so the trainer's calibration_brier-vs-mid reflects (and
+    # validates) the stack. all_predicted above is the RAW model output (no stack yet), so the fit
+    # is on raw probs. Never-worse-than-mid by construction; baseline champion is already the mid.
+    if settings.crypto_mid_stack_enabled and model_type != "market_mid_baseline":
+        _mids = [float(_decimal(row["mid_yes_dollars"])) for row in rows]
+        _labels = [int(row["label_yes"]) for row in rows]
+        _model_probs = [float(p) for p in all_predicted]
+        _stack = fit_mid_stack(_model_probs, _mids, _labels, min_samples=200)
+        if _stack and isinstance(model, dict):
+            model["mid_stack"] = _stack
+            all_predicted = [
+                _clamp_price(Decimal(str(apply_mid_stack(mp, md, _stack))))
+                for mp, md in zip(_model_probs, _mids)
+            ]
 
     baseline_predictions: list[tuple[Decimal, int]] = []
     calibrated_predictions: list[tuple[Decimal, int]] = []
