@@ -203,6 +203,35 @@ quotes + measure market-edge after fees → gate → live per-station/contract-t
 - **Stage 4 (gate→live):** replay/backtest gate on fee-adjusted OOS profit; flip live per-station
   only where it passes. Restore flags per `docs/operations/weather-disabled-2026-05-20.md`.
 
+## ⭐ 2026-06-25 — intraday model is now TRAINABLE on shadow data; calibration upgraded to Platt
+Two findings on this date, both measured (not assumed):
+1. **The 06-22 "data too thin to train" assessment is STALE.** Shadow collection (re-enabled
+   2026-06-22) has since produced ~162k eligible snapshot rows with `current_temp_f`
+   (`archived_weather_bundle` 119.6k + `captured_weather_bundle` 42.8k, 20 stations). A
+   live dry-run `weather-intraday evaluate` against the production DB now **trains and passes
+   all gates**: 2,400 train / 884 holdout rows, baseline Brier 0.1041 → **model Brier 0.0883,
+   +15.2%**. So the binding constraint for *training* is no longer data depth (backfill/#1 only
+   adds seasonality now) — it is model quality. (Backfill against the official settlement
+   station remains valuable for the *live* basis-alignment fix and deeper history.)
+2. **Calibration switched isotonic → Platt for small samples (commit pending).** Deep-research
+   (105-agent run, 2026-06-25) confirmed 3-0 (Niculescu-Mizil & Caruana, ICML'05): isotonic
+   overfits when calibration data is small (<~200–1000 cases); Platt/sigmoid wins there. The
+   intraday calibrator runs on ~480 calibration rows — squarely small-sample. New
+   `fit_intraday_calibrator` (`weather/intraday.py`) picks Platt below
+   `weather_intraday_isotonic_min_rows` (default 1000), isotonic at/above; `calibrate_intraday_probability`
+   applies both. **Measured A/B on identical real splits: Platt holdout Brier 0.0832 / +20.0%
+   vs isotonic 0.0883 / +15.2%** (Platt closes ~32% more of the baseline gap). Same lever applies
+   to crypto per-asset calibration (same small-sample isotonic pattern) — follow-up. Tests:
+   `tests/unit/test_weather_intraday_calibration.py`. NOT YET DEPLOYED (running prod image has the
+   old code; deploy via blue-green when the broader weather path is ready).
+
+**Still-open weather training levers (ranked):** (a) #2 bracket/3-way `between` contract
+representation (majority class, currently a 2-way operator collapses the band — bigger build);
+(b) expand the in-sample 2-city diurnal fit to all 20 stations with a proper OOS holdout;
+(c) adaptive diurnal-peak model replacing the fixed-clock `heating_hours_remaining`;
+(d) #1 observed-temp backfill against the official `daily_summary_station` for depth + the live
+settlement-basis fix.
+
 ## Sources (verified)
 HRRR diurnal skill: journals.ametsoc.org/view/journals/wefo/37/8/WAF-D-21-0130.1.xml;
 royalsocietypublishing.org/doi/10.1098/rsta.2020.0099. EMOS/NGR: stat.washington.edu/raftery/

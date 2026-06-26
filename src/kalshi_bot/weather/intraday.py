@@ -220,8 +220,71 @@ def intraday_probability_from_artifact(
         return None
 
 
+def fit_intraday_calibrator(
+    raw_probabilities: list[float],
+    outcomes: list[int],
+    *,
+    isotonic_min_rows: int,
+) -> dict[str, Any]:
+    """Fit a probability calibrator, choosing the method by sample size.
+
+    Deep-research finding (Niculescu-Mizil & Caruana, ICML'05; 3-0 confirmed): isotonic
+    regression overfits when calibration data is scarce, while Platt (sigmoid) scaling is
+    robust there. Below ``isotonic_min_rows`` calibration points we fit Platt; at/above it
+    we fit isotonic. With fewer than two outcome classes neither is identifiable, so we
+    return an identity passthrough.
+    """
+
+    pairs = [
+        (float(p), int(o))
+        for p, o in zip(raw_probabilities, outcomes, strict=False)
+        if p is not None and o is not None
+    ]
+    n = len(pairs)
+    if n == 0 or len({o for _, o in pairs}) < 2:
+        return {"method": "identity", "row_count": n}
+
+    xs = [p for p, _ in pairs]
+    ys = [o for _, o in pairs]
+    if n >= int(isotonic_min_rows):
+        from sklearn.isotonic import IsotonicRegression
+
+        calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        calibrator.fit(xs, ys)
+        return {
+            "method": "isotonic",
+            "x_thresholds": [float(value) for value in calibrator.X_thresholds_],
+            "y_thresholds": [float(value) for value in calibrator.y_thresholds_],
+            "row_count": n,
+        }
+
+    # Platt scaling: a 1-D logistic of outcome on the raw probability.
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+
+    model = LogisticRegression(max_iter=1000, solver="lbfgs")
+    model.fit(np.asarray(xs, dtype=float).reshape(-1, 1), np.asarray(ys, dtype=int))
+    return {
+        "method": "platt",
+        "coef": float(model.coef_[0][0]),
+        "intercept": float(model.intercept_[0]),
+        "row_count": n,
+    }
+
+
 def calibrate_intraday_probability(probability: float, calibration: Any) -> float:
-    if not isinstance(calibration, dict) or calibration.get("method") != "isotonic":
+    if not isinstance(calibration, dict):
+        return max(0.0, min(1.0, float(probability)))
+    method = calibration.get("method")
+    if method == "platt":
+        try:
+            coef = float(calibration.get("coef") or 0.0)
+            intercept = float(calibration.get("intercept") or 0.0)
+            score = max(-35.0, min(35.0, coef * float(probability) + intercept))
+            return max(0.0, min(1.0, 1.0 / (1.0 + math.exp(-score))))
+        except (TypeError, ValueError, OverflowError):
+            return max(0.0, min(1.0, float(probability)))
+    if method != "isotonic":
         return max(0.0, min(1.0, float(probability)))
     xs = [float(value) for value in calibration.get("x_thresholds") or []]
     ys = [float(value) for value in calibration.get("y_thresholds") or []]

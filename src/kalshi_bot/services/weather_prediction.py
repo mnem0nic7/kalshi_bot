@@ -8,7 +8,6 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import numpy as np
-from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sqlalchemy import bindparam, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -25,6 +24,8 @@ from kalshi_bot.weather.scoring import (
 from kalshi_bot.weather.intraday import (
     IntradayFeatureInput,
     NUMERIC_INTRADAY_FEATURES,
+    calibrate_intraday_probability,
+    fit_intraday_calibrator,
     intraday_artifact_fallback_reason,
     intraday_feature_values,
     normalize_weather_operator,
@@ -453,16 +454,15 @@ class WeatherPredictionService:
         model.fit(x_train_scaled, y_train)
         raw_calibration_probabilities = [float(value) for value in model.predict_proba(x_calibration_scaled)[:, 1]]
         calibration_outcomes = [row.outcome_yes for row in calibration_rows] or [row.outcome_yes for row in fit_rows]
-        calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-        calibrator.fit(raw_calibration_probabilities, calibration_outcomes)
-        calibration_artifact = {
-            "method": "isotonic",
-            "x_thresholds": [float(value) for value in calibrator.X_thresholds_],
-            "y_thresholds": [float(value) for value in calibrator.y_thresholds_],
-            "row_count": len(calibration_outcomes),
-        }
+        calibration_artifact = fit_intraday_calibrator(
+            raw_calibration_probabilities,
+            calibration_outcomes,
+            isotonic_min_rows=self.settings.weather_intraday_isotonic_min_rows,
+        )
         raw_holdout_probabilities = [float(value) for value in model.predict_proba(x_holdout_scaled)[:, 1]]
-        model_probabilities = [float(value) for value in calibrator.transform(raw_holdout_probabilities)]
+        model_probabilities = [
+            calibrate_intraday_probability(value, calibration_artifact) for value in raw_holdout_probabilities
+        ]
         baseline_probabilities = [_baseline_probability_for_intraday_row(row) for row in holdout_rows]
         outcomes = [row.outcome_yes for row in holdout_rows]
         initial_series_regressions = self._intraday_series_regressions(

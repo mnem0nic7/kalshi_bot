@@ -697,6 +697,9 @@ class Settings(BaseSettings):
     weather_intraday_min_calibration_bucket_rows: int = 50
     weather_intraday_min_series_holdout_rows: int = 30
     weather_intraday_max_series_brier_regression: float = 0.05
+    # Below this many calibration rows, fit Platt (sigmoid) instead of isotonic, which
+    # overfits on scarce data (Niculescu-Mizil & Caruana, ICML'05). At/above it, isotonic.
+    weather_intraday_isotonic_min_rows: int = 1000
     sigma_calibration_enabled: bool = True
     sigma_min_samples_beats_global: int = 100
     sigma_min_samples_beats_yaml: int = 200
