@@ -73,3 +73,44 @@ def test_fit_falls_back_to_identity_for_single_class() -> None:
 
 def test_fit_empty_is_identity() -> None:
     assert fit_intraday_calibrator([], [], isotonic_min_rows=1000)["method"] == "identity"
+
+
+# ---- Venn-Abers (inductive) — finite-sample calibration for small corpora ----
+
+
+def test_fit_venn_abers_when_method_forced() -> None:
+    raw = [i / 40.0 for i in range(40)]
+    outcomes = [0 if p < 0.5 else 1 for p in raw]
+    artifact = fit_intraday_calibrator(raw, outcomes, isotonic_min_rows=1000, method="venn_abers")
+    assert artifact["method"] == "venn_abers"
+    assert artifact["scores"] and artifact["labels"]
+    assert len(artifact["scores"]) == len(artifact["labels"]) == 40
+
+
+def test_calibrate_venn_abers_is_monotone_and_bounded() -> None:
+    raw = [i / 50.0 for i in range(50)]
+    outcomes = [0 if p < 0.5 else 1 for p in raw]
+    artifact = fit_intraday_calibrator(raw, outcomes, isotonic_min_rows=1000, method="venn_abers")
+    grid = [k / 20.0 for k in range(21)]
+    cal = [calibrate_intraday_probability(p, artifact) for p in grid]
+    assert all(0.0 <= c <= 1.0 for c in cal)
+    assert all(cal[i] <= cal[i + 1] + 1e-9 for i in range(len(cal) - 1))
+    # signal preserved: low end below high end
+    assert cal[0] < cal[-1]
+
+
+def test_venn_abers_tracks_group_rates() -> None:
+    # Two clean groups: raw~0.2 settles ~20% YES, raw~0.8 settles ~80% YES.
+    raw = [0.2] * 10 + [0.8] * 10
+    outcomes = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1] + [1, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+    artifact = fit_intraday_calibrator(raw, outcomes, isotonic_min_rows=1000, method="venn_abers")
+    lo = calibrate_intraday_probability(0.2, artifact)
+    hi = calibrate_intraday_probability(0.8, artifact)
+    assert lo < 0.5 < hi
+    assert lo == pytest.approx(0.2, abs=0.15)
+    assert hi == pytest.approx(0.8, abs=0.15)
+
+
+def test_venn_abers_single_class_is_identity() -> None:
+    artifact = fit_intraday_calibrator([0.3, 0.5, 0.7], [1, 1, 1], isotonic_min_rows=1000, method="venn_abers")
+    assert artifact["method"] == "identity"

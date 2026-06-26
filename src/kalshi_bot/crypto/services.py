@@ -43,6 +43,7 @@ from kalshi_bot.core.enums import (
 from kalshi_bot.core.fixed_point import make_client_order_id, quantize_count, quantize_price
 from kalshi_bot.core.schemas import ExecReceiptPayload, RoomCreate, RoomMessageCreate, TradeEligibilityVerdict, TradeTicket
 from kalshi_bot.crypto.edge_shrinkage import EDGE_SHRINKAGE_STATUS_OK, fit_edge_shrinkage
+from kalshi_bot.forecast.calibration_metrics import brier_score_decomposition
 from kalshi_bot.crypto.models import CryptoMarket, CryptoSeries
 from kalshi_bot.crypto.parsing import (
     normalize_candlestick,
@@ -10968,18 +10969,27 @@ def _probability_metrics_market_weighted(
     for probability, label, market_ticker in predictions:
         grouped[market_ticker].append((probability, label))
     if not grouped:
-        return {"market_count": 0, "brier": None, "log_loss": None, "ece": None}
+        return {"market_count": 0, "brier": None, "log_loss": None, "ece": None, "score_decomposition": None}
     per_market = [_probability_metrics_decimal(items) for items in grouped.values()]
 
     def _mean(key: str) -> float | None:
         values = [metrics[key] for metrics in per_market if metrics.get(key) is not None]
         return sum(values) / len(values) if values else None
 
+    # MCB/DSC decomposition is a reliability property of the whole distribution, so it is
+    # computed on the POOLED predictions (not per-market averaged). MCB separates "fixable by
+    # calibration" from DSC "genuine signal" — diagnostic only, surfaced in the replay gate.
+    decomposition = brier_score_decomposition(
+        [float(probability) for probability, _label, _ticker in predictions],
+        [float(label) for _probability, label, _ticker in predictions],
+    )
+
     return {
         "market_count": len(grouped),
         "brier": _mean("brier"),
         "log_loss": _mean("log_loss"),
         "ece": _mean("ece"),
+        "score_decomposition": decomposition,
     }
 
 

@@ -21,6 +21,7 @@ from kalshi_bot.weather.scoring import (
     extract_gridpoint_max_temp_f,
     gaussian_probability,
 )
+from kalshi_bot.forecast.calibration_metrics import brier_score_decomposition
 from kalshi_bot.weather.intraday import (
     IntradayFeatureInput,
     NUMERIC_INTRADAY_FEATURES,
@@ -454,10 +455,12 @@ class WeatherPredictionService:
         model.fit(x_train_scaled, y_train)
         raw_calibration_probabilities = [float(value) for value in model.predict_proba(x_calibration_scaled)[:, 1]]
         calibration_outcomes = [row.outcome_yes for row in calibration_rows] or [row.outcome_yes for row in fit_rows]
+        configured_method = str(self.settings.weather_intraday_calibration_method or "auto").strip().lower()
         calibration_artifact = fit_intraday_calibrator(
             raw_calibration_probabilities,
             calibration_outcomes,
             isotonic_min_rows=self.settings.weather_intraday_isotonic_min_rows,
+            method=None if configured_method in {"", "auto"} else configured_method,
         )
         raw_holdout_probabilities = [float(value) for value in model.predict_proba(x_holdout_scaled)[:, 1]]
         model_probabilities = [
@@ -562,6 +565,7 @@ class WeatherPredictionService:
                 "baseline_brier": baseline_brier,
                 "model_brier": model_brier,
                 "brier_improvement_pct": improvement_pct,
+                "score_decomposition": brier_score_decomposition(model_probabilities, outcomes),
                 "calibration_buckets": calibration,
                 "initial_series_regressions": initial_series_regressions[:20],
                 "series_regressions": series_regressions[:20],

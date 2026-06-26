@@ -250,6 +250,8 @@ Commands:
 | `weather-intraday train --kalshi-env --series` | `demo`, all series | Fits intraday logistic model and probability calibration (Platt or isotonic, by sample size). |
 | `weather-intraday evaluate --kalshi-env --series` | `demo`, all series | Dry-run evaluation. |
 | `WEATHER_INTRADAY_ISOTONIC_MIN_ROWS` | `1000` | Below this many calibration rows, fit Platt (sigmoid) instead of isotonic — isotonic overfits on scarce data (Niculescu-Mizil & Caruana, ICML'05). At/above it, isotonic. Measured A/B on real data (480 calib rows): Platt holdout Brier 0.0832 / +20.0% vs isotonic 0.0883 / +15.2%. |
+| `WEATHER_INTRADAY_CALIBRATION_METHOD` | `auto` | `auto` (size-based per the row above) or force `platt` \| `isotonic` \| `venn_abers`. Venn-Abers (arXiv 2502.05676) gives distribution-free finite-sample calibration. Real-data A/B/C (same splits): Platt Brier **0.0832** / MCB 0.0062; Venn-Abers Brier 0.0842 / **MCB 0.0047** (best-calibrated); isotonic 0.0883 / MCB 0.0080. **Default stays `auto`/Platt — best Brier; Venn-Abers is the lowest-miscalibration option when calibration matters more than sharpness.** |
+| `intraday metrics → score_decomposition` | — | Each intraday eval now reports the CORP Brier decomposition `S = MCB − DSC + UNC` (miscalibration / discrimination / uncertainty) alongside Brier, separating "fixable by calibration" from "no signal". |
 | `WEATHER_INTRADAY_MODEL_ENABLED` | `false` | Enables intraday model at runtime. |
 | `WEATHER_INTRADAY_MODEL_MAX_AGE_HOURS` | `168` | Runtime artifact staleness limit. |
 | `WEATHER_INTRADAY_MIN_TRAIN_ROWS` | `500` | Minimum rows before fitting. |

@@ -225,14 +225,17 @@ def fit_intraday_calibrator(
     outcomes: list[int],
     *,
     isotonic_min_rows: int,
+    method: str | None = None,
 ) -> dict[str, Any]:
-    """Fit a probability calibrator, choosing the method by sample size.
+    """Fit a probability calibrator.
 
-    Deep-research finding (Niculescu-Mizil & Caruana, ICML'05; 3-0 confirmed): isotonic
-    regression overfits when calibration data is scarce, while Platt (sigmoid) scaling is
-    robust there. Below ``isotonic_min_rows`` calibration points we fit Platt; at/above it
-    we fit isotonic. With fewer than two outcome classes neither is identifiable, so we
-    return an identity passthrough.
+    With ``method=None`` (default) the method is chosen by sample size: isotonic regression
+    overfits when calibration data is scarce, while Platt (sigmoid) scaling is robust there
+    (Niculescu-Mizil & Caruana, ICML'05; 3-0 confirmed). Below ``isotonic_min_rows`` points we
+    fit Platt; at/above it we fit isotonic. ``method`` may force ``"platt"``, ``"isotonic"``,
+    or ``"venn_abers"`` (inductive Venn-Abers — distribution-free finite-sample calibration
+    guarantees, preferable for small corpora; arXiv 2502.05676). With fewer than two outcome
+    classes no calibrator is identifiable, so we return an identity passthrough.
     """
 
     pairs = [
@@ -246,7 +249,13 @@ def fit_intraday_calibrator(
 
     xs = [p for p, _ in pairs]
     ys = [o for _, o in pairs]
-    if n >= int(isotonic_min_rows):
+    chosen = method or ("isotonic" if n >= int(isotonic_min_rows) else "platt")
+
+    if chosen == "venn_abers":
+        # Store the calibration set; the merged probability is computed per-point at apply time.
+        return {"method": "venn_abers", "scores": xs, "labels": ys, "row_count": n}
+
+    if chosen == "isotonic":
         from sklearn.isotonic import IsotonicRegression
 
         calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
@@ -284,6 +293,21 @@ def calibrate_intraday_probability(probability: float, calibration: Any) -> floa
             return max(0.0, min(1.0, 1.0 / (1.0 + math.exp(-score))))
         except (TypeError, ValueError, OverflowError):
             return max(0.0, min(1.0, float(probability)))
+    if method == "venn_abers":
+        scores = [float(v) for v in calibration.get("scores") or []]
+        labels = [float(v) for v in calibration.get("labels") or []]
+        if not scores or len(scores) != len(labels):
+            return max(0.0, min(1.0, float(probability)))
+        from kalshi_bot.forecast.calibration_metrics import pav_isotonic
+
+        p = max(0.0, min(1.0, float(probability)))
+        # Inductive Venn-Abers: refit isotonic with the test point labelled 1 and 0; the
+        # merged probability p1/(1 - p0 + p1) is calibrated in finite samples.
+        p1 = pav_isotonic(scores + [p], labels + [1.0])[-1]
+        p0 = pav_isotonic(scores + [p], labels + [0.0])[-1]
+        denom = 1.0 - p0 + p1
+        merged = p1 / denom if denom > 0.0 else p
+        return max(0.0, min(1.0, merged))
     if method != "isotonic":
         return max(0.0, min(1.0, float(probability)))
     xs = [float(value) for value in calibration.get("x_thresholds") or []]

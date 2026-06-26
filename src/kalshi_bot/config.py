@@ -700,6 +700,10 @@ class Settings(BaseSettings):
     # Below this many calibration rows, fit Platt (sigmoid) instead of isotonic, which
     # overfits on scarce data (Niculescu-Mizil & Caruana, ICML'05). At/above it, isotonic.
     weather_intraday_isotonic_min_rows: int = 1000
+    # Calibration method: "auto" (size-based: Platt small / isotonic large), or force
+    # "platt" | "isotonic" | "venn_abers". Venn-Abers gives distribution-free finite-sample
+    # guarantees (arXiv 2502.05676) — opt-in after an A/B vs the auto default.
+    weather_intraday_calibration_method: str = "auto"
     sigma_calibration_enabled: bool = True
     sigma_min_samples_beats_global: int = 100
     sigma_min_samples_beats_yaml: int = 200

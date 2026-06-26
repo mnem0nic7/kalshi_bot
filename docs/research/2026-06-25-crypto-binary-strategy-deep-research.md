@@ -106,6 +106,16 @@ confirmed with a dissent).
 6. **Possible mild NO-side prior** from the YES-overbetting cross-subsidy — worth a *test*, with a
    scope caveat (evidence is from event markets, not 15m crypto).
 
+## Follow-up build (2026-06-25): #2 + #5 implemented
+- **#5 MCB/DSC decomposition** shipped as a shared pure-python util (`forecast/calibration_metrics.py`,
+  CORP via PAV); surfaced in weather intraday metrics and the crypto replay-gate market-weighted
+  metrics (`score_decomposition`). Diagnostic only.
+- **#2 Venn-Abers** shipped as a selectable calibrator (`weather_intraday_calibration_method=venn_abers`).
+  Real-data A/B/C (same weather splits): **Platt Brier 0.0832 / MCB 0.0062** (best Brier); **Venn-Abers
+  Brier 0.0842 / MCB 0.0047** (best calibrated); isotonic 0.0883 / MCB 0.0080. **Decision: default stays
+  Platt** (best Brier); Venn-Abers retained as the lowest-miscalibration option. The MCB/DSC split (#5)
+  is what made the trade-off legible (Venn trades a little discrimination for better calibration).
+
 ## Killed claims (do NOT act on)
 - Near-expiry spreads must widen (0-3).
 - No-trade region provably optimal under proportional costs (0-3).

@@ -308,6 +308,7 @@ Replay is the promotion gate between trained models and live asset eligibility.
 | `crypto_replay_min_net_pl_dollars` | `0.0` | Minimum replay net P/L. With the current gate logic, default means replay must be positive, not merely equal to zero. |
 | `crypto_replay_max_hard_cap_breaches` | `0` | Maximum allowed hard-cap breaches in replay. Default allows none. |
 | `crypto_replay_require_calibration_better_than_mid` | `False` | If true, calibration metrics must beat market mid. |
+| replay market-weighted metrics → `score_decomposition` | — | The market-weighted probability metrics now include the **pooled** CORP Brier decomposition `S = MCB − DSC + UNC` (miscalibration / discrimination / uncertainty; `forecast/calibration_metrics.py`). Diagnostic only — separates a miscalibrated champion (high MCB, calibration-fixable) from one with no edge (low DSC). Does not gate by itself. |
 | `crypto_replay_require_pnl_beats_market_mid` | `True` | Requires replay P/L advantage versus market-mid baseline. |
 | `crypto_replay_min_pnl_advantage_dollars` | `0.0` | Minimum dollar advantage over market mid. Default requires positive advantage. |
 | `crypto_replay_min_spot_coverage_pct` | `0.80` | Minimum spot-data coverage for replay. |
