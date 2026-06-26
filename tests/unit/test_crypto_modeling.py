@@ -42,7 +42,9 @@ def test_residual_model_fits_probability_calibration_with_sufficient_data() -> N
     model = _fit_crypto_spot_distance_residual_model(rows, fallback=_make_fallback())
     assert model.get("probability_calibration") is not None
     calibration = model["probability_calibration"]
-    assert calibration.get("method") == "isotonic"
+    # 20 rows is below CRYPTO_CALIBRATION_ISOTONIC_MIN_ROWS (default 1000) -> Platt,
+    # which is robust on scarce data where isotonic overfits (Niculescu-Mizil & Caruana).
+    assert calibration.get("method") == "platt"
     assert calibration.get("sample_count") == 20
 
 

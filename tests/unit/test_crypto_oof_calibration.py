@@ -40,7 +40,9 @@ def test_oof_calibration_covers_every_row_without_leakage() -> None:
     )
 
     assert calibration is not None
-    assert calibration.get("method") == "isotonic"
+    # n=60 is below CRYPTO_CALIBRATION_ISOTONIC_MIN_ROWS (default 1000) -> Platt; the
+    # OOF coverage/no-leakage contract this test guards is calibrator-method-agnostic.
+    assert calibration.get("method") == "platt"
     # Calibrator trained on OOF predictions for ALL rows, not just a 15% tail.
     assert calibration.get("sample_count") == n
     # One fit per fold.

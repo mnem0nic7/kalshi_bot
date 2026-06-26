@@ -12364,22 +12364,55 @@ def _fit_crypto_lightgbm_model(
         return {"name": "lightgbm_classifier", "status": "unavailable", "reason": f"lightgbm_fit_failed:{exc}", "dependency_version": _package_version("lightgbm")}
 
 
-def _fit_probability_calibration(predictions: list[Decimal], labels: list[int]) -> dict[str, Any] | None:
+def _crypto_calibration_isotonic_min_rows() -> int:
+    """Below this many calibration rows, fit Platt (sigmoid) instead of isotonic, which
+    overfits on scarce data (Niculescu-Mizil & Caruana, ICML'05). Env-tunable."""
+    try:
+        return int(os.environ.get("CRYPTO_CALIBRATION_ISOTONIC_MIN_ROWS", "1000"))
+    except (TypeError, ValueError):
+        return 1000
+
+
+def _fit_probability_calibration(
+    predictions: list[Decimal],
+    labels: list[int],
+    *,
+    isotonic_min_rows: int | None = None,
+) -> dict[str, Any] | None:
     if len(predictions) < 12 or len(set(labels)) < 2 or len({str(value) for value in predictions}) < 3:
         return None
+    x_values = [float(value) for value in predictions]
+    threshold = _crypto_calibration_isotonic_min_rows() if isotonic_min_rows is None else int(isotonic_min_rows)
+    if len(predictions) >= threshold:
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except Exception:
+            return None
+        try:
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(x_values, labels)
+            return {
+                "method": "isotonic",
+                "sample_count": len(predictions),
+                "thresholds_x": [float(value) for value in calibrator.X_thresholds_],
+                "thresholds_y": [float(value) for value in calibrator.y_thresholds_],
+            }
+        except Exception:
+            return None
+    # Small sample -> Platt scaling (1-D logistic of label on the raw probability).
     try:
-        from sklearn.isotonic import IsotonicRegression
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression
     except Exception:
         return None
     try:
-        x_values = [float(value) for value in predictions]
-        calibrator = IsotonicRegression(out_of_bounds="clip")
-        calibrator.fit(x_values, labels)
+        model = LogisticRegression(max_iter=1000, solver="lbfgs")
+        model.fit(np.asarray(x_values, dtype=float).reshape(-1, 1), np.asarray(labels, dtype=int))
         return {
-            "method": "isotonic",
+            "method": "platt",
             "sample_count": len(predictions),
-            "thresholds_x": [float(value) for value in calibrator.X_thresholds_],
-            "thresholds_y": [float(value) for value in calibrator.y_thresholds_],
+            "coef": float(model.coef_[0][0]),
+            "intercept": float(model.intercept_[0]),
         }
     except Exception:
         return None
@@ -12446,7 +12479,18 @@ def _fit_crypto_oof_probability_calibration(
 
 
 def _apply_probability_calibration(probability: Decimal, calibration: dict[str, Any] | None) -> Decimal:
-    if not calibration or calibration.get("method") != "isotonic":
+    if not calibration:
+        return _clamp_price(probability)
+    method = calibration.get("method")
+    if method == "platt":
+        try:
+            coef = float(calibration.get("coef") or 0.0)
+            intercept = float(calibration.get("intercept") or 0.0)
+            score = max(-35.0, min(35.0, coef * float(probability) + intercept))
+            return _clamp_price(Decimal(str(1.0 / (1.0 + math.exp(-score)))))
+        except (TypeError, ValueError, OverflowError):
+            return _clamp_price(probability)
+    if method != "isotonic":
         return _clamp_price(probability)
     xs = [float(value) for value in calibration.get("thresholds_x") or []]
     ys = [float(value) for value in calibration.get("thresholds_y") or []]
