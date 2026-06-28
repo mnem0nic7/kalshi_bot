@@ -12259,6 +12259,13 @@ def _fit_crypto_xgboost_model(
                 [labels[i] for i in train_idx],
                 sample_weight=_crypto_training_sample_weights([rows[i] for i in train_idx], settings=settings),
             )
+            # Pin inference to CPU: a cuda-fit booster predicting on CPU eval folds otherwise hits
+            # the slow "mismatched devices" DMatrix fallback, run once per OOF split — a hot path in
+            # the candidate report. Training stayed on GPU; only this predict moves to CPU.
+            try:
+                fold_clf.get_booster().set_param({"device": "cpu"})
+            except Exception:
+                pass
             return [float(value) for value in fold_clf.predict_proba([raw_matrix[i] for i in eval_idx])[:, 1]]
 
         # Out-of-fold isotonic (see lightgbm fit); single-holdout is the fallback.
@@ -12688,6 +12695,10 @@ def _predict_crypto_probability(
             raw = _crypto_raw_feature_vector(row, schema, defaults=model.get("feature_defaults") or {})
             booster = xgb.Booster()
             booster.load_model(bytearray(base64.b64decode(str(model.get("booster_raw_base64") or ""))))
+            try:
+                booster.set_param({"device": "cpu"})  # avoid cuda<->cpu mismatch fallback on inference
+            except Exception:
+                pass
             probability = _clamp_price(Decimal(str(float(booster.predict(xgb.DMatrix([raw]))[0]))))
             return _apply_probability_calibration(probability, model.get("probability_calibration")) if apply_calibration else probability
         except Exception:
