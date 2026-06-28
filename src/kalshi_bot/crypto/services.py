@@ -12738,6 +12738,13 @@ def _xgboost_predict_batch(
         matrix = [_crypto_raw_feature_vector(row, schema, defaults=defaults) for row in rows]
         booster = xgb.Booster()
         booster.load_model(bytearray(base64.b64decode(str(model.get("booster_raw_base64") or ""))))
+        # Predict on CPU: a cuda-trained booster predicting on CPU data otherwise falls back to a
+        # slow DMatrix path ("mismatched devices"), which dominates the walk-forward candidate
+        # report (40k rows x folds) and makes the trainer look wedged. CPU inference is fast + safe.
+        try:
+            booster.set_param({"device": "cpu"})
+        except Exception:
+            pass
         raw_probs = booster.predict(xgb.DMatrix(matrix))
         cal = model.get("probability_calibration") if apply_calibration else None
         results = []
