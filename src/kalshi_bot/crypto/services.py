@@ -13397,6 +13397,9 @@ def _crypto_model_candidate_report(
         return report
 
     predictions_by_candidate: dict[str, list[tuple[Decimal, int]]] = defaultdict(list)
+    # Parallel to predictions_by_candidate: the market mid per OOS row, so the mid-anchored blend
+    # weight can be fit on genuine out-of-sample (walk-forward) predictions, not in-sample.
+    oos_mids_by_candidate: dict[str, list[float]] = defaultdict(list)
     trade_rows_by_candidate: dict[str, list[dict[str, Any]]] = defaultdict(list)
     unavailable_reasons: dict[str, str] = {}
     dependency_versions: dict[str, str | None] = {}
@@ -13425,6 +13428,7 @@ def _crypto_model_candidate_report(
             ensemble_test_preds = _crypto_batch_predict_ensemble(test_rows, available_models, weights)
             for row, prediction in zip(test_rows, ensemble_test_preds):
                 predictions_by_candidate["calibrated_weighted_ensemble"].append((prediction, int(row["label_yes"])))
+                oos_mids_by_candidate["calibrated_weighted_ensemble"].append(float(_decimal(row["mid_yes_dollars"])))
                 if settings is not None:
                     trade = _simulate_crypto_trade(
                         row,
@@ -13446,6 +13450,7 @@ def _crypto_model_candidate_report(
             batch_preds = _crypto_predictions_for_model(test_rows, status["model"])
             for row, (prediction, label) in zip(test_rows, batch_preds, strict=True):
                 predictions_by_candidate[name].append((prediction, label))
+                oos_mids_by_candidate[name].append(float(_decimal(row["mid_yes_dollars"])))
                 if settings is not None:
                     trade = _simulate_crypto_trade(
                         row,
@@ -13509,9 +13514,29 @@ def _crypto_model_candidate_report(
         live_champion_allowlist=_crypto_live_champion_allowlist(settings),
     )
     champion_entry = _crypto_candidate_entry_by_name(entries, champion)
+    # Fit the mid-anchored convex blend on the CHAMPION's out-of-sample walk-forward predictions
+    # (the data the fold models did not train on), so the weight reflects true OOS value. Gated:
+    # default off, and never for the mid baseline (already the mid). Carried in the report and
+    # attached to the persisted champion in _crypto_model_metrics.
+    champion_mid_blend = None
+    if (
+        settings is not None
+        and getattr(settings, "crypto_mid_stack_enabled", False)
+        and champion not in CRYPTO_MODEL_BASELINE_CANDIDATES
+    ):
+        champ_preds = predictions_by_candidate.get(champion, [])
+        champ_mids = oos_mids_by_candidate.get(champion, [])
+        if len(champ_preds) == len(champ_mids) and len(champ_preds) >= 200:
+            champion_mid_blend = fit_mid_stack(
+                [float(p) for p, _ in champ_preds],
+                champ_mids,
+                [int(y) for _, y in champ_preds],
+                min_samples=200,
+            )
     return {
         "schema_version": CRYPTO_CANDIDATE_REGISTRY_VERSION,
         "status": "ok",
+        "champion_mid_blend": champion_mid_blend,
         "selection_scope": "walk_forward_time_ordered",
         "primary_metric": "oos_candidate_net_pnl",
         "selection_policy": "prefer_positive_oos_pnl_non_market_candidate_then_pnl_advantage",
@@ -13688,21 +13713,20 @@ def _crypto_model_metrics(
     else:
         all_predicted = [_predict_crypto_probability(row, model) for row in rows]
 
-    # Mid-anchored stacking (gated, default off): fit label ~ [logit(model), logit(mid)] on these
-    # rows, attach to the champion model so it persists + applies at inference, and use the stacked
-    # predictions for the metrics below so the trainer's calibration_brier-vs-mid reflects (and
-    # validates) the stack. all_predicted above is the RAW model output (no stack yet), so the fit
-    # is on raw probs. Never-worse-than-mid by construction; baseline champion is already the mid.
-    if settings.crypto_mid_stack_enabled and model_type != "market_mid_baseline":
-        _mids = [float(_decimal(row["mid_yes_dollars"])) for row in rows]
-        _labels = [int(row["label_yes"]) for row in rows]
-        _model_probs = [float(p) for p in all_predicted]
-        _stack = fit_mid_stack(_model_probs, _mids, _labels, min_samples=200)
-        if _stack and isinstance(model, dict):
-            model["mid_stack"] = _stack
+    # Mid-anchored blend (gated, default off): use the weight fit on OOS WALK-FORWARD predictions
+    # (carried in candidate_report by _crypto_model_candidate_report), attach to the champion so it
+    # persists + applies at inference, and apply to all_predicted so these metrics also reflect the
+    # deployed forecast. Attach only when w>0 (the blend beat the mid OOS); w=0 means "don't trust
+    # the model over the mid for Brier" — we then leave the raw model so a profit-selected champion
+    # is not neutered (forecast-quality vs tail-profit are different objectives).
+    if settings.crypto_mid_stack_enabled and model_type != "market_mid_baseline" and isinstance(model, dict):
+        _report = model.get("candidate_report") if isinstance(model.get("candidate_report"), dict) else {}
+        _blend = _report.get("champion_mid_blend") if isinstance(_report, dict) else None
+        if _blend and float(_blend.get("w") or 0.0) > 0.0:
+            model["mid_stack"] = _blend
             all_predicted = [
-                _clamp_price(Decimal(str(apply_mid_stack(mp, md, _stack))))
-                for mp, md in zip(_model_probs, _mids)
+                _clamp_price(Decimal(str(apply_mid_stack(float(p), float(_decimal(row["mid_yes_dollars"])), _blend))))
+                for row, p in zip(rows, all_predicted)
             ]
 
     baseline_predictions: list[tuple[Decimal, int]] = []
