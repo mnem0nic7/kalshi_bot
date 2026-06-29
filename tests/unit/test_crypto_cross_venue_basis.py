@@ -88,6 +88,24 @@ def test_cross_venue_basis_buckets_ticks_across_venues() -> None:
     assert features[0]["spot_cross_venue_count"] == 3
 
 
+def test_cross_venue_basis_averages_multiple_ticks_per_venue_in_bucket() -> None:
+    # Settlement-alignment (v14): Kalshi settles on a 60s TIME-WEIGHTED average of a multi-venue
+    # index. When a venue publishes several ticks within the 60s bucket, the basis should use their
+    # AVERAGE (a 60s-TWAP proxy), not just the latest tick — less tick-noise, closer to settlement.
+    from kalshi_bot.crypto.services import _crypto_basis_index
+
+    cb1 = _Row("coinbase", "70000"); cb1.interval_seconds = 0; cb1.end_ts = NOW + timedelta(seconds=2)
+    cb2 = _Row("coinbase", "70200"); cb2.interval_seconds = 0; cb2.end_ts = NOW + timedelta(seconds=20)
+    kr = _Row("kraken", "70000"); kr.interval_seconds = 0; kr.end_ts = NOW + timedelta(seconds=10)
+
+    end_times, features = _crypto_basis_index([cb1, cb2, kr])
+    assert len(end_times) == 1
+    assert features[0]["spot_cross_venue_count"] == 2  # coinbase + kraken
+    # coinbase = mean(70000, 70200) = 70100 (TWAP), NOT the latest tick 70200
+    mean = (70100.0 + 70000.0) / 2
+    assert features[0]["spot_cross_venue_basis_pct"] == pytest.approx((70100.0 - mean) / mean)
+
+
 def test_cross_venue_basis_for_decision_prefers_freshest_multi_venue() -> None:
     # A lone coinbase tick AFTER a multi-venue bucket must not blank the basis: the decision
     # should fall back to the most recent multi-venue period <= decision.

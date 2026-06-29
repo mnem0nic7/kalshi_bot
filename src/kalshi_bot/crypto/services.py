@@ -110,7 +110,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v13"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v14"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -10360,7 +10360,12 @@ def _crypto_basis_index(rows: list[CryptoSpotOHLCRecord]) -> tuple[list[int], li
     #    different per-venue timestamps, so they're BUCKETED to CROSS_VENUE_TICK_BUCKET_SECONDS so
     #    near-simultaneous ticks from different venues land in one period (the latest tick per venue
     #    in the bucket wins). Sort ascending first so "latest wins" holds.
-    by_period: dict[tuple[int, int], dict[str, float]] = {}
+    # Settlement-alignment (v14): Kalshi settles on a 60s TIME-WEIGHTED average of a multi-venue
+    # index. For tick buckets we therefore AVERAGE each venue's ticks within the 60s window (a
+    # TWAP proxy) rather than taking the latest tick — reducing tick-noise so the basis is a
+    # closer proxy to the settlement reference. Candle rows carry one value per (venue, period),
+    # so averaging a single value is a no-op (behavior unchanged for candles).
+    by_period: dict[tuple[int, int], dict[str, list[float]]] = {}
     for row in sorted(rows, key=lambda r: _as_utc_datetime(r.end_ts)):
         if row.close_dollars is None:
             continue
@@ -10370,10 +10375,16 @@ def _crypto_basis_index(rows: list[CryptoSpotOHLCRecord]) -> tuple[list[int], li
             key = (epoch, interval)
         else:
             key = (epoch - (epoch % CROSS_VENUE_TICK_BUCKET_SECONDS), 0)
-        by_period.setdefault(key, {})[str(row.provider or "").strip().lower()] = float(row.close_dollars)
+        provider = str(row.provider or "").strip().lower()
+        by_period.setdefault(key, {}).setdefault(provider, []).append(float(row.close_dollars))
     keys = sorted(by_period)
     end_times = [epoch for (epoch, _interval) in keys]
-    features = [_crypto_cross_venue_basis_features(by_period[key]) for key in keys]
+    features = [
+        _crypto_cross_venue_basis_features(
+            {provider: sum(prices) / len(prices) for provider, prices in by_period[key].items() if prices}
+        )
+        for key in keys
+    ]
     return end_times, features
 
 
