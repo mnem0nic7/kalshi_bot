@@ -13422,9 +13422,28 @@ def _crypto_model_candidate_report(
     unavailable_reasons: dict[str, str] = {}
     dependency_versions: dict[str, str | None] = {}
     fold_summaries: list[dict[str, Any]] = []
-    for fold in folds:
+    # Progress logging: the per-fold candidate fit + in-sample backtest is single-threaded and can
+    # peg one core for minutes-to-hours on the largest assets, emitting no output — which is
+    # indistinguishable from a hang by eye. Log each fold boundary so the candidate report is
+    # observable (purely informational; no effect on the computation).
+    _report_asset = str((rows[0].get("asset_symbol") if rows else None) or "?")
+    logger.info(
+        "crypto_candidate_report start asset=%s rows=%d folds=%d",
+        _report_asset,
+        len(rows),
+        len(folds),
+    )
+    for fold_idx, fold in enumerate(folds, start=1):
         train_rows = fold["train_rows"]
         test_rows = fold["test_rows"]
+        logger.info(
+            "crypto_candidate_report fold asset=%s fold=%d/%d train=%d test=%d",
+            _report_asset,
+            fold_idx,
+            len(folds),
+            len(train_rows),
+            len(test_rows),
+        )
         schema = _crypto_feature_schema(train_rows)
         defaults = _crypto_feature_defaults(train_rows)
         fallback = _fit_crypto_heuristic_calibration(train_rows)
