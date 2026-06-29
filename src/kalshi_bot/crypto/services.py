@@ -10600,7 +10600,21 @@ def _spot_context_for_decision(
     moneyness_pct = None
     spot_probability_proxy = None
     if target_price is not None and target_price > 0:
-        moneyness = close - target_price
+        # Settlement-aligned moneyness (#3, v14): Kalshi settles on the multi-venue CONSENSUS index,
+        # not our single reference venue. When >=2 venues are observed this period, shift the
+        # reference close to the cross-venue consensus (close / (1 + basis), since
+        # basis = (reference - mean)/mean) so moneyness reflects the basis the market settles to.
+        # Momentum/returns/volatility keep using the single clean series (close) unchanged.
+        moneyness_close = close
+        _basis = basis_features.get("spot_cross_venue_basis_pct")
+        if int(basis_features.get("spot_cross_venue_count") or 0) >= 2 and _basis is not None:
+            try:
+                _denom = Decimal("1") + Decimal(str(_basis))
+                if _denom > 0:
+                    moneyness_close = close / _denom
+            except (ArithmeticError, ValueError, TypeError):
+                moneyness_close = close
+        moneyness = moneyness_close - target_price
         moneyness_pct = moneyness / target_price
         spot_probability_proxy = Decimal("0.5000") + max(Decimal("-0.5000"), min(Decimal("0.5000"), moneyness_pct * Decimal("20")))
     target_distance_volatility = None

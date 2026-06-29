@@ -138,6 +138,42 @@ def test_cross_venue_basis_flows_through_spot_context() -> None:
     assert ctx["spot_cross_venue_basis_pct"] > 0
 
 
+def test_settlement_aligned_moneyness_uses_consensus_not_single_venue() -> None:
+    # #3 (v14): Kalshi settles on the multi-venue CONSENSUS, not our single reference venue.
+    # Moneyness must be computed off the consensus (close / (1 + basis)), so when coinbase sits
+    # ABOVE the consensus, consensus-moneyness is smaller than single-venue moneyness. Momentum
+    # keeps using the clean single series; only moneyness shifts to the settlement basis.
+    rows = [_Row("coinbase", "70100"), _Row("kraken", "70000"), _Row("gemini", "70000")]
+    prepared = _prepare_spot_context_series(rows)
+    ctx = _spot_context_for_decision(
+        rows,
+        decision_ts=NOW + timedelta(minutes=1),
+        target_price=Decimal("70000"),
+        mid_yes=Decimal("0.50"),
+        prepared=prepared,
+    )
+    consensus = (70100.0 + 70000.0 + 70000.0) / 3  # 70033.33
+    # moneyness off consensus ≈ consensus - target (~33), NOT single-venue 70100-70000 = 100
+    assert float(ctx["spot_moneyness_dollars"]) == pytest.approx(consensus - 70000.0, abs=0.6)
+    assert float(ctx["spot_moneyness_dollars"]) < 90.0
+    # close itself (for momentum) stays the single-venue reference, unchanged
+    assert float(ctx["spot_close_dollars"]) == pytest.approx(70100.0)
+
+
+def test_moneyness_falls_back_to_single_venue_when_one_venue() -> None:
+    # Only one venue -> no consensus -> moneyness uses the single close (unchanged behavior).
+    rows = [_Row("coinbase", "70100")]
+    prepared = _prepare_spot_context_series(rows)
+    ctx = _spot_context_for_decision(
+        rows,
+        decision_ts=NOW + timedelta(minutes=1),
+        target_price=Decimal("70000"),
+        mid_yes=Decimal("0.50"),
+        prepared=prepared,
+    )
+    assert float(ctx["spot_moneyness_dollars"]) == pytest.approx(100.0)  # 70100 - 70000
+
+
 def test_cross_venue_basis_in_schema_and_feature_vector() -> None:
     row = {
         "asset_symbol": "BTC",
