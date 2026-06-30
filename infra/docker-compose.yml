@@ -680,6 +680,15 @@ services:
 
   daemon_production_crypto_1h_blue:
     <<: *production-daemon-base
+    # Leak containment (2026-06-30 host-thrash incident): the SHADOW 1h crypto
+    # daemon leaked from its ~0.5GB normal footprint to 35GB RSS over ~15h,
+    # thrashing the host into swap (load avg 109) and wedging the trainer. Unlike
+    # the trainer (32g) / crypto_mm (8g) it inherited NO mem_limit from
+    # production-daemon-base, only the -900 oom_score_adj protection — so an
+    # uncapped leak was actively defended by the kernel while it reaped healthier
+    # containers. A per-cgroup cap converts a host-wide thrash into a contained
+    # self-restart of this expendable shadow daemon. Generous (~10x normal).
+    mem_limit: 8g
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
@@ -703,6 +712,10 @@ services:
 
   daemon_production_crypto_1h_green:
     <<: *production-daemon-base
+    # Leak containment — see daemon_production_crypto_1h_blue (2026-06-30 host-thrash
+    # incident): cap the uncapped shadow 1h daemon so a memory leak self-restarts
+    # the cgroup instead of thrashing the host. Generous (~10x normal footprint).
+    mem_limit: 8g
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
