@@ -688,7 +688,13 @@ services:
     # uncapped leak was actively defended by the kernel while it reaped healthier
     # containers. A per-cgroup cap converts a host-wide thrash into a contained
     # self-restart of this expendable shadow daemon. Generous (~10x normal).
+    # memswap_limit == mem_limit gives the cgroup ZERO swap: mem_limit alone
+    # capped RSS at 8g but the leak then spilled into host swap (filled 6GB,
+    # daemon pinned at 8g/unhealthy, never OOM-restarting). With no swap the
+    # cgroup OOM-kills at 8g RAM -> clean container restart instead of a slow
+    # swap-exhaustion creep that still threatens a host OOM.
     mem_limit: 8g
+    memswap_limit: 8g
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
@@ -715,7 +721,10 @@ services:
     # Leak containment — see daemon_production_crypto_1h_blue (2026-06-30 host-thrash
     # incident): cap the uncapped shadow 1h daemon so a memory leak self-restarts
     # the cgroup instead of thrashing the host. Generous (~10x normal footprint).
+    # memswap_limit == mem_limit gives the cgroup zero swap so it OOM-restarts
+    # cleanly at 8g instead of creeping into host swap — see crypto_1h_blue.
     mem_limit: 8g
+    memswap_limit: 8g
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
