@@ -431,7 +431,14 @@ def test_historical_spot_ohlc_uses_alignment_window_not_live_freshness() -> None
     assert rows[0]["spot_max_stale_seconds"] == 905
 
 
-def test_historical_spot_context_prefers_ohlc_over_stale_tick() -> None:
+def test_historical_spot_context_prefers_fresh_tick_over_stale_candle() -> None:
+    # 2026-06-30 STALE-SPOT FIX: historical mode used to DROP spot_tick rows and
+    # take the up-to-900s-stale 15m candle for moneyness, while LIVE used the fresh
+    # ~20s ticks — a train/serve mismatch that left moneyness a coin flip on 15m
+    # markets and collapsed the analytic vol fair value to Brier ~0.25. Validated
+    # (scripts/diag_sigma_freshfix.py): fresh spot drops raw vol Brier 0.25 -> 0.15.
+    # Historical mode now uses the freshest point-in-time spot (here the 12:10 tick,
+    # close=101), matching live; the 12:00 candle (close=99) is older and ignored.
     decision_ts = datetime(2026, 5, 12, 12, 11, tzinfo=UTC)
     snapshot = type(
         "_Snapshot",
@@ -485,13 +492,15 @@ def test_historical_spot_context_prefers_ohlc_over_stale_tick() -> None:
         payload={},
     )
 
-    rows = _crypto_decision_rows([snapshot], [], [ohlc, tick])  # type: ignore[list-item]
+    # settings → coinbase max_stale 180s, so the 60s-old tick is fresh & available
+    # (production behaviour); without it the 5s fallback constant would mark it stale.
+    rows = _crypto_decision_rows([snapshot], [], [ohlc, tick], settings=Settings())  # type: ignore[list-item]
 
     assert rows[0]["spot_context_mode"] == "historical"
     assert rows[0]["spot_feature_status"] == "available"
-    assert rows[0]["spot_source_kind"] == "spot_ohlc"
-    assert rows[0]["spot_close_dollars"] == Decimal("99.00000000")
-    assert rows[0]["spot_max_stale_seconds"] == 905
+    assert rows[0]["spot_source_kind"] == "spot_tick"
+    assert rows[0]["spot_close_dollars"] == Decimal("101.00000000")
+    assert rows[0]["spot_stale_seconds"] == 60
 
 
 def test_historical_spot_ohlc_stales_after_alignment_window() -> None:

@@ -110,7 +110,7 @@ CRYPTO_ASSET_MODES = {
     CRYPTO_ASSET_MODE_LIVE,
 }
 CRYPTO_LOGISTIC_FEATURE_SCHEMA_VERSION = "crypto-logistic-v2"
-CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v14"
+CRYPTO_RICH_FEATURE_SCHEMA_VERSION = "crypto-rich-v15"
 CRYPTO_CANDIDATE_REGISTRY_VERSION = "crypto-candidate-registry-v1"
 CRYPTO_AUTONOMY_CYCLE_OPS_SCHEMA_VERSION = "crypto-autonomy-cycle-v1"
 CRYPTO_PROBABILITY_GUARDRAIL_TOLERANCE = 0.02
@@ -10440,7 +10440,6 @@ def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[
     # the provider dedup below (which keeps one venue per period for momentum safety).
     basis_end_times, basis_features = _crypto_basis_index(close_rows)
     clean = _dedup_spot_rows_by_provider_preference(close_rows)
-    hist = [row for row in clean if str(row.source_kind or "").strip().lower() != "spot_tick"]
     micro_prefix: list[int] = []
     last = -1
     for i, row in enumerate(clean):
@@ -10451,8 +10450,6 @@ def _prepare_spot_context_series(spot_rows: list[CryptoSpotOHLCRecord]) -> dict[
     return {
         "rows": clean,
         "end_times": [_as_utc_datetime(row.end_ts) for row in clean],
-        "hist_rows": hist,
-        "hist_end_times": [_as_utc_datetime(row.end_ts) for row in hist],
         "micro_prefix": micro_prefix,
         "basis_end_times": basis_end_times,
         "basis_features": basis_features,
@@ -10483,10 +10480,14 @@ def _spot_context_for_decision(
         eligible = prepared["rows"][max(0, idx - _SPOT_CONTEXT_TAIL_ROWS) : idx]
         micro_i = prepared["micro_prefix"][idx - 1] if idx > 0 else -1
         prepared_microstructure_row = prepared["rows"][micro_i] if micro_i >= 0 else None
-        if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
-            hidx = bisect_right(prepared["hist_end_times"], decision_utc)
-            if hidx > 0:
-                eligible = prepared["hist_rows"][max(0, hidx - _SPOT_CONTEXT_TAIL_ROWS) : hidx]
+        # NOTE: historical mode no longer drops spot_tick rows. Dropping them left
+        # training/replay moneyness on the up-to-900s-stale 15m candle (~7.6 min
+        # stale on a 15m market) while LIVE used the fresh ~20s ticks — a train/
+        # serve mismatch that collapsed every spot feature (and the analytic vol
+        # fair value) to base rate (Brier ~0.25). Using the freshest point-in-time
+        # spot in BOTH modes restored raw vol Brier 0.25 -> 0.15 on HYPE
+        # (scripts/diag_sigma_freshfix.py, 2026-06-30). Pre-tick-era rows have no
+        # ticks, so they transparently fall back to candles.
     elif spot_end_times is not None:
         eligible = [row for row in spot_rows[:bisect_right(spot_end_times, decision_utc)] if row.close_dollars is not None]
         eligible = _dedup_spot_rows_by_provider_preference(eligible)
@@ -10542,14 +10543,9 @@ def _spot_context_for_decision(
             ),
             None,
         )
-        if str(mode or "").strip().lower() == CRYPTO_SPOT_CONTEXT_HISTORICAL:
-            historical_eligible = [
-                row
-                for row in eligible
-                if str(row.source_kind or "").strip().lower() != "spot_tick"
-            ]
-            if historical_eligible:
-                eligible = historical_eligible
+        # historical mode no longer drops spot_tick rows (see the prepared-path note
+        # above): the freshest point-in-time spot — tick or candle — feeds moneyness
+        # in both modes so training matches live.
     current = eligible[-1]
     close = _decimal(current.close_dollars)
     stale_seconds = int((decision_utc - _as_utc_datetime(current.end_ts)).total_seconds())
