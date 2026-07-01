@@ -63,15 +63,28 @@ a backtest script, unit-tested, runnable offline.
 - Fetches the daily Cleveland Fed CPI nowcast: current target month's headline CPI, as MoM % and
   YoY %. (One nowcast of the current-month CPI index yields both: MoM vs last month's known actual,
   YoY vs the month-12 known actual. Cleveland Fed also publishes both directly.)
-- Ingestion is UA-sensitive: clevelandfed.org returns 403 to naive fetchers. Use `httpx` with a
-  browser `User-Agent`. Primary = Cleveland Fed nowcast data file (their published historical-vintage
-  spreadsheet/CSV). Fallbacks (config-ordered): FRED (if a nowcast series exists) and the MacroMicro
-  mirror. Each source is a small adapter behind one interface; the source that answers first wins.
-- Returns a normalized `NowcastReading(as_of_date, target_month, index=cpi_headline, mom_pct,
-  yoy_pct, source, raw)`.
-- **Point-in-time discipline (the crypto stale-spot lesson):** persist one vintage row per
-  `(as_of_date, target_month)`; the backtest reads the vintage *as it was known on each date*, never
-  the final value. This is the macro analogue of the stale-spot train/serve bug — avoid lookahead.
+- **Verified data source (2026-07-01 feasibility probe):** the primary endpoint is
+  `https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_month.json`
+  (siblings: `nowcast_quarter.json`, `nowcast_year.json`). **UA-gated** — a browser `User-Agent`
+  returns 200; naive fetchers (incl. WebFetch) get **403**. No auth / API key. Clean JSON.
+- **Structure (verified):** a list of ~157 frames, **one per target month from 2013-07 to the current
+  month**. Each frame's x-axis is the **daily nowcast path over that month's run-up** (x-labels are
+  dates like `03/02, 03/03, …` interleaved with `CPI Feb` / `PCE Feb` actual-release markers), across
+  8 series: `CPI Inflation`, `Core CPI Inflation`, `PCE Inflation`, `Core PCE Inflation`, and the four
+  matching `Actual …` series. **Values are MoM %** (e.g. `0.1333` = 0.13% MoM). This file is
+  **inherently point-in-time** — each x is a date, so it *is* the lookahead-free vintage archive.
+- **Consequence for A:** ~13 years of daily point-in-time CPI-nowcast vintages + actuals are available
+  in a single fetch — the signal-vs-actual backtest needs **no forward-collection** to start. Parse the
+  frames into `NowcastReading(as_of_date, target_month, index, mom_pct, source, raw)` rows and persist
+  them (idempotent) so later daily fetches append new dates.
+- Fallbacks (config-ordered, only if the primary format breaks): the DOI research dataset
+  (`10.26509/frbc-inflationnowcast`), FRED (if a nowcast series exists), MacroMicro mirror. One adapter
+  per source behind a single interface; first to answer wins. Never silently fall back to a stale/None
+  value — that is the stale-spot class of bug; fail loud with per-source status.
+- **Point-in-time discipline (the crypto stale-spot lesson):** the backtest reads the nowcast *as it
+  was known on each date*, never a later value. The frame x-axis already encodes this; assert it.
+- **Data-gap caveat:** the source publishes methodology notes for missing-CPI months (e.g. the
+  Oct/Nov 2025 CPI data gap) — the parser must tolerate months with absent actuals rather than crash.
 
 **`macro/distribution.py` — `NowcastDistribution`**
 - Input: nowcast point estimate (MoM and YoY) for a target month + days-to-release.
@@ -102,9 +115,12 @@ One new table (Alembic migration), append-only:
 - `macro_nowcast_vintages(id, as_of_date, target_month, index_type, mom_pct, yoy_pct, source,
   raw_payload, created_at)`, unique on `(as_of_date, target_month, index_type)`.
 
-No decision/outcome tables in A (those belong to B's shadow tracking). Kalshi CPI price history is
-thin (API cutoff ~2 months) — A uses whatever exists; a forward-collection loop is a B concern. The
-backtest can run on signal-vs-actual immediately and on signal-vs-market as price history accrues.
+No decision/outcome tables in A (those belong to B's shadow tracking). **The nowcast history is NOT
+thin** — the monthly JSON carries ~13 years of daily point-in-time vintages, so the signal-vs-actual
+backtest runs fully offline today. What *is* thin is the **Kalshi ladder price history** (API cutoff
+~2 months) — so the decisive market-edge metric can only be measured on recent + forward-collected
+prices. A therefore delivers a complete signal-quality verdict now and a *preliminary* market-edge
+verdict that strengthens as Kalshi price history accrues (forward collection is a B concern).
 
 ### Config
 
