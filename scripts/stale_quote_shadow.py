@@ -53,7 +53,10 @@ MIN_TTC_S = 90
 MAX_TTC_S = 870
 MAX_SPREAD = 0.20
 PROBE_DELAYS = (2.0, 3.0)   # cumulative: +2s, +5s
-SPOT_REFRESH_S = 60.0       # reload spot tick tail per asset
+SPOT_REFRESH_S = 0.0        # reload spot tail EVERY cycle — a cached (stale) spot zeroes dfair
+                            # and defeats the reaction-speed premise (bug found 2026-07-02:
+                            # 60s cache => spot_ref == spot_now for most pairs => 0 signals)
+HEARTBEAT_S = 600.0         # emit max|dfair| seen periodically (quiet vs broken)
 
 OUT_DIR = os.environ.get("STALE_SHADOW_OUT", "/app/data/stale_shadow")
 STDOUT = os.environ.get("STALE_SHADOW_STDOUT") == "1"
@@ -122,7 +125,7 @@ async def main() -> None:
     async def spot_rows(asset):
         nowt = datetime.now(UTC)
         cached = spot_cache.get(asset)
-        if cached and (nowt - cached[0]).total_seconds() < SPOT_REFRESH_S:
+        if cached and SPOT_REFRESH_S > 0 and (nowt - cached[0]).total_seconds() < SPOT_REFRESH_S:
             return cached[1], cached[2]
         async with factory() as session:
             repo = PlatformRepository(session, kalshi_env=settings.kalshi_env)
@@ -135,8 +138,15 @@ async def main() -> None:
         spot_cache[asset] = (nowt, rows, prep)
         return rows, prep
 
+    max_dfair_seen = 0.0
+    evals = 0
+    last_beat = asyncio.get_event_loop().time()
     while True:
         cycle_t0 = asyncio.get_event_loop().time()
+        if cycle_t0 - last_beat >= HEARTBEAT_S:
+            emit({"type": "heartbeat", "ts": datetime.now(UTC).isoformat(),
+                  "max_abs_dfair": round(max_dfair_seen, 4), "evals": evals})
+            max_dfair_seen, evals, last_beat = 0.0, 0, cycle_t0
         now = datetime.now(UTC)
         for asset in assets:
             try:
@@ -182,6 +192,9 @@ async def main() -> None:
                 if fair_ref is None:
                     continue
                 dfair = float(fair_now) - float(fair_ref)
+                evals += 1
+                if abs(dfair) > max_dfair_seen:
+                    max_dfair_seen = abs(dfair)
                 stale = abs(mid_now - ref[1]) <= QUOTE_EPS
                 if abs(dfair) < DFAIR_TH or not stale:
                     continue
