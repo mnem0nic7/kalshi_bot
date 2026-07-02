@@ -102,6 +102,26 @@ class _RoomShim:
     shadow_mode: bool
 
 
+async def live_book_top(client, ticker: str) -> tuple[float | None, float | None]:
+    """Real-time (best_yes_bid, best_yes_ask) from the orderbook endpoint.
+
+    list_markets quote fields lag during fast moves (first 5 live IOCs at the
+    cached quote all canceled unfilled against DEEP books); the orderbook is the
+    real book: yes_dollars = resting YES bids, no_dollars = resting NO bids, and
+    the effective YES ask = 1 - best NO bid.
+    """
+    ob = (await client._request("GET", f"/markets/{ticker}/orderbook")).get("orderbook_fp") or {}
+
+    def best(levels):
+        px = [f(p) for p, _cnt in (levels or []) if f(p) is not None]
+        return max(px) if px else None
+
+    yes_bid = best(ob.get("yes_dollars"))
+    no_bid = best(ob.get("no_dollars"))
+    yes_ask = (1.0 - no_bid) if no_bid is not None else None
+    return yes_bid, yes_ask
+
+
 async def main() -> None:
     settings = get_settings()
     cfg = _env_cfg()
@@ -230,8 +250,29 @@ async def main() -> None:
                 if not allowed:
                     emit(rec)
                     continue
+                # Re-price off the REAL-TIME book right before submit — the cached
+                # market quote lags during fast moves (0/5 fills at cached prices
+                # against deep books). Log both to quantify the lag.
+                try:
+                    live_bid, live_ask = await live_book_top(client, tk)
+                except Exception as e:
+                    rec["book_error"] = str(e)[:120]
+                    live_bid, live_ask = None, None
+                rec["cached_quote"] = [yb, ya]
+                rec["live_book"] = [live_bid, live_ask]
+                if live_bid is None or live_ask is None:
+                    rec["guard"] = "no_live_book"
+                    emit(rec)
+                    continue
+                live_entry = live_ask if side == "yes" else 1.0 - live_bid
+                rec["live_entry"] = round(live_entry, 4)
+                # re-check price guards at the live price (edge may be gone)
+                if not (0.03 <= live_entry <= 0.97) or live_entry > cfg.max_entry_dollars:
+                    rec["guard"] = "live_entry_out_of_bounds"
+                    emit(rec)
+                    continue
                 ticket = build_pilot_ticket(market_ticker=tk, side=side,
-                                            yes_bid=_decimal(str(yb)), yes_ask=_decimal(str(ya)))
+                                            yes_bid=_decimal(str(live_bid)), yes_ask=_decimal(str(live_ask)))
                 coid = make_client_order_id("stale-quote-pilot", tk, ticket.nonce)
                 receipt = await execution.execute(
                     room=_RoomShim(shadow_mode=not cfg.enabled),
@@ -263,7 +304,7 @@ async def main() -> None:
                     rec["filled"] = filled
                     if filled > 0:
                         eff_entry = fill_price if (fill_price is not None and side == "yes") \
-                            else (1.0 - fill_price if fill_price is not None else entry)
+                            else (1.0 - fill_price if fill_price is not None else live_entry)
                         state.open_positions += 1
                         open_trades.append({"ticker": tk, "side": side, "entry": eff_entry,
                                             "settle_by": cl + timedelta(seconds=60)})
