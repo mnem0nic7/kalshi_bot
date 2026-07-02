@@ -390,6 +390,12 @@ services:
   postgres_demo:
     <<: [*cpu-limits, *oom-protect]
     image: pgvector/pgvector:pg16
+    # tini as PID 1: without it the postmaster is PID 1 and reaps orphaned
+    # docker execs (e.g. a timed-out pg_isready healthcheck, which exits 2);
+    # postmaster then treats the unknown child's nonzero exit as a crashed
+    # backend and forces full crash-recovery. Bit us twice on 2026-07-02 —
+    # see docs/operations/2026-07-02-daemon-reconcile-wedge.md.
+    init: true
     env_file: [../.env]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
@@ -407,6 +413,7 @@ services:
   postgres_production:
     <<: [*cpu-limits, *oom-protect]
     image: pgvector/pgvector:pg16
+    init: true  # PID-1 orphan-reaping guard — same rationale as postgres_demo
     env_file: [../.env]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-kalshi_bot}
