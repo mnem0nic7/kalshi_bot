@@ -55,7 +55,8 @@ VOL_MODEL = {
 }
 SERIES = {"BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M", "XRP": "KXXRP15M",
           "BNB": "KXBNB15M", "DOGE": "KXDOGE15M", "HYPE": "KXHYPE15M"}
-POLL_S = 5.0
+POLL_S = 2.0  # was 5.0 — a measured 8.35c-edge fill was lost to loop latency;
+              # the token bucket in KalshiClient keeps request rate safe
 LOOKBACK_S = 18.0
 DFAIR_TH = 0.10
 QUOTE_EPS = 0.01
