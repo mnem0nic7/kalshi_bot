@@ -160,6 +160,8 @@ FastAPI app with server-rendered Jinja2 templates, SSE transcript stream, and RE
 ### Blue/green deployment
 A DB-backed single-writer lock enforces that only the active color (`app_color` setting) can acquire the execution lock. The kill switch (`app_enable_kill_switch`) clears the execution lock and blocks new live orders. Self-improve staging is checkpoint-based: promotions write `pending_pack_promotion:{kalshi_env}:{color}`, and the target color's daemon applies it at startup so watchdog restarts or failovers do not strand an old pack assignment. Canary state has a max lifetime and becomes `stalled` after `SELF_IMPROVE_CANARY_MAX_SECONDS`.
 
+The daemon's reconcile and heartbeat loops are stall-proof (2026-07-02): each iteration runs under `daemon_loop_stall_timeout_seconds` (default 300) and failures are logged-and-retried rather than killing the loop. Before this, a Postgres crash-recovery cycle could hang the reconcile loop on a dead connection for hours while the container stayed "healthy" — fills/settlement ingestion silently stopped (tell: `max(created_at)` in `fills` lags live trading). See `docs/operations/2026-07-02-daemon-reconcile-wedge.md`.
+
 The active color lives in the `deployment_control` DB row, set via `kalshi-bot-cli promote <blue|green>` (a pure metadata update). For **zero-downtime redeploys**, recreate only the inactive color, wait for health, then `promote` to hand off the lock — use `scripts/blue_green_redeploy.sh` and `docs/operations/blue-green-redeploy.md`. A plain `docker compose up -d --force-recreate <all colors>` bounces the active color too (brief trading gap + ~74s daemon warmup) and is only for an intentional full bounce.
 
 ### Historical data layers (four separate concerns)

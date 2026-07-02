@@ -796,6 +796,9 @@ class Settings(BaseSettings):
     trigger_marketability_recheck_limit: int = 50
     daemon_reconcile_interval_seconds: int = 60
     daemon_reconcile_stale_kill_switch_seconds: int = 300
+    # Max seconds one reconcile/heartbeat iteration may run before it is
+    # cancelled as wedged (e.g. awaiting a socket that died in a DB crash).
+    daemon_loop_stall_timeout_seconds: int = 300
     daemon_heartbeat_interval_seconds: int = 60
     daemon_heartbeat_unhealthy_grace_seconds: int = 45
     daemon_active_color_cache_seconds: float = 0.0

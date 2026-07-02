@@ -868,14 +868,33 @@ class DaemonService:
         return True
 
     async def _periodic_reconcile_loop(self) -> None:
+        # Both failure modes of a mid-iteration DB outage must leave the loop
+        # alive: an exception (connection refused) is logged and retried next
+        # interval, and a hang (await on a socket that died mid-crash, which
+        # raises nothing) is bounded by the stall timeout. 2026-07-02: a
+        # Postgres crash-recovery cycle wedged this loop for ~7h while the
+        # daemon stayed healthy-looking.
         while True:
             await asyncio.sleep(self.settings.daemon_reconcile_interval_seconds)
-            await self.reconcile_once(run_settlement_gate_tuning=False)
+            try:
+                async with asyncio.timeout(self.settings.daemon_loop_stall_timeout_seconds):
+                    await self.reconcile_once(run_settlement_gate_tuning=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("reconcile loop error", exc_info=True)
 
     async def _periodic_heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.daemon_heartbeat_interval_seconds)
-            payload = await self.heartbeat_once(run_follow_up=False)
+            try:
+                async with asyncio.timeout(self.settings.daemon_loop_stall_timeout_seconds):
+                    payload = await self.heartbeat_once(run_follow_up=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("heartbeat loop error", exc_info=True)
+                continue
             self._schedule_heartbeat_follow_up(payload)
 
     @staticmethod
@@ -1326,15 +1345,22 @@ class DaemonService:
             raise
         except Exception as exc:
             logger.exception("daemon heartbeat follow-up failed")
-            async with self.session_factory() as session:
-                repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
-                await repo.log_ops_event(
-                    severity="error",
-                    summary="Daemon heartbeat follow-up error",
-                    source="daemon",
-                    payload={"error": str(exc), "app_color": self.settings.app_color},
-                )
-                await session.commit()
+            try:
+                async with self.session_factory() as session:
+                    repo = PlatformRepository(session, kalshi_env=self.settings.kalshi_env)
+                    await repo.log_ops_event(
+                        severity="error",
+                        summary="Daemon heartbeat follow-up error",
+                        source="daemon",
+                        payload={"error": str(exc), "app_color": self.settings.app_color},
+                    )
+                    await session.commit()
+            except Exception:
+                # The usual reason the follow-up failed is a DB outage — the
+                # ops-event write then fails too. Losing the ops event is fine;
+                # letting this raise turned the handler itself into an
+                # unretrieved task exception.
+                logger.warning("could not persist heartbeat follow-up ops event", exc_info=True)
         finally:
             if asyncio.current_task() is self._heartbeat_follow_up_task:
                 self._heartbeat_follow_up_task = None
