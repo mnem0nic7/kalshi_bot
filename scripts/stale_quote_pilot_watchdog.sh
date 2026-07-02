@@ -14,6 +14,14 @@ mkdir -p "$OUT_DIR"
 
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then exit 0; fi
 
+# Kill any orphaned IN-CONTAINER pilots first — killing the host `docker exec`
+# wrapper does NOT kill the container process (we leaked 3 concurrent pilots
+# this way on 2026-07-02; multiple pilots multiply the caps).
+for c in infra-app_production_blue-1 infra-app_production_green-1; do
+  docker ps --format '{{.Names}}' | grep -qx "$c" || continue
+  docker exec "$c" sh -c 'ls /proc | grep -E "^[0-9]+$" | while read p; do cmd=$(cat /proc/$p/cmdline 2>/dev/null | tr "\0" " "); case "$cmd" in python*stale_quote_pilot.py*) kill -9 $p;; esac; done' 2>/dev/null || true
+done
+
 # active color from the DB via any running app container
 ACTIVE=""
 for c in infra-app_production_blue-1 infra-app_production_green-1; do
