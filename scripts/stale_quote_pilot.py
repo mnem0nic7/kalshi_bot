@@ -266,13 +266,23 @@ async def main() -> None:
                     continue
                 live_entry = live_ask if side == "yes" else 1.0 - live_bid
                 rec["live_entry"] = round(live_entry, 4)
-                # re-check price guards at the live price (edge may be gone)
-                if not (0.03 <= live_entry <= 0.97) or live_entry > cfg.max_entry_dollars:
+                # re-check price guards at the live price (edge may be gone);
+                # +0.01 keeps the crossed price under the entry cap too
+                if not (0.03 <= live_entry <= 0.97) or (live_entry + 0.01) > cfg.max_entry_dollars:
                     rec["guard"] = "live_entry_out_of_bounds"
                     emit(rec)
                     continue
+                # Cross 1 tick THROUGH the live touch: 0/7 touch-priced IOCs
+                # filled (book outruns our exec path), so pay 1c for execution
+                # certainty when any quote within 1c persists. Costs 1c of the
+                # backtest capture; if even this never fills, the edge is
+                # definitively unreachable at our latency class.
+                cross = 0.01
+                x_ask = min(live_ask + cross, 0.99)   # yes-buy limit
+                x_bid = max(live_bid - cross, 0.01)   # no-buy (yes-ask) limit
+                rec["cross_ticks"] = 1
                 ticket = build_pilot_ticket(market_ticker=tk, side=side,
-                                            yes_bid=_decimal(str(live_bid)), yes_ask=_decimal(str(live_ask)))
+                                            yes_bid=_decimal(f"{x_bid:.4f}"), yes_ask=_decimal(f"{x_ask:.4f}"))
                 coid = make_client_order_id("stale-quote-pilot", tk, ticket.nonce)
                 receipt = await execution.execute(
                     room=_RoomShim(shadow_mode=not cfg.enabled),
