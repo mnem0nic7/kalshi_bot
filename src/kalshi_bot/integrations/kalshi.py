@@ -22,6 +22,34 @@ from kalshi_bot.config import Settings
 logger = logging.getLogger(__name__)
 
 
+def order_payload_v2(v1: dict[str, Any]) -> dict[str, Any]:
+    """Translate a v1-shaped order payload to the V2 create-order body.
+
+    V2 (POST /portfolio/events/orders) is a single YES book: ``side`` is
+    ``bid``/``ask`` and ``price`` is the yes price. Buying NO is selling YES at
+    the same yes price, so (action, side) maps as:
+      (buy, yes) -> bid   (buy, no) -> ask   (sell, yes) -> ask   (sell, no) -> bid
+    ``count_fp``/``yes_price_dollars`` become ``count``/``price``; ``subaccount``
+    becomes an int. Everything the services build stays v1-shaped — this is the
+    only translation point.
+    """
+    buy = str(v1.get("action", "buy")).lower() == "buy"
+    yes = str(v1.get("side", "yes")).lower() == "yes"
+    payload: dict[str, Any] = {
+        "ticker": v1["ticker"],
+        "side": "bid" if buy == yes else "ask",
+        "count": v1["count_fp"],
+        "price": v1["yes_price_dollars"],
+        "time_in_force": v1["time_in_force"],
+        "self_trade_prevention_type": v1.get("self_trade_prevention_type", "taker_at_cross"),
+    }
+    if v1.get("client_order_id"):
+        payload["client_order_id"] = v1["client_order_id"]
+    if v1.get("subaccount") not in (None, ""):
+        payload["subaccount"] = int(v1["subaccount"])
+    return payload
+
+
 class _TokenBucket:
     """Async token bucket — limits average request rate to `rate` per second."""
 
@@ -232,13 +260,16 @@ class KalshiClient:
         return await self._request("GET", "/historical/cutoff")
 
     async def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/portfolio/orders", json=payload, write=True)
+        # v1 POST /portfolio/orders returns 410 deprecated_v1_order_endpoint
+        # (found live 2026-07-02). Translate the v1-shaped payload the services
+        # build to the V2 single-book endpoint here, at the single choke point.
+        return await self._request("POST", "/portfolio/events/orders", json=order_payload_v2(payload), write=True)
 
     async def get_order(self, order_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/portfolio/orders/{order_id}")
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/portfolio/orders/{order_id}", write=True)
+        return await self._request("DELETE", f"/portfolio/events/orders/{order_id}", write=True)
 
 
 class KalshiWebSocketClient:
