@@ -69,6 +69,13 @@ latency/reaction edge, not a forecasting edge, so it does not contradict the v15
 2. **Micro-capped live pilot** (operator authorization, like the 2026-06-29 $10 SOL experiment):
    1-contract taker IOC orders, strict daily cap, BTC+BNB only. Directly measures fill rate + realized
    capture vs backtest. This is the only way to close the fill question.
+   **BUILT (default OFF):** `scripts/stale_quote_pilot.py` + TDD'd guards in
+   `kalshi_bot/crypto/stale_quote_pilot.py` (tests: `tests/unit/test_stale_quote_pilot.py`). Orders
+   route ONLY through `ExecutionService` (kill-switch/color/creds rails). Without `STALE_PILOT_ENABLED=1`
+   it dry-runs the full path as `shadow_skipped`. Enabling requires explicit env:
+   `STALE_PILOT_ENABLED=1 STALE_PILOT_ASSETS=BTC,BNB STALE_PILOT_MAX_TRADES_PER_DAY=10
+   STALE_PILOT_MAX_OPEN=1 STALE_PILOT_DAILY_LOSS_STOP=3.0 STALE_PILOT_MAX_ENTRY=0.75` —
+   all caps default to 0 (refuse).
 3. If live capture ≥ ~half of backtest: productionize as a new event-triggered strategy in the
    autonomy loop (NOT the champion-model path), with per-asset enable, replay-gate-style shadow
    accounting, and the existing kill-switch/risk rails.
