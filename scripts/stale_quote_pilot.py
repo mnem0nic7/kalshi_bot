@@ -244,10 +244,29 @@ async def main() -> None:
                 if receipt.status not in ("shadow_skipped", "kill_switch_blocked",
                                           "inactive_color_skipped", "write_credentials_missing") \
                         and not receipt.status.startswith("rejected"):
-                    state.trades_today += 1
-                    state.open_positions += 1
-                    open_trades.append({"ticker": tk, "side": side, "entry": entry,
-                                        "settle_by": cl + timedelta(seconds=60)})
+                    state.trades_today += 1  # every submitted order consumes the daily budget
+                    # IOC can cancel with 0 fills (the latency race) — only a real
+                    # fill is an open position; a phantom would block MAX_OPEN and
+                    # poison settle P&L (first live order: submitted -> canceled, 0 fills).
+                    filled = 0.0
+                    fill_price = None
+                    oid = receipt.external_order_id
+                    await asyncio.sleep(2.0)
+                    try:
+                        if oid:
+                            o = (await client.get_order(oid)).get("order") or {}
+                            filled = f(o.get("fill_count_fp")) or 0.0
+                            fill_price = f(o.get("yes_price_dollars"))
+                            rec["final_order_status"] = o.get("status")
+                    except Exception as e:
+                        rec["fill_check_error"] = str(e)[:120]
+                    rec["filled"] = filled
+                    if filled > 0:
+                        eff_entry = fill_price if (fill_price is not None and side == "yes") \
+                            else (1.0 - fill_price if fill_price is not None else entry)
+                        state.open_positions += 1
+                        open_trades.append({"ticker": tk, "side": side, "entry": eff_entry,
+                                            "settle_by": cl + timedelta(seconds=60)})
                 emit(rec)
         elapsed = asyncio.get_event_loop().time() - cycle_t0
         await asyncio.sleep(max(0.5, POLL_S - elapsed))
