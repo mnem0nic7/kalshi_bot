@@ -20,7 +20,6 @@ import asyncio
 import json
 import math
 import os
-import re
 import sys
 from datetime import UTC, datetime, timedelta
 
@@ -91,8 +90,10 @@ def parse_close(m) -> datetime | None:
 
 
 def strike_of(m) -> float | None:
-    mm = re.search(r"-T?(-?\d+(?:\.\d+)?)$", str(m.get("ticker") or ""))
-    return float(mm.group(1)) if mm else None
+    # 15m tickers end in a 2-digit index (e.g. ...1100-00), NOT the strike — the
+    # strike is the floor_strike field (bug found 2026-07-02: regex gave 0/45 ->
+    # garbage moneyness -> ctx fields missing -> dfair identically 0).
+    return f(m.get("floor_strike"))
 
 
 async def market_quotes(client, series_ticker):
