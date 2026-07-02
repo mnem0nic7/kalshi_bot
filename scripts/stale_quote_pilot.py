@@ -266,9 +266,20 @@ async def main() -> None:
                     continue
                 live_entry = live_ask if side == "yes" else 1.0 - live_bid
                 rec["live_entry"] = round(live_entry, 4)
-                # re-check price guards at the live price (edge may be gone);
-                # +0.01 keeps the crossed price under the entry cap too
-                if not (0.03 <= live_entry <= 0.97) or (live_entry + 0.01) > cfg.max_entry_dollars:
+                # Require the edge to SURVIVE at the live price. The signal
+                # fires vs the lagging cached quote; when the live book has
+                # already moved to fair, filling is easy but EV is negative
+                # (adverse selection — e.g. BTC 12:45: fair ~0.73, live ask
+                # 0.72, edge ~1c < ~1.4c fee). 3c clears the worst-case fee
+                # (~1.75c) with margin.
+                edge_live = (float(fair_now) - live_ask) if side == "yes" else (live_bid - float(fair_now))
+                rec["edge_live"] = round(edge_live, 4)
+                if edge_live < 0.03:
+                    rec["guard"] = "live_edge_too_small"
+                    emit(rec)
+                    continue
+                # re-check price guards at the live price
+                if not (0.03 <= live_entry <= 0.97) or live_entry > cfg.max_entry_dollars:
                     rec["guard"] = "live_entry_out_of_bounds"
                     emit(rec)
                     continue
