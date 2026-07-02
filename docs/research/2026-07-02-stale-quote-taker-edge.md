@@ -1,0 +1,74 @@
+# Stale-quote taker edge on 15m crypto (2026-07-02)
+
+**Status:** OOS-validated in backtest on 3 independent checks. **Live fill reality UNPROVEN** — the
+one remaining link before any live deployment. No orders placed; research only.
+**Scripts:** `scripts/diag_stale_quote_edge.py` (materialized-row window), `scripts/diag_stale_quote_oos.py`
+(fresh-tick recompute for pre-v15 windows).
+
+## Hypothesis (from the settlement-basis study's residual)
+
+Residual 15m edge is "stale-quote-on-alts": when spot moves sharply but a thin Kalshi quote hasn't
+updated, crossing the quote in the spot's direction is positive-EV without out-forecasting anyone —
+it's reaction speed vs a slow MM, not prediction.
+
+## Rule (all information point-in-time; no lookahead)
+
+For consecutive same-market feature-row snapshots (~18s cadence, gap ≤ 150s, 90s ≤ ttc ≤ 870s,
+spread ≤ 20¢): compute `dfair` = change in analytic vol fair value `Φ(ln(S/K)/(σ√τ))` from the spot
+move alone (fresh tick spot; σ, τ held at current values). Signal when `|dfair| ≥ 0.10` **and** the
+quote mid moved ≤ 1¢ over the same interval ("stale"). Trade: cross the current top-of-book (buy YES
+at ask if dfair>0, else buy NO at 1−bid), hold to settlement. Fee = `0.07·p·(1−p)`.
+
+## Evidence (three independent checks, all net of fees)
+
+1. **Recent week (6/25–7/2), v15 materialized rows, threshold selected here** (in-sample for the
+   threshold): stale-conditioned +1.8¢/ct @ ≥0.10 (n=1782), +3.4¢ @ ≥0.15 (n=1103); baseline
+   (same signal, quote moved) −0.6¢/+0.2¢. Conditioning on quote-lag is what pays.
+2. **Cross-sectional holdout, same week, assets not used to pick the threshold** (SOL/BNB/ETH/BTC):
+   stale +1.1¢ @ ≥0.10 (n=3232), +2.3¢ @ ≥0.15 (n=1800); baseline ≈ 0. Confirms across assets
+   (SOL ≈ flat; DOGE weakest).
+3. **True time-OOS, prior disjoint week (6/18–6/25), fresh-tick recompute** (pre-v15 rows have frozen
+   candle spot, so spot context was recomputed from raw `crypto_spot_ohlc` ticks exactly as the
+   freshfix diagnostic): per-contract at ≥0.10 — BTC +6.7¢ (n=2600), BNB +5.5¢ (n=2133), HYPE +3.8¢
+   (n=1933), DOGE +2.9¢ (n=2425). Positive on all 4 assets, monotone in threshold, stale ≥ base.
+
+**Dedup realism (one trade per market — clustering removed), OOS week, ≥0.10:**
+
+| asset | trades | net $/wk (1 ct) | avg/ct | win% |
+|-------|--------|-----------------|--------|------|
+| BTC   | 602    | +33.16          | +5.5¢  | 59%  |
+| BNB   | 550    | +19.86          | +3.6¢  | 59%  |
+| HYPE  | 520    | +18.19          | +3.5¢  | 58%  |
+| DOGE  | 533    | +5.71           | +1.1¢  | 57%  |
+| **total** | **2205** | **+76.92** | **+3.5¢** | **58%** |
+
+## Why this can coexist with "mids are efficient"
+
+The mid is efficient *conditional on being fresh*. This rule only fires in the ~40% of moments when
+the quote failed to react to a spot move within ~18s — exactly the moments excluded from the
+model-vs-mid comparisons (which score against the *current* quote whatever its age). It is a taker
+latency/reaction edge, not a forecasting edge, so it does not contradict the v15 champion result.
+
+## Honest caveats (in order of severity)
+
+1. **Fill reality is unproven and is the classic latency-arb backtest trap.** The backtest crosses
+   the snapshot's top-of-book at the snapshot timestamp. Live: the quote may be pulled before our
+   order lands, top size may be < wanted size, and we race other takers. The stale premise (MM slow
+   for ≥18s) argues fills exist, but only a live test settles it. **Expect live capture to be a
+   fraction of backtest capture.**
+2. Two weeks, one vol regime (June/July 2026). Decay risk: as Kalshi MMs speed up, this shrinks.
+3. Snapshot cadence ~18s is our *detection* latency in backtest; the live loop must react at least
+   this fast at signal time (it already runs continuously on the active color).
+4. DOGE persistently weakest (thicker/faster MM?) — per-asset gating needed.
+5. σ comes from the same feature pipeline; miscalibrated σ shifts the threshold meaning per asset.
+
+## Proposed path (operator decision required)
+
+1. **Shadow first** (no orders): log live would-trade signals with the quote captured at decision
+   time; settle against outcomes. Proves signal timing/frequency live; still can't prove fills.
+2. **Micro-capped live pilot** (operator authorization, like the 2026-06-29 $10 SOL experiment):
+   1-contract taker IOC orders, strict daily cap, BTC+BNB only. Directly measures fill rate + realized
+   capture vs backtest. This is the only way to close the fill question.
+3. If live capture ≥ ~half of backtest: productionize as a new event-triggered strategy in the
+   autonomy loop (NOT the champion-model path), with per-asset enable, replay-gate-style shadow
+   accounting, and the existing kill-switch/risk rails.
