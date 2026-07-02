@@ -141,7 +141,7 @@ Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In test
 `PlatformRepository` (in `db/repositories.py`) is the single repository surface passed to services. It is assembled from four mixin classes — `DeploymentControlRepositoryMixin`, `LearningRepositoryMixin`, `StrategyRepositoryMixin`, `WebAuthRepositoryMixin` — each in their own file under `db/`. Add new query methods to the appropriate mixin, not directly to `PlatformRepository`. The mixin chain order in `repositories.py` matters for MRO when mixins define overlapping helpers — keep the existing order unless you have a specific reason to change it, and add a test that exercises both methods if you do.
 
 ### Integrations (`integrations/`)
-- `kalshi.py` — REST (RSA-signed) + WebSocket client
+- `kalshi.py` — REST (RSA-signed) + WebSocket client. **Order create/cancel use the V2 endpoints** (`POST`/`DELETE /portfolio/events/orders…`) as of 2026-07-02 — Kalshi 410s the v1 `POST /portfolio/orders` (`deprecated_v1_order_endpoint`; this silently broke ALL production orders while the bot was dormant, caught by the stale-quote pilot's first live order). Services still build v1-shaped payloads; `order_payload_v2()` translates at this single choke point ((buy,yes)→bid, (buy,no)→ask, (sell,yes)→ask, (sell,no)→bid; `count_fp`→`count`, `yes_price_dollars`→`price`, `subaccount`→int).
 - `weather.py` — NWS/NOAA ingestion
 - `forecast_archive.py` — Open-Meteo historical weather recovery
 - `crypto_spot.py` — Coinbase OHLC/current spot feeds; proxy fallback is opt-in only
