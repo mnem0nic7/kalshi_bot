@@ -272,17 +272,12 @@ async def main() -> None:
                     rec["guard"] = "live_entry_out_of_bounds"
                     emit(rec)
                     continue
-                # Cross 1 tick THROUGH the live touch: 0/7 touch-priced IOCs
-                # filled (book outruns our exec path), so pay 1c for execution
-                # certainty when any quote within 1c persists. Costs 1c of the
-                # backtest capture; if even this never fills, the edge is
-                # definitively unreachable at our latency class.
-                cross = 0.01
-                x_ask = min(live_ask + cross, 0.99)   # yes-buy limit
-                x_bid = max(live_bid - cross, 0.01)   # no-buy (yes-ask) limit
-                rec["cross_ticks"] = 1
+                # Price AT the live touch: the exchange audit showed 3/7 touch
+                # IOCs actually filled (43%) with one price-improved — no need
+                # to pay through. (The earlier "0/7 at touch" was a fill-check
+                # bug, not reality.)
                 ticket = build_pilot_ticket(market_ticker=tk, side=side,
-                                            yes_bid=_decimal(f"{x_bid:.4f}"), yes_ask=_decimal(f"{x_ask:.4f}"))
+                                            yes_bid=_decimal(f"{live_bid:.4f}"), yes_ask=_decimal(f"{live_ask:.4f}"))
                 coid = make_client_order_id("stale-quote-pilot", tk, ticket.nonce)
                 receipt = await execution.execute(
                     room=_RoomShim(shadow_mode=not cfg.enabled),
@@ -296,19 +291,22 @@ async def main() -> None:
                                           "inactive_color_skipped", "write_credentials_missing") \
                         and not receipt.status.startswith("rejected"):
                     state.trades_today += 1  # every submitted order consumes the daily budget
-                    # IOC can cancel with 0 fills (the latency race) — only a real
-                    # fill is an open position; a phantom would block MAX_OPEN and
-                    # poison settle P&L (first live order: submitted -> canceled, 0 fills).
+                    # IOC can cancel with 0 fills — only a real fill is an open
+                    # position. Look the order up BY client_order_id via
+                    # get_orders(ticker=...): receipt.external_order_id proved
+                    # unreliable (3 real fills were logged filled=0.0 and went
+                    # untracked until the exchange audit caught them).
                     filled = 0.0
                     fill_price = None
-                    oid = receipt.external_order_id
                     await asyncio.sleep(2.0)
                     try:
-                        if oid:
-                            o = (await client.get_order(oid)).get("order") or {}
-                            filled = f(o.get("fill_count_fp")) or 0.0
-                            fill_price = f(o.get("yes_price_dollars"))
-                            rec["final_order_status"] = o.get("status")
+                        oresp = await client.get_orders(ticker=tk, limit=20)
+                        for o in (oresp.get("orders") or []):
+                            if o.get("client_order_id") == coid:
+                                filled = f(o.get("fill_count_fp")) or 0.0
+                                fill_price = f(o.get("yes_price_dollars"))
+                                rec["final_order_status"] = o.get("status")
+                                break
                     except Exception as e:
                         rec["fill_check_error"] = str(e)[:120]
                     rec["filled"] = filled
