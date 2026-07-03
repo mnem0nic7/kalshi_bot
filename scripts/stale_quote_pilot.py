@@ -279,6 +279,14 @@ async def main() -> None:
                     rec["guard"] = "live_edge_too_small"
                     emit(rec)
                     continue
+                # Credible-edge ceiling (same principle as RISK_MAX_CREDIBLE_EDGE_BPS):
+                # live day-1 results — claimed edge >=15c went 0W/3L (fair estimate
+                # breaks in violent moves: whipsaw vs the 18s spot ref / sigma blowup),
+                # while 9-11c went 2W/0L. Beyond the ceiling, "edge" is model error.
+                if edge_live > 0.15:
+                    rec["guard"] = "live_edge_not_credible"
+                    emit(rec)
+                    continue
                 # re-check price guards at the live price
                 if not (0.03 <= live_entry <= 0.97) or live_entry > cfg.max_entry_dollars:
                     rec["guard"] = "live_entry_out_of_bounds"
