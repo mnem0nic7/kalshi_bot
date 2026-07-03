@@ -75,6 +75,32 @@ when the postgres container is recreated** (`docker compose --env-file .env
 2026-07-02 daemon loop fix makes the fleet tolerate it). Until then the
 production DB remains exposed to a recurrence under memory pressure.
 
-Residual disease: the crypto_1h daemon leak (still open, see CLAUDE.md
-2026-06-30 note) is what created the pressure storm; its 8g cap contains the
-blast radius but it still degrades the host every cycle.
+## crypto_1h daemon "leak" diagnosed (2026-07-03)
+
+Live observation of a fresh container (memory sampled every 30s alongside
+logs): RSS ramps only on the ACTIVE color, in ~130MB/cycle ratchets whenever
+an hourly strike ladder sits inside the 1h close-time discovery window, and
+partially releases when the ladder exits the window. It is not a classic
+unbounded leak — it is working-set churn + glibc arena fragmentation:
+
+- The 1h universe legitimately includes the wide hourly ladder markets
+  (~50 strikes/asset; the "hourly event listing" duration rule in
+  `db/repositories.py` exists precisely to include them). During ladder
+  hours the loops churn hundreds of MB of market/orderbook/snapshot
+  payloads per cycle (measured: 130MB of snapshot payloads written per 30
+  min, ~2,500 distinct markets touched).
+- The autonomy loop ran every 5s (`crypto_autonomy_idle_interval_seconds`
+  default, sized for the 15m live path) with `persist=True` discovery —
+  re-persisting the entire ladder as "live" snapshots ≈1.1M rows/day of
+  write amplification into the ~71GB `crypto_market_snapshots` table.
+- glibc malloc arenas never return the churn to the OS → RSS ratchets to
+  the 8g cap → cgroup OOM restart (236 restarts 06-30→07-02, always on the
+  active color).
+
+Containment shipped on both crypto_1h services (shadow-only, no live
+impact): `MALLOC_ARENA_MAX=2` (kills the fragmentation ratchet) and
+`CRYPTO_AUTONOMY_IDLE_INTERVAL_SECONDS=60` (12x less ladder churn), plus
+`oom_score_adj: 500` so a recurrence is the kernel's first pick instead of
+last. Backlog (only if the ramp persists): drop `persist=True` from the 1h
+autonomy discovery, and replace `collect_open`'s per-cycle
+`list_crypto_market_snapshots(limit=5000)` summary read with a COUNT.

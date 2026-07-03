@@ -702,12 +702,26 @@ services:
     # swap-exhaustion creep that still threatens a host OOM.
     mem_limit: 8g
     memswap_limit: 8g
+    # Override the inherited -900 oom-protect: an expendable SHADOW daemon with
+    # a known leak (236 OOM restarts 06-30→07-02) must be the kernel's FIRST
+    # choice under host memory pressure, not its last (2026-07-02 pg incident).
+    oom_score_adj: 500
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
       KALSHI_ENV: production
       APP_COLOR: blue
       DAEMON_HEARTBEAT_ROLE: crypto_1h
+      # 2026-07-03 leak diagnosis: the 1h universe legitimately includes the
+      # wide hourly strike ladders (~50 strikes/asset, "hourly event listing"
+      # rule), so each active-color cycle churns 100s of MB of market/orderbook
+      # /snapshot payloads; glibc arena fragmentation ratchets RSS to the 8g
+      # cap (~236 OOM restarts 06-30→07-02). MALLOC_ARENA_MAX=2 caps the arena
+      # fragmentation; a 60s autonomy cadence (vs 5s default, sized for the
+      # 15m live path) cuts the ladder discovery+persist churn 12x on this
+      # SHADOW loop (1h live trading stays disabled).
+      MALLOC_ARENA_MAX: "2"
+      CRYPTO_AUTONOMY_IDLE_INTERVAL_SECONDS: "60"
       CRYPTO_AUTO_FREQUENCIES: "1h"
       CRYPTO_1H_ENABLED: ${CRYPTO_1H_ENABLED:-true}
       CRYPTO_HISTORY_AUTO_LOOKBACK_DAYS: ${CRYPTO_1H_HISTORY_DAYS:-7}
@@ -732,9 +746,12 @@ services:
     # cleanly at 8g instead of creeping into host swap — see crypto_1h_blue.
     mem_limit: 8g
     memswap_limit: 8g
+    oom_score_adj: 500  # expendable leaker: kernel's first pick, not last — see crypto_1h_blue
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
+      MALLOC_ARENA_MAX: "2"  # fragmentation ratchet fix — see crypto_1h_blue comment
+      CRYPTO_AUTONOMY_IDLE_INTERVAL_SECONDS: "60"
       KALSHI_ENV: production
       APP_COLOR: green
       DAEMON_HEARTBEAT_ROLE: crypto_1h
