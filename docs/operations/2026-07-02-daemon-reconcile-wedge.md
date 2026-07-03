@@ -116,9 +116,12 @@ ACTIVE COLOR, not role — the crypto-only 1h daemon shares APP_COLOR with
 the main daemon, so this "lean collector" ran the ENTIRE heavy follow-up
 suite (historical intelligence, decision-corpus promotion, gate tuning,
 strategy regression/codex/promotion jobs, shadow campaigns, canary sweeps)
-every heartbeat from a second container — and the trainer node from a
-third. Besides the memory bursts, that was duplicate concurrent execution
-of stateful jobs.
+every heartbeat from a second container. (The trainer sets
+`APP_COLOR: trainer`, so it never matched the active color and only ran the
+ungated rollout-monitor tail — the duplication was specifically the
+crypto_1h daemon whose compose env shares the real blue/green colors.)
+Besides the memory bursts, that was duplicate concurrent execution of
+stateful jobs.
 
 Fix: `_run_heartbeat_follow_up` now returns immediately unless
 `_heartbeat_role == "daemon"` (the main daemon). Crypto-only and trainer
