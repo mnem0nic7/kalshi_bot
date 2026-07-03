@@ -101,6 +101,29 @@ Containment shipped on both crypto_1h services (shadow-only, no live
 impact): `MALLOC_ARENA_MAX=2` (kills the fragmentation ratchet) and
 `CRYPTO_AUTONOMY_IDLE_INTERVAL_SECONDS=60` (12x less ladder churn), plus
 `oom_score_adj: 500` so a recurrence is the kernel's first pick instead of
-last. Backlog (only if the ramp persists): drop `persist=True` from the 1h
-autonomy discovery, and replace `collect_open`'s per-cycle
-`list_crypto_market_snapshots(limit=5000)` summary read with a COUNT.
+last.
+
+### The real burst source (found 2026-07-03 via py-spy, fixed in code)
+
+The containment above was NOT sufficient — the daemon still OOM'd at 8g on
+a multi-GB single-burst allocation. A py-spy trap (temporary SYS_PTRACE on
+the shadow container, dumps auto-captured above a 2.5G threshold) caught
+the main thread inside `json.loads` decoding JSONB from asyncpg, with
+concurrent reads of `raw_exchange_events` (5.7GB), room `signals`, room
+`artifacts`, and `historical_replay_runs` — i.e. **training-corpus room-
+bundle assembly**. Root cause: `_run_heartbeat_follow_up` gated only on
+ACTIVE COLOR, not role — the crypto-only 1h daemon shares APP_COLOR with
+the main daemon, so this "lean collector" ran the ENTIRE heavy follow-up
+suite (historical intelligence, decision-corpus promotion, gate tuning,
+strategy regression/codex/promotion jobs, shadow campaigns, canary sweeps)
+every heartbeat from a second container — and the trainer node from a
+third. Besides the memory bursts, that was duplicate concurrent execution
+of stateful jobs.
+
+Fix: `_run_heartbeat_follow_up` now returns immediately unless
+`_heartbeat_role == "daemon"` (the main daemon). Crypto-only and trainer
+nodes keep their liveness heartbeats; only the main active-color daemon
+runs the follow-up suite (`tests/unit/test_daemon_follow_up_role_gate.py`).
+Backlog items kept for reference (likely unnecessary now): drop
+`persist=True` from 1h autonomy discovery; `collect_open`'s 5000-row
+summary read → COUNT.

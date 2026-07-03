@@ -1277,6 +1277,14 @@ class DaemonService:
                     consecutive_failures = 0
 
     async def _run_heartbeat_follow_up(self, payload: dict[str, Any]) -> None:
+        # Main-daemon role only. The color check below is not sufficient on its
+        # own: crypto-only and trainer nodes share the active APP_COLOR, and
+        # before 2026-07-03 each of them ran this entire suite every heartbeat —
+        # duplicate stateful jobs (gate tuning, promotions, canary sweeps) from
+        # multiple containers, and the room-bundle assembly's multi-GB JSON
+        # decode was the crypto_1h daemon's 8g OOM-cycle burst.
+        if self._heartbeat_role != "daemon":
+            return
         if (
             self.shadow_campaign_service is not None
             and self.settings.training_campaign_enabled
