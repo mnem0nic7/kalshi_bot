@@ -747,6 +747,7 @@ services:
     mem_limit: 8g
     memswap_limit: 8g
     oom_score_adj: 500  # expendable leaker: kernel's first pick, not last — see crypto_1h_blue
+    cap_add: [SYS_PTRACE]  # temporary 2026-07-03: py-spy access to catch the multi-GB allocation burst in the act
     command: ["python", "-m", "kalshi_bot.cli", "daemon", "--crypto-only", "--heartbeat-role", "crypto_1h"]
     environment:
       <<: *production-env
