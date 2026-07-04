@@ -536,6 +536,16 @@ class Settings(BaseSettings):
     crypto_take_profit_threshold_pct_by_frequency: dict[str, float] = Field(default_factory=dict)
     crypto_take_profit_check_interval_seconds: int = 30
     crypto_take_profit_stale_snapshot_seconds: int = 120
+    # Prediction-scaled take-profit threshold (2026-07-04 spec:
+    # docs/superpowers/specs/2026-07-04-prediction-scaled-take-profit-design.md).
+    # Effective threshold = base * lerp(min_mult, max_mult, shrunk_edge/edge_ref);
+    # falls back to the static base wherever no fresh trained-model view exists.
+    crypto_take_profit_prediction_scaling_enabled: bool = True
+    crypto_take_profit_edge_ref_cents: float = 5.0
+    crypto_take_profit_min_multiplier: float = 0.5
+    crypto_take_profit_max_multiplier: float = 2.0
+    crypto_take_profit_prediction_refresh_seconds: float = 30.0
+    crypto_take_profit_prediction_max_age_seconds: float = 120.0
     crypto_book_noise_gate_enabled: bool = False
     crypto_book_noise_yes_range_threshold: float = 0.10
     crypto_book_noise_lookback_seconds: int = 90

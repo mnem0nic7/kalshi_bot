@@ -389,7 +389,12 @@ class AppContainer:
             kalshi,
         )
         stop_loss_service = StopLossService(settings, session_factory, execution_service)
-        crypto_take_profit_service = CryptoTakeProfitService(settings, session_factory, execution_service)
+        crypto_take_profit_service = CryptoTakeProfitService(
+            settings,
+            session_factory,
+            execution_service,
+            forecast_service=crypto_forecast_service,
+        )
         strategy_eval_service = StrategyEvaluationService(settings, session_factory, agent_pack_service)
         strategy_regression_service = StrategyRegressionService(
             settings,

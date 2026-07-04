@@ -83,6 +83,26 @@ def _resolve_take_profit_threshold(
     return global_threshold
 
 
+def _prediction_scaled_threshold(
+    base: float,
+    *,
+    edge_remaining_dollars: float,
+    edge_ref_dollars: float,
+    min_multiplier: float,
+    max_multiplier: float,
+) -> float:
+    """Scale the take-profit threshold by the model's shrunk remaining edge.
+
+    No remaining edge -> min_multiplier * base (take profits sooner: the model
+    says the move is done). Edge at/above the reference -> max_multiplier *
+    base (let it ride). Linear in between.
+    """
+    if edge_ref_dollars <= 0:
+        return base
+    frac = min(1.0, max(0.0, edge_remaining_dollars / edge_ref_dollars))
+    return base * (min_multiplier + (max_multiplier - min_multiplier) * frac)
+
+
 def _crypto_mid(snapshot: CryptoMarketSnapshotRecord, side: str) -> Decimal | None:
     yes_bid = snapshot.yes_bid_dollars
     yes_ask = snapshot.yes_ask_dollars
@@ -145,13 +165,90 @@ class CryptoTakeProfitService:
         settings: Settings,
         session_factory: async_sessionmaker,
         execution_service: ExecutionService,
+        forecast_service: Any | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.execution_service = execution_service
+        # Optional CryptoForecastService for prediction-scaled thresholds;
+        # None -> static thresholds only.
+        self.forecast_service = forecast_service
+        # ticker -> (fetched_at_utc, StrategySignal | None). Throttles inline
+        # forecasts: the exit loop can run sub-second while a position is open
+        # and forecast() loads model artifacts.
+        self._prediction_cache: dict[str, tuple[datetime, Any | None]] = {}
         # Open-position count from the last check; the daemon loop runs hot
         # (sub-interval) while this is non-zero.
         self.last_position_count: int = 0
+
+    @staticmethod
+    def _market_for_snapshot(snapshot: CryptoMarketSnapshotRecord) -> Any:
+        from kalshi_bot.crypto.services import _market_from_snapshot
+
+        return _market_from_snapshot(snapshot)
+
+    async def _prediction_threshold(
+        self,
+        position: PositionRecord,
+        snapshot: CryptoMarketSnapshotRecord,
+        base_threshold: float,
+        now: datetime,
+    ) -> tuple[float, dict[str, Any]]:
+        """Resolve the effective take-profit threshold for a position.
+
+        Returns (threshold, meta). Any missing/unusable model view falls back
+        to the static base threshold (meta["threshold_mode"] == "static").
+        """
+        static = (base_threshold, {"threshold_mode": "static"})
+        if (
+            self.forecast_service is None
+            or not self.settings.crypto_take_profit_prediction_scaling_enabled
+        ):
+            return static
+
+        ticker = position.market_ticker
+        cached = self._prediction_cache.get(ticker)
+        refresh = timedelta(seconds=float(self.settings.crypto_take_profit_prediction_refresh_seconds))
+        max_age = timedelta(seconds=float(self.settings.crypto_take_profit_prediction_max_age_seconds))
+        if cached is None or (now - cached[0]) >= refresh:
+            try:
+                market = self._market_for_snapshot(snapshot)
+                signal = await self.forecast_service.forecast(market)
+            except Exception:
+                logger.warning("crypto_take_profit forecast failed for %s", ticker, exc_info=True)
+                signal = None
+            cached = (now, signal)
+            self._prediction_cache[ticker] = cached
+        fetched_at, signal = cached
+        if signal is None or (now - fetched_at) > max_age:
+            return static
+
+        trace = getattr(signal, "candidate_trace", None) or {}
+        model_type = (trace.get("prediction_model") or {}).get("model_type")
+        fair_yes = getattr(signal, "fair_yes_dollars", None)
+        if fair_yes is None or model_type in (None, "market_mid_baseline"):
+            return static
+
+        mid = _crypto_mid(snapshot, position.side)
+        if mid is None:
+            return static
+        fair_side = _side_value_from_yes_price(Decimal(fair_yes), position.side)
+        beta = float(self.settings.crypto_edge_shrinkage_beta_floor)
+        edge_remaining = beta * float(fair_side - mid)
+        threshold = _prediction_scaled_threshold(
+            base_threshold,
+            edge_remaining_dollars=edge_remaining,
+            edge_ref_dollars=float(self.settings.crypto_take_profit_edge_ref_cents) / 100.0,
+            min_multiplier=float(self.settings.crypto_take_profit_min_multiplier),
+            max_multiplier=float(self.settings.crypto_take_profit_max_multiplier),
+        )
+        return threshold, {
+            "threshold_mode": "scaled",
+            "model_type": model_type,
+            "edge_remaining_dollars": round(edge_remaining, 4),
+            "base_threshold": base_threshold,
+            "effective_threshold": round(threshold, 4),
+        }
 
     async def check_once(self) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
@@ -267,7 +364,13 @@ class CryptoTakeProfitService:
             sell_yes_price=sell_px,
             fee_rate=Decimal(str(self.settings.kalshi_taker_fee_rate)),
         )
-        if profit is None or profit < threshold:
+        if profit is None:
+            return None
+
+        effective_threshold, threshold_meta = await self._prediction_threshold(
+            position, snapshot, threshold, now
+        )
+        if profit < effective_threshold:
             return None
 
         return await self._submit(
@@ -278,6 +381,7 @@ class CryptoTakeProfitService:
             now=now,
             kill_switch_enabled=kill_switch_enabled,
             active_color=active_color,
+            threshold_meta=threshold_meta,
         )
 
     async def _submit(
@@ -290,6 +394,7 @@ class CryptoTakeProfitService:
         now: datetime,
         kill_switch_enabled: bool,
         active_color: str,
+        threshold_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         market_ticker = position.market_ticker
         client_order_id = str(uuid4())
@@ -359,6 +464,8 @@ class CryptoTakeProfitService:
             "exec_status": receipt_status,
             "strategy_code": strategy_code,
         }
+        if threshold_meta:
+            event_payload["take_profit_threshold"] = threshold_meta
 
         submit_payload: dict[str, Any] = {
             "submitted_at": now.isoformat(),
