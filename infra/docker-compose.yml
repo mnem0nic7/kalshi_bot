@@ -581,7 +581,7 @@ services:
       # trains fine. Run 15m-only to keep the live-relevant champions re-selecting
       # while the 1h-fit memory blowup is fixed separately (smaller 1h sample cap
       # / fewer folds / chunked fit). Restore "15m,1h" after that fix.
-      CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m"
+      CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m,1h"
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
       CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
       CRYPTO_TRAINING_PREFLIGHT_SETTLED_DAYS: "10"
