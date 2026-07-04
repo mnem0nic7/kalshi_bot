@@ -62,12 +62,16 @@ the real API, both minimal and confined to the script:
 | 14 | KXNATGASW | Natural Gas Weekly | weekly | 40 | 200 | 06-05..07-02 | 51.9 | 0.02 | 4,039 | 3,938 |
 | 18 | KXWTIW | WTI oil weekly range | weekly | 15 | 135 | 05-01..06-26 | 16.9 | 0.01 | 5,878 | 3,602 |
 | 22 | KXBRENTMON | Brent Monthly | monthly | 20 | 60 | 04-30..06-30 | 6.9 | 0.01 | 7,404 | 3,687 |
-| — | KXCOPPERMON | Copper Monthly | monthly | 40 | 120 | 04-30..06-30 | 6.9 | 0.35 | 86 | 86 |
+| — | KXCOPPERMON | Copper Monthly | monthly | 40 | 120 | 04-30..06-30 | 13.8 | 0.35 | 86 | 86 |
 
 GPU-pricing series (H100/H200/B200/RTX/A100/GPT — priced under Kalshi's "Commodities" category
 filter alongside oil/metals/ags) are out of scope for this spike (operator's ask was Brent, copper,
 natgas, gas prices, ags) and are left in the table only to show they don't distort the ranking; not
 otherwise assessed.
+
+Gold Daily and Silver Daily are similarly excluded from the top-5 deep-dive — the operator's ask was
+oil/gas (and ags/industrial metals); precious metals are a separate vertical and would need their own
+scoping pass before any verdict.
 
 **Note on `KXNGASW` vs `KXNATGASD`/`KXNATGASW`:** the brief's a-priori guess `KXNGASW` ("Natural gas
 price max and min weekly") is a *dead* legacy series — 0 open markets, 0 settled markets ever
