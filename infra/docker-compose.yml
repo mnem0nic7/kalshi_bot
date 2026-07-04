@@ -574,13 +574,14 @@ services:
       # rather than loading raw snapshots + cross-asset spot into memory.
       CRYPTO_MODEL_NIGHTLY_AUTO_ENABLED: "false"
       CRYPTO_CONTINUOUS_TRAIN_ENABLED: "true"
-      # 2026-06-19: 1h TEMPORARILY DISABLED. With materialize unblocked (warmup
-      # cut + chunking), the loop reached the 1h candidate report, which fits all
-      # models x4 walk-forward folds on the large 1h sample set and OOMs the 32g
-      # cgroup (hung at 99.5%, unhealthy, wedging the whole loop at BTC 1h). 15m
-      # trains fine. Run 15m-only to keep the live-relevant champions re-selecting
-      # while the 1h-fit memory blowup is fixed separately (smaller 1h sample cap
-      # / fewer folds / chunked fit). Restore "15m,1h" after that fix.
+      # 2026-06-19: 1h was TEMPORARILY DISABLED because fitting all models x4
+      # walk-forward folds on the full 1h sample set OOMed the 32g cgroup (hung
+      # at 99.5%, unhealthy, wedging the whole loop at BTC 1h). RE-ENABLED
+      # 2026-07-04 with a 150k-row 1h fit cap (CRYPTO_TRAIN_MAX_FIT_ROWS_1H,
+      # config.py default) to keep the fit inside the cgroup. If the 1h fit
+      # still approaches 32g, the emergency knobs are lowering that env var
+      # and/or CRYPTO_MODEL_CANDIDATE_REPORT_MAX_WALK_FORWARD_FOLDS (global
+      # fold override, set below) — no code change needed.
       CRYPTO_CONTINUOUS_TRAIN_FREQUENCIES: "15m,1h"
       CRYPTO_TRAINING_PREFLIGHT_ENABLED: "true"
       CRYPTO_TRAINING_FEATURE_STORE_ENABLED: "true"
