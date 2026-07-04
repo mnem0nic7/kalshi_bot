@@ -33,8 +33,9 @@ Alignment points resolved from real data/code (Step 1, do not re-guess these):
      official high is STRICTLY > floor_strike (a boundary tie settles NO); the
      06-22 spec doc documents this was found the hard way (2 boundary
      false-locks before the strict-inequality fix). 'less' is the mirror:
-     YES iff high STRICTLY <= cap, so LOCKED_NO fires once high STRICTLY > cap.
-     This eval uses strict '>' throughout, matching the validated harness.
+     high_so_far > cap breaks the lock; YES settles iff the daily high stayed
+     <= cap, so LOCKED_NO fires once high_so_far STRICTLY > cap. This eval
+     uses strict '>' throughout, matching the validated harness.
   4. Station map: reused verbatim from `scripts/weather_lockin_fetch_asos.py`,
      which matches the deployed `WEATHER_MARKET_MAP_PATH` YAML (default
      `docs/examples/weather_markets.example.yaml`, confirmed 20 series/stations
@@ -143,12 +144,24 @@ async def main() -> None:
     factory = create_session_factory(engine)
     async with factory() as session:
         rows = (await session.execute(text("""
-            SELECT market_ticker, series_ticker, station_id, local_market_day,
+            SELECT id, market_ticker, series_ticker, station_id, local_market_day,
                    asof_ts, yes_ask_dollars, no_ask_dollars, payload
             FROM historical_market_snapshots
             WHERE asof_ts >= :since AND series_ticker LIKE 'KXHIGH%'
-            ORDER BY market_ticker, asof_ts
+            ORDER BY market_ticker, asof_ts, id
         """), {"since": datetime.fromisoformat(SINCE).replace(tzinfo=UTC)})).mappings().all()
+
+    # Data-quality check: historical_market_snapshots has known duplicate
+    # (market_ticker, asof_ts) groups (opening-snapshot backfill artifacts, up
+    # to 530 rows sharing one timestamp) — the ORDER BY ... , id tiebreaker
+    # above makes row selection deterministic despite them. Count the
+    # duplicate groups here so the summary shows whether this window is
+    # affected, rather than asserting it silently.
+    _seen_keys: dict[tuple[str, object], int] = defaultdict(int)
+    for r in rows:
+        _seen_keys[(r["market_ticker"], r["asof_ts"])] += 1
+    duplicate_asof_groups = sum(1 for n in _seen_keys.values() if n > 1)
+    duplicate_asof_rows_extra = sum(n - 1 for n in _seen_keys.values() if n > 1)
 
     by_market: dict[str, list] = defaultdict(list)
     for r in rows:
@@ -213,6 +226,12 @@ async def main() -> None:
         await asos.aclose()
 
     trades, skipped = [], defaultdict(int)
+    # Instrumentation for the headline "$1.00 at fill" / "$1.00 is the floor
+    # across the whole post-lock tail" claims: captured for EVERY market that
+    # reaches a lock (including ones the fee/edge gate then skips), not just
+    # the (zero) markets that clear the gate as trades.
+    ask_at_fill_values: list[float] = []
+    post_lock_tail_min_values: list[float] = []
     for ticker, snaps in sorted(by_market.items()):
         spec = snaps[-1]  # latest snapshot carries the final payload (result set once settled)
         market = (spec["payload"] or {}).get("market", {})
@@ -278,6 +297,22 @@ async def main() -> None:
             skipped["no_ask_at_fill"] += 1
             continue
 
+        ask_at_fill_values.append(float(ask))
+
+        # Post-lock tail scan: the winning-side ask at EVERY snapshot after
+        # the lock (not just the fill snapshot), to back the "$1.00 is the
+        # floor across the whole tail" claim rather than just the one fill
+        # point.
+        tail_asks = [
+            float(a) for a in (
+                (s["yes_ask_dollars"] if side == "yes" else s["no_ask_dollars"])
+                for s in snaps[lock_i + 1:]
+            )
+            if a is not None
+        ]
+        if tail_asks:
+            post_lock_tail_min_values.append(min(tail_asks))
+
         gate = evaluate_lockin_fee_edge_gate(
             resolution_state=lock_state_val,
             yes_ask_dollars=Decimal(str(ask)) if side == "yes" else None,
@@ -314,7 +349,27 @@ async def main() -> None:
         "avg_net": round(sum(t["net"] for t in trades) / len(trades), 4) if trades else None,
         "avg_edge": round(sum(t["edge"] for t in trades) / len(trades), 4) if trades else None,
         "per_city": {k: v for k, v in sorted(per_city.items())},
-        "skipped": dict(skipped)}}))
+        "skipped": dict(skipped),
+        "locked_markets": len(ask_at_fill_values),
+        "ask_at_fill": {
+            "count": len(ask_at_fill_values),
+            "min": min(ask_at_fill_values) if ask_at_fill_values else None,
+            "max": max(ask_at_fill_values) if ask_at_fill_values else None,
+            "num_at_100": sum(1 for v in ask_at_fill_values if v >= 0.9999),
+        },
+        "post_lock_tail_min_ask": {
+            "count": len(post_lock_tail_min_values),
+            "min": min(post_lock_tail_min_values) if post_lock_tail_min_values else None,
+            "max": max(post_lock_tail_min_values) if post_lock_tail_min_values else None,
+            "num_at_100": sum(1 for v in post_lock_tail_min_values if v >= 0.9999),
+        },
+        "duplicate_asof_ts_check": {
+            "duplicate_groups": duplicate_asof_groups,
+            "extra_rows": duplicate_asof_rows_extra,
+            "note": "market_ticker+asof_ts groups with >1 row (backfill artifact); "
+                    "ORDER BY market_ticker, asof_ts, id makes row selection deterministic",
+        },
+    }}))
 
 
 if __name__ == "__main__":

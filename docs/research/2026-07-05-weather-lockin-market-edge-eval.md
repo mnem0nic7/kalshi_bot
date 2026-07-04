@@ -53,6 +53,24 @@ Alignment decisions (resolved from real rows/code, not the skeleton's guesses):
 4. Station map = the deployed `WEATHER_MARKET_MAP_PATH` YAML (`station_id`, e.g. KXHIGHNY→KNYC
    →IEM `NYC`), identical to `scripts/weather_lockin_fetch_asos.py`.
 
+The headline "$1.00 at fill" and "$1.00 is the floor across the whole post-lock tail" numbers are
+produced directly by the committed `scripts/weather_lockin_eval.py` (not a side script): for every
+market that reaches a lock, the summary JSON's `ask_at_fill` block records the winning-side ask at
+the fill snapshot for all 144 locks (gate-skipped or not), and `post_lock_tail_min_ask` records,
+per locked market, the minimum winning-side ask across every snapshot after the lock — both
+reported as count/min/max/num_at_100 in the emitted `summary`.
+
+**Data quality — duplicate `asof_ts` rows:** `historical_market_snapshots` has known duplicate
+`(market_ticker, asof_ts)` groups (opening-snapshot backfill artifacts, up to several hundred rows
+sharing one timestamp). The query now orders `market_ticker, asof_ts, id` so row selection is
+deterministic despite them, and the summary's `duplicate_asof_ts_check` reports the group/row
+counts for this run (572 duplicate groups, 87,496 extra rows in the 06-22→07-04 window). This was
+checked against the result: the 144-lock count and the $1.00 ask-at-fill / post-lock-tail-min
+figures reproduce byte-for-byte with the tiebreaker in place, so the duplicates do not affect the
+144 lock/fill events analyzed here. (They do occasionally change which duplicate row is picked as
+the "latest" metadata snapshot for markets that are still open/uncollected-to-settlement — a
+cosmetic shift in the `skipped` breakdown's still-open bucket, not in the settled/locked counts.)
+
 ## Results
 
 | metric | value |
@@ -78,7 +96,8 @@ is correct on this window).
 
 This replicates and strengthens the 2026-06-22 NO-GO (`2026-06-22-weather-lockin-mvp-spec.md`
 §VERDICT: 111/111 repriced to $1.00 on 06-14→06-20) on an independent, newer, larger window with
-a stricter honest-fill rule: **288/288 locked markets across both windows, zero fee-edge, ever.**
+a stricter honest-fill rule: **111 (06-14→06-20) + 144 (this window) = 255/255 locked markets
+across both windows, zero fee-edge, ever.**
 The snapshot cadence (~70s) upper-bounds how much staleness we could exploit at this collection
 rate — but the *minimum over every post-lock snapshot* being $1.00 means there was never a
 mispriced quote at any sampled moment, not merely a too-slow reaction. The KXHIGH order book is
@@ -97,7 +116,7 @@ otherwise keep collecting and revisit.
 pilot; `*_TRIGGER_ENABLE_AUTO_ROOMS` stays off for weather.
 
 **Revisit:** not calendar-bound — more of the same collection will not change this (two
-independent windows, 288/288 at $1.00). Re-run `scripts/weather_lockin_eval.py` only if the
+independent windows, 255/255 at $1.00). Re-run `scripts/weather_lockin_eval.py` only if the
 regime plausibly changed (e.g. Kalshi fee structure changes, market-maker withdrawal from KXHIGH,
 or a new city/series with thinner books), or if pursuing the maker-side variant with an
 adverse-selection model — that would be a new design, not this gate. Suggested earliest recheck:
