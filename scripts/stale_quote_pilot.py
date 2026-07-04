@@ -5,7 +5,7 @@ shadow_mode=True, so the FULL ExecutionService path runs (kill switch, color,
 creds) but returns shadow_skipped — a true dry-run. Enabling requires the
 operator to set, explicitly:
   STALE_PILOT_ENABLED=1
-  STALE_PILOT_ASSETS=BTC,BNB                (allowlist)
+  STALE_PILOT_ASSETS=BTC,BNB,HYPE,DOGE,ETH   (allowlist; SOL flat / XRP unvalidated in backtest)
   STALE_PILOT_MAX_TRADES_PER_DAY=10
   STALE_PILOT_MAX_OPEN=1                    (correlated-exposure cap)
   STALE_PILOT_DAILY_LOSS_STOP=3.0           (dollars)
