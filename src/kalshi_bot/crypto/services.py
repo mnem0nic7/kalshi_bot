@@ -4145,7 +4145,7 @@ class CryptoForecastService:
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbols=requested_assets or None,
                     since=since,
-                    limit=self.settings.crypto_train_max_snapshots,
+                    limit=_crypto_train_fit_row_limit(self.settings, freq),
                 )
             funding_rate_rows = await repo.list_crypto_funding_rates_bulk(
                 asset_symbols=requested_assets or None,
@@ -4171,14 +4171,14 @@ class CryptoForecastService:
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbols=requested_assets or None,
                     since=since,
-                    limit=self.settings.crypto_train_max_snapshots,
+                    limit=_crypto_train_fit_row_limit(self.settings, freq),
                 )
                 live_quote_rows = await repo.list_crypto_live_quote_snapshots(
                     frequency=freq,
                     kalshi_env=self.settings.kalshi_env,
                     asset_symbols=requested_assets or None,
                     since=since,
-                    limit=self.settings.crypto_train_max_snapshots,
+                    limit=_crypto_train_fit_row_limit(self.settings, freq),
                 )
                 if live_quote_rows:
                     rows = _dedupe_crypto_snapshot_rows([*rows, *live_quote_rows])
@@ -13702,6 +13702,14 @@ def _metrics_for_candidate(entries: list[dict[str, Any]], name: str) -> dict[str
         if entry.get("name") == name and isinstance(entry.get("metrics"), dict):
             return entry["metrics"]
     return None
+
+
+def _crypto_train_fit_row_limit(settings: Settings, frequency: str) -> int:
+    base = int(settings.crypto_train_max_snapshots)
+    cap = getattr(settings, "crypto_train_max_fit_rows_1h", None)
+    if frequency == "1h" and cap is not None:
+        return min(base, max(1, int(cap)))
+    return base
 
 
 def _crypto_model_candidate_report_max_folds(settings: Settings | None) -> int | None:

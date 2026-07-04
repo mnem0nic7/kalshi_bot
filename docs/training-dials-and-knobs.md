@@ -616,6 +616,7 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_HISTORICAL_PAGINATION_STOP_AT_CUTOFF` | `false` | Stops historical-market pagination once a whole page is older than the requested cutoff. Keep off for maximum conservatism; enable for bounded catch-ups after confirming Kalshi pages are newest-first. |
 | `CRYPTO_HISTORY_CANDLE_CONCURRENCY` | `1` | Max concurrent Kalshi candlestick fetches during crypto history backfills. |
 | `CRYPTO_MIN_TRAINING_SAMPLES` | `250` | Minimum rows for trained crypto model status. |
+| `CRYPTO_TRAIN_MAX_FIT_ROWS_1H` | `150000` | 1h-only fit-row cap applied inside `CryptoForecastService.train()` (newest rows win); bounds the 1h candidate fit's memory footprint independent of `CRYPTO_TRAIN_MAX_SNAPSHOTS`. `None` disables the cap (falls back to `CRYPTO_TRAIN_MAX_SNAPSHOTS`); 15m is never capped by this. |
 | `CRYPTO_REPLAY_MIN_RESOLVED_MARKETS` | `500` | Replay gate resolved-market support. |
 | `CRYPTO_REPLAY_MIN_TRADE_CANDIDATES` | `50` | Replay gate candidate support. |
 | `CRYPTO_REPLAY_MIN_NET_PL_DOLLARS` | `0.0` | Replay gate net P/L floor. |

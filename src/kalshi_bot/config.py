@@ -216,6 +216,10 @@ class Settings(BaseSettings):
     # bounds all three sources to a time window to keep memory predictable.
     crypto_train_lookback_days: int = 60
     crypto_train_max_snapshots: int = 500_000
+    # 1h candidate-fit memory bound: cap feature rows loaded for the 1h fit
+    # (newest rows win; the 1h sample OOM'd the 32g trainer cgroup 2026-06-19).
+    # None disables. 15m is never capped by this.
+    crypto_train_max_fit_rows_1h: int | None = 150_000
     crypto_train_max_candlesticks: int = 500_000
     crypto_train_max_spot_rows: int = 600_000
     crypto_train_incremental_materialize_enabled: bool = True
