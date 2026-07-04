@@ -89,6 +89,7 @@ async def main() -> None:
     client = KalshiClient(settings)
     hist: dict[str, list] = {}
     signaled: set[str] = set()
+    last_seen: dict[str, datetime] = {}
     open_signals: list[dict] = []   # {ticker, side, entry, settle_by}
     emit({"type": "start", "ts": datetime.now(UTC).isoformat(),
           "mode": "shadow_1h", "assets": sorted(SERIES_1H)})
@@ -115,6 +116,14 @@ async def main() -> None:
             emit({"type": "settle", "ts": nowt.isoformat(), "mode": "shadow_1h",
                   "ticker": tr["ticker"], "result": res, "net": round(net, 4)})
         open_signals[:] = still
+        # Eviction: hourly markets are long closed 2h after last activity —
+        # drop them so hist/signaled/last_seen don't grow unbounded over weeks.
+        cutoff = nowt - timedelta(hours=2)
+        stale_tickers = [tk for tk, ts in last_seen.items() if ts < cutoff]
+        for tk in stale_tickers:
+            hist.pop(tk, None)
+            signaled.discard(tk)
+            last_seen.pop(tk, None)
 
     last_reconcile = 0.0
     while True:
@@ -133,6 +142,9 @@ async def main() -> None:
                     )
                 rows = sorted(rows, key=lambda r: r.end_ts)
                 prep = _prepare_spot_context_series(rows)
+                spot_hint = None
+                if rows and rows[-1].close_dollars is not None:
+                    spot_hint = f(rows[-1].close_dollars)
                 resp = await client.list_markets(series_ticker=series, status="open", limit=200)
             except Exception as e:
                 emit({"type": "error", "ts": now.isoformat(), "asset": asset, "err": str(e)[:200]})
@@ -145,6 +157,11 @@ async def main() -> None:
                 ct = m.get("close_time")
                 if yb is None or ya is None or strike is None or not ct:
                     continue
+                # ladder-churn guard FIRST — ~50 strikes/hourly ladder, only the
+                # near-money ones are worth the per-market spot-context cost.
+                if spot_hint is None or not in_strike_band(spot_hint, strike):
+                    continue
+                last_seen[tk] = now
                 try:
                     cl = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
                 except ValueError:
@@ -161,8 +178,8 @@ async def main() -> None:
                     continue
                 spot_now = f(ctx.get("spot_close_dollars"))
                 mny = f(ctx.get("spot_moneyness_pct"))
-                if spot_now is None or not in_strike_band(spot_now, strike):
-                    continue          # ladder-churn guard: near-money strikes only
+                if spot_now is None:
+                    continue
                 row = {**ctx, "time_to_close_seconds": int(ttc)}
                 fair_now = fair_for_market(row, strike, cap)
                 mid_now = (yb + ya) / 2
