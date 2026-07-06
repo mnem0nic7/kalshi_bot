@@ -1,6 +1,6 @@
 # CPI Nowcast Gate-0 — Final Verdict: NO-GO
 
-**Status:** Gate-0 CLOSED. Decisive criterion (market edge) fails on 4/4 available events.
+**Status:** Gate-0 CLOSED. Decisive criterion (market edge) fails on 4/4 available events (~2 independent print months per series: April and May 2026).
 **Spec:** `docs/superpowers/specs/2026-07-01-cpi-nowcast-gate0-design.md`
 **Predecessor:** `docs/research/2026-07-01-cpi-nowcast-gate0-signal.md` (signal-only spike; criterion 2 left "open" — this doc closes it)
 **Code:** `src/kalshi_bot/macro/` (`nowcast_source.py`, `distribution.py`, `ladder.py`, `backtest.py`) + `scripts/cpi_gate0_backtest.py`. TDD'd: `tests/unit/test_macro_{nowcast_source,distribution,ladder,backtest}.py` (40 tests).
@@ -64,7 +64,11 @@ scored by Brier (nowcast-implied `P(actual > strike)` vs the Kalshi mid, vs the 
 outcome) and traded (buy YES at the ask if the nowcast disagrees upward, else buy NO at `1 - bid`;
 always acts on every disagreement, not a cherry-picked winning subset) net of the real
 `rate * p * (1-p)` taker fee (`kalshi_bot.services.fee_model.estimate_kalshi_taker_fee_dollars`, the
-same helper used everywhere else in this codebase — not a reimplementation):
+same helper used everywhere else in this codebase — not a reimplementation).
+
+Note: the 4 events comprise April and May per series (2 per series); MoM and YoY for the same month
+are not independent (both derived from the same underlying CPI print), so the effective independent
+sample is 2 print months, not 4. The direction is unanimous across both months and both series:
 
 | event | n obs | nowcast Brier | Kalshi mid Brier | mid wins? | net P&L | fees paid |
 |---|---|---|---|---|---|---|
@@ -111,12 +115,9 @@ wiring, or any order-placing code) is authorized on this signal.**
 
 ## Honest caveats / spec deviations forced by reality
 
-- **n is smaller than hoped.** The design doc anticipated "n(market events) TINY (~2-3 prints)";
-  reality is exactly 2 events per series (4 total), because the public API's price-history
-  retention window is ~2 months, not the "handful" implicitly hoped for. This is a real
-  small-sample result, not a large-n one — but the direction is unanimous (4/4), which is the most
-  a small sample can offer, and it agrees with the two independent prior diagnostic scripts on
-  `main` (`diag_cpi_edge_snapshot.py`, `diag_cpi_criterion2_backtest.py`).
+- **Error model narrowing:** The spec (`docs/superpowers/specs/2026-07-01-cpi-nowcast-gate0-design.md` §2.2) proposed three error models for the distribution — Gaussian, Student-t, and empirical. The implementation deployed only Gaussian (`distribution.py` hardcodes `dist_kind` in `NowcastDistribution.__init__`, mapping a `sigma(horizon)` curve fit from historical error quantiles to a normal CDF). An independent reviewer stress-tested that the σ values are sane (consistent with the spec's example range ~0.10-0.15pp) and that the failure direction (nowcast Brier worse than Kalshi mid on every single event) is robust to this narrowing — the delta between nowcast and mid is large enough (>0.04 Brier on 3/4 events) that swapping to Student-t or empirical would not close it. This is an unimplemented spec detail, not a silent divergence, and does not change the verdict.
+- **n is smaller and less independent than the label "4/4" suggests.** The design doc anticipated "n(market events) TINY (~2-3 prints)"; reality is exactly 2 events per series (4 total), because the public API's price-history retention window is ~2 months. The events are April 2026 and May 2026, with both MoM and YoY per month; since MoM and YoY for the same month are correlated (both derive from the same underlying CPI print), the effective independent sample is ~2 print months, not 4. This is a real small-sample result, not a large-n one — but the direction is unanimous (4/4 events, 2/2 calendar months), which is the most a small sample can offer, and it agrees with the two independent prior diagnostic scripts on `main` (`diag_cpi_edge_snapshot.py`, `diag_cpi_criterion2_backtest.py`).
+- **Brier deficit grows with disagreement magnitude.** An independent reviewer's disagreement-stratified re-check (conditioning on |nowcast − market mid| ≥ 0.20) found that the nowcast's Brier deficit versus Kalshi mid **grows with larger disagreement**, reaching −0.138 margin at high disagreement — a classic signature of the market already embedding more information than the nowcast. This strengthens the NO-GO beyond the raw event count: not only does the nowcast lose on Brier uniformly, but it loses *worse* exactly when it disagrees most with the market, suggesting the market already knows something the nowcast doesn't.
 - **CPI basis ambiguity, discovered during this work.** Cleveland Fed's own "Actual CPI Inflation"
   value for a target month does **not** always match the value implied by which Kalshi strike
   actually resolved yes/no. Example: April 2026 MoM — Cleveland Fed's actual = 0.640%, but Kalshi's
