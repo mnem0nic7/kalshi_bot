@@ -127,3 +127,37 @@ existing operator-authorized caps (unchanged: `STALE_PILOT_MAX_TRADES_PER_DAY=10
 `STALE_PILOT_CONTRACTS=2`). Same fill-reality caveat as every other pilot asset applies (honest
 capture is unproven until live fills accumulate); XRP inherits the shared per-asset kill-rule readout
 in `kalshi_bot.crypto.stale_pilot_readout`.
+
+## Edge decay watch (2026-07-06)
+
+While validating XRP (above), the same rebuilt fresh-tick backtest (`scripts/xrp_stale_backtest.py`)
+was re-run per asset across the two disjoint 2-week windows already in the XRP table, and the
+comparison surfaced **observed** decay, not just the theoretical risk flagged as caveat #2:
+
+| asset | prior window (06-08→06-22) avg/ct | newest window (06-22→07-06) avg/ct | direction |
+|-------|-----------------------------------|--------------------------------------|-----------|
+| DOGE  | +3.70¢                            | **−0.23¢**                           | flipped negative |
+| BTC   | (positive, see body above)        | **−0.30¢**                           | softened, flipped negative |
+| BNB   | —                                 | +5.02¢                               | still strong |
+| HYPE  | —                                 | +5.76¢                               | still strong |
+
+DOGE went from the third-strongest asset in the original checks to net-negative in the current
+window. BTC softened the same way in the current window and was **independently kill-ruled out of
+the live pilot the same day** (per-asset kill-rule readout in `kalshi_bot.crypto.stale_pilot_readout`)
+— two independent signals (backtest decay + live kill rule) agreeing on the same asset the same day.
+BNB and HYPE remain strong in the current window, so this is per-asset, not a blanket edge collapse.
+
+**Interpretation:** caveat #2 ("decay risk: as Kalshi MMs speed up, this shrinks") is now an observed
+fact for at least one asset (DOGE) per rebuilt window-over-window comparison, with BTC corroborating
+via the independent live kill rule. The edge is not static — it needs to be re-measured on a cadence,
+not assumed from the original three checks.
+
+**Mitigation — weekly cross-asset recheck.** `scripts/stale_edge_weekly_recheck.sh` reuses the
+active-color resolution block from `scripts/stale_quote_pilot_watchdog.sh` and runs
+`scripts/xrp_stale_backtest.py` (read-only, no orders — it only queries settled feature rows + spot
+ticks) inside the active app container for each of `BNB HYPE DOGE ETH XRP`, appending output to
+`/home/user1/kalshi_stale_pilot/edge_recheck/<date>.log`. Scheduled Monday 08:00 UTC (`crontab`:
+`0 8 * * 1 .../scripts/stale_edge_weekly_recheck.sh >> /tmp/stale_edge_recheck_cron.log 2>&1`) —
+deliberately after the Sunday 09:00 UTC VACUUM FULL window, not competing with it. This is a
+detection-only recheck (no automatic pilot asset removal); an operator reviews the log and drops any
+asset whose current-window avg/ct goes negative, same as the BTC kill-rule precedent above.

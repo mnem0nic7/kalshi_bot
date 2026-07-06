@@ -5,17 +5,18 @@ shadow_mode=True, so the FULL ExecutionService path runs (kill switch, color,
 creds) but returns shadow_skipped — a true dry-run. Enabling requires the
 operator to set, explicitly:
   STALE_PILOT_ENABLED=1
-  STALE_PILOT_ASSETS=BTC,BNB,HYPE,DOGE,ETH   (allowlist; SOL flat / XRP unvalidated in backtest)
+  STALE_PILOT_ASSETS=BNB,HYPE,DOGE,ETH,XRP  (allowlist; XRP validated 2026-07-06; BTC dropped by kill rule)
   STALE_PILOT_MAX_TRADES_PER_DAY=10
-  STALE_PILOT_MAX_OPEN=1                    (correlated-exposure cap)
-  STALE_PILOT_DAILY_LOSS_STOP=3.0           (dollars)
+  STALE_PILOT_MAX_OPEN=2                    (correlated-exposure cap)
+  STALE_PILOT_DAILY_LOSS_STOP=6.0           (dollars)
   STALE_PILOT_MAX_ENTRY=0.75                (dollars)
   STALE_PILOT_CONTRACTS=2                   (contracts per ticket)
   STALE_PILOT_MAX_TRADES_PER_WINDOW=5       (per 12h UTC window; belt is the daily cap)
 
 Detection is identical to scripts/stale_quote_shadow.py (imported); guards and
 ticket construction are the TDD'd kalshi_bot.crypto.stale_quote_pilot. Orders go
-ONLY through ExecutionService (architecture rule) as 1-contract IOC takers.
+ONLY through ExecutionService (architecture rule) as N-contract IOC takers
+(STALE_PILOT_CONTRACTS).
 Every action is logged as JSONL (stdout with STALE_PILOT_STDOUT=1, else
 $STALE_PILOT_OUT). Purpose: measure LIVE fill rate + realized capture vs the
 backtest (docs/research/2026-07-02-stale-quote-taker-edge.md) under strict caps.
@@ -178,13 +179,26 @@ async def main() -> None:
             if nowt < ms["settle_by"]:
                 still_ms.append(ms)
                 continue
+            # Max-age eviction: a shadow that never settles (ticker never
+            # resolves / repeatedly errors) would otherwise repoll forever.
+            # Give it 24h past settle_by (well past normal settlement lag)
+            # then drop it and log why, instead of silently growing the list.
+            expired = nowt > ms["settle_by"] + timedelta(hours=24)
             try:
                 m = (await client.get_market(ms["ticker"])).get("market") or {}
             except Exception:
+                if expired:
+                    emit({"type": "maker_expired", "ts": nowt.isoformat(), "reason": "get_market_error",
+                          **{k: ms[k] for k in ("ticker", "side", "yes_price", "fair", "signal_ts", "filled_proxy")}})
+                    continue
                 still_ms.append(ms)
                 continue
             res = m.get("result")
             if res not in ("yes", "no"):
+                if expired:
+                    emit({"type": "maker_expired", "ts": nowt.isoformat(), "reason": "no_result",
+                          **{k: ms[k] for k in ("ticker", "side", "yes_price", "fair", "signal_ts", "filled_proxy")}})
+                    continue
                 still_ms.append(ms)
                 continue
             y = 1.0 if res == "yes" else 0.0
