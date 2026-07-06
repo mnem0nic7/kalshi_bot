@@ -59,6 +59,9 @@ def main() -> None:
             settles.append(rec)
 
     print("Maker-side counterfactual shadow report (signal-only, zero order risk).")
+    print("NOTE: shadows spawn only where the live book ALREADY repriced through fair "
+          "(live_edge_too_small rejects) — a structurally adverse-selected sample; expect "
+          "pessimistic numbers vs a real always-on maker.")
     print("Fee assumptions: (a) maker fee = $0 [confirm against Kalshi's live maker fee "
           "schedule before trusting], (b) taker formula 0.07*p*(1-p) as a CONSERVATIVE "
           "upper-bound fee, not a claim of the actual maker rate.")
