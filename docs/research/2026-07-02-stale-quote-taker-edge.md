@@ -3,7 +3,8 @@
 **Status:** OOS-validated in backtest on 3 independent checks. **Live fill reality UNPROVEN** — the
 one remaining link before any live deployment. No orders placed; research only.
 **Scripts:** `scripts/diag_stale_quote_edge.py` (materialized-row window), `scripts/diag_stale_quote_oos.py`
-(fresh-tick recompute for pre-v15 windows).
+(fresh-tick recompute for pre-v15 windows), `scripts/xrp_stale_backtest.py` (2026-07-06 per-asset
+extension: same fresh-tick method + one-trade-per-market dedup, used for the XRP verdict below).
 
 ## Hypothesis (from the settlement-basis study's residual)
 
@@ -79,3 +80,50 @@ latency/reaction edge, not a forecasting edge, so it does not contradict the v15
 3. If live capture ≥ ~half of backtest: productionize as a new event-triggered strategy in the
    autonomy loop (NOT the champion-model path), with per-asset enable, replay-gate-style shadow
    accounting, and the existing kill-switch/risk rails.
+
+## XRP verdict (2026-07-06)
+
+XRP was never tested on 15m in the original three checks (only BTC/BNB/HYPE/DOGE + a SOL/ETH
+cross-sectional holdout) — flagged for a look because XRP shows +$7.72 in the separate 1h paper
+shadow. Ran the **exact validated fresh-tick-recompute method** (`scripts/diag_stale_quote_oos.py`'s
+approach — recomputes point-in-time spot context from raw `crypto_spot_ohlc` ticks so materialized
+pre-v15 frozen-candle-spot rows don't collapse `dfair`), same detection constants
+(`VOL_MODEL`=`vol_normal_fair_value`/`spot_realized_volatility_32`, `MAX_GAP_S=150` i.e. ~18s cadence,
+`QUOTE_EPS=0.01`, `DFAIR_GRID` incl. 0.10/0.15) as `scripts/stale_quote_pilot.py`, in
+`scripts/xrp_stale_backtest.py` (new script — the "one trade per market" dedup used for the
+doc's dedup-realism table was ad hoc, not committed as a script, so it was rebuilt here on top of
+the committed fresh-tick method rather than invented from scratch). Ran inside
+`infra-app_production_green-1` (DB access) via `docker cp` + `docker exec`.
+
+**Primary window — most recent 2 weeks (06-22 → 07-06), dedup one trade/market:**
+
+| threshold | n (dedup trades) | net $ (1 ct) | avg/ct | win% |
+|-----------|-------------------|--------------|--------|------|
+| dfair≥0.10 | 746 | +27.91 | +3.74¢ | 59% |
+| dfair≥0.15 | 654 | +38.96 | +5.96¢ | 61% |
+
+Baseline (same signal, quote not conditioned on staleness) at ≥0.10 was **negative** (n=806,
+net −23.19, avg −2.88¢, win 55%) — same pattern as the other assets: conditioning on quote-lag is
+what pays, not the raw spot-move signal.
+
+**Robustness check — disjoint prior 2 weeks (06-08 → 06-22), same method, same script:**
+
+| threshold | n (dedup trades) | net $ (1 ct) | avg/ct | win% |
+|-----------|-------------------|--------------|--------|------|
+| dfair≥0.10 | 1082 | +17.25 | +1.59¢ | 55% |
+| dfair≥0.15 | 948  | +34.97 | +3.69¢ | 56% |
+
+Positive at ≥0.10 and ≥0.15 in **both** independent 2-week windows, n well above the ~200 dedup-trade
+bar in both. Weaker than BTC/BNB/HYPE (3.5–5.5¢/ct historical) but stronger than DOGE (1.1¢/ct, the
+previously-weakest asset) at ≥0.10, and comparable to the pack at ≥0.15. Monotone win-rate improvement
+with threshold, consistent with the mechanism (larger stale mispricings are easier to detect
+correctly).
+
+**Verdict: ADD.** Positive dedup net at ≥0.10 with n=746 (≥~200 bar) in the primary window, confirmed
+in a disjoint OOS window. `XRP` appended to `STALE_PILOT_ASSETS` in
+`scripts/stale_quote_pilot_watchdog.sh` (now `BNB,HYPE,DOGE,ETH,XRP`); pilot restarted under the
+existing operator-authorized caps (unchanged: `STALE_PILOT_MAX_TRADES_PER_DAY=10`,
+`STALE_PILOT_MAX_OPEN=2`, `STALE_PILOT_DAILY_LOSS_STOP=6.0`, `STALE_PILOT_MAX_ENTRY=0.75`,
+`STALE_PILOT_CONTRACTS=2`). Same fill-reality caveat as every other pilot asset applies (honest
+capture is unproven until live fills accumulate); XRP inherits the shared per-asset kill-rule readout
+in `kalshi_bot.crypto.stale_pilot_readout`.
