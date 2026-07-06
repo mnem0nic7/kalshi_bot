@@ -602,8 +602,10 @@ services:
       # 24 (was 48) since 2026-07-05: memcg OOM kill at 01:59Z during the 1h
       # catch-up — 48h chunks of post-06-18 ladder-dense 1h data plus a
       # cross-chunk memory ratchet blew the 32g cap (same window passed on
-      # retry in a fresh process). Halving the window halves the peak.
-      CRYPTO_TRAIN_MATERIALIZE_MAX_STEP_HOURS: "24"
+      # retry in a fresh process). 24h still plateaued at 31.7g on the 06-24
+      # chunk (2026-07-06 01:00Z) -> 12h. Peak scales with window density;
+      # late-June+ ladder data needs the smaller step.
+      CRYPTO_TRAIN_MATERIALIZE_MAX_STEP_HOURS: "12"
       CRYPTO_XGBOOST_DEVICE: cuda
       # Keep per-asset candidate selection moving through the full 15m/1h
       # rotation. Replay gates still enforce profitability before live use.
