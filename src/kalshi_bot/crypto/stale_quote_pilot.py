@@ -27,6 +27,9 @@ class PilotConfig:
     max_open_positions: int = 0
     daily_loss_stop_dollars: float = 0.0
     max_entry_dollars: float = 0.0
+    contracts: int = 1
+    max_trades_per_window: int = 0
+    window_hours: int = 12
 
 
 @dataclass
@@ -37,6 +40,8 @@ class PilotState:
     trades_today: int = 0
     realized_pnl_today: float = 0.0
     open_positions: int = 0
+    window_index: int | None = None
+    trades_this_window: int = 0
 
 
 def evaluate_guards(
@@ -57,8 +62,17 @@ def evaluate_guards(
         state.day = now.date()
         state.trades_today = 0
         state.realized_pnl_today = 0.0
+        state.window_index = None
+        state.trades_this_window = 0
     if state.trades_today >= config.max_trades_per_day:
         return False, "daily_trade_cap"
+    if config.max_trades_per_window > 0:
+        idx = now.hour // max(1, config.window_hours)
+        if state.window_index != idx:
+            state.window_index = idx
+            state.trades_this_window = 0
+        if state.trades_this_window >= config.max_trades_per_window:
+            return False, "window_trade_cap"
     if state.open_positions >= config.max_open_positions:
         return False, "open_position_cap"
     if state.realized_pnl_today <= -abs(config.daily_loss_stop_dollars):
@@ -74,8 +88,9 @@ def build_pilot_ticket(
     side: str,
     yes_bid: Decimal,
     yes_ask: Decimal,
+    count: int = 1,
 ) -> TradeTicket:
-    """1-contract IOC taker ticket crossing the current top of book.
+    """IOC taker ticket (count contracts) crossing the current top of book.
 
     Buying YES crosses at the ask; buying NO crosses at the bid (the yes-price at
     which the NO side transacts — you pay 1 - yes_bid per NO contract).
@@ -87,7 +102,7 @@ def build_pilot_ticket(
         action=TradeAction.BUY,
         side=contract_side,
         yes_price_dollars=yes_price,
-        count_fp=Decimal("1"),
+        count_fp=Decimal(count),
         time_in_force="immediate_or_cancel",
         note="stale_quote_pilot",
     )
