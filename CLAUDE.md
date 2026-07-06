@@ -139,6 +139,17 @@ A self-contained, **NON-TRADING** research subsystem implementing `docs/research
 - `loop.py` / `service.py` — the continuous loop (log every tick; OOS-evaluate every `MM_EVAL_INTERVAL_SECONDS`), assembled with real collaborators. Run via `crypto-mm run`.
 Staged per plan §6: the data spine is v1 (reuses already-collected spot, so it's verifiable without new WS infra); live multi-venue WS book reconstruction, the §4.3 order-flow gate, and live execution are deliberate later stages. Config: `mm_*` settings in `config.py`.
 
+### CPI nowcast research stack (`macro/`) — GATE-0: NO-GO 2026-07-06
+
+A self-contained, **NON-TRADING** research subsystem (`docs/superpowers/specs/2026-07-01-cpi-nowcast-gate0-design.md`) testing whether the Cleveland Fed CPI nowcast (which beats consensus surveys per the Fed's own published real-time accuracy study) also beats the Kalshi `KXCPI`/`KXCPIYOY` market. Sub-project A only: libraries + an offline backtest script, no `AppContainer` wiring, no trading code.
+- `nowcast_source.py` — `ClevelandFedNowcastSource` parses the UA-gated `nowcast_month.json` (MoM) / `nowcast_year.json` (YoY) endpoints into point-in-time `NowcastReading`s (~13y of daily vintages, ~157 target months each).
+- `distribution.py` — `NowcastDistribution` (Gaussian/Student-t/empirical `P(actual > k)`) + `SigmaCurve` (horizon-bucketed sigma fit from vintage-vs-actual error history).
+- `ladder.py` — read-only Kalshi CPI ladder parsing (`floor_strike`/`strike_type=greater`, `yes_bid_dollars`/`yes_ask_dollars`/`volume_fp`/`open_interest_fp`) + GET-only fetch helpers (public, unauthenticated endpoints; no order fields touched).
+- `backtest.py` — `evaluate_signal_quality` (nowcast vs naive-carry-forward Brier), `evaluate_market_edge_for_event` (nowcast-implied ladder vs Kalshi mid, net of `rate·p·(1−p)` fees), `summarize_fillability`, and `Gate0Verdict` (part 2 is decisive: it alone can fail the whole gate).
+- `scripts/cpi_gate0_backtest.py` — runs the full three-part gate-0 and prints/writes the verdict.
+
+**Verdict (`docs/research/2026-07-06-cpi-gate0-verdict.md`): NO-GO.** Part 1 (signal quality) passes clearly — nowcast Brier ~0.020 (MoM) / ~0.010 (YoY) vs naive-baseline Brier ~0.034 / ~0.019, pooled across 152 months of the 13y vintage archive. Part 2 (market edge, **decisive**) fails on **4/4** available events (the public API's price-history retention is ~2 months, so only `KXCPI-26APR`, `KXCPI-26MAY`, `KXCPIYOY-26APR`, `KXCPIYOY-26MAY` have both settlement + price history): the Kalshi mid's Brier beats the nowcast's Brier in every single event, and net-of-fees simulated P&L is mixed-sign and nets to a loss (-$20.52 across the 4 events, ~980 near-money observations). Part 3 (fillability) passes (near-money strikes carry 5-figure to 6-figure volume/OI, well above the spec's cited example). **The market already embeds the nowcast** — same efficiency-wall finding as crypto/weather. No B/C build (shadow loop, `AppContainer` wiring, live orders) is authorized on this signal; `scripts/collect_cpi_shadow.py`'s daily forward-collection (running since 2026-07-01, `project_cpi_nowcast_project`) keeps accruing n and can be revisited if it later shows a different picture with more settled prints. Config: `macro_*` in `config.py`, all inert (no loop reads them).
+
 ### Persistence (`db/`)
 Postgres + SQLAlchemy async + `pgvector` for semantic memory embeddings. In tests, SQLite is used via a JSON-compatible type wrapper (no pgvector). Alembic migrations live in `alembic/`.
 

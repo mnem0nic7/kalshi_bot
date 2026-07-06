@@ -923,6 +923,24 @@ class Settings(BaseSettings):
     historical_directional_confidence_min_full_market_days: int = 30
     historical_directional_confidence_min_holdout_market_days: int = 7
 
+    # CPI nowcast gate-0 (src/kalshi_bot/macro/) — a self-contained, NON-TRADING research
+    # subsystem (docs/superpowers/specs/2026-07-01-cpi-nowcast-gate0-design.md). Sub-project A
+    # is libraries + an offline backtest script only: no AppContainer wiring, no trading code,
+    # no shadow loop reads these yet. Not tuner-managed (mirrors mm_*'s inert pattern).
+    macro_cpi_nowcast_month_url: str = (
+        "https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_month.json"
+    )
+    macro_cpi_nowcast_year_url: str = (
+        "https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_year.json"
+    )
+    macro_cpi_nowcast_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+    macro_cpi_nowcast_fallback_sources: str = ""
+    macro_cpi_gate0_min_brier_margin: float = 0.01
+    macro_cpi_gate0_min_net_edge_dollars: float = 0.0
+
     @model_validator(mode="after")
     def _validate_auto_evolve_flags(self) -> "Settings":
         if self.strategy_auto_evolve_activate_suggestions and not self.strategy_auto_evolve_accept_suggestions:
