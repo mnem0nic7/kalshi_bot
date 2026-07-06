@@ -136,6 +136,7 @@ async def main() -> None:
     execution = ExecutionService(settings, client)
     state = PilotState()
     open_trades: list[dict] = []   # {ticker, side, entry, settle_by}
+    maker_shadows: list[dict] = []  # {ticker, side, yes_price, fair, signal_ts, filled_proxy, settle_by}
     hist: dict[str, list] = {}
     signaled: set[str] = set()
     emit({"type": "start", "ts": datetime.now(UTC).isoformat(), "enabled": cfg.enabled,
@@ -171,6 +172,28 @@ async def main() -> None:
             emit({"type": "settle", "ts": nowt.isoformat(), "ticker": tr["ticker"],
                   "result": res, "net": round(net, 4), "pnl_today": round(state.realized_pnl_today, 4)})
         open_trades[:] = still
+
+        still_ms: list[dict] = []
+        for ms in maker_shadows:
+            if nowt < ms["settle_by"]:
+                still_ms.append(ms)
+                continue
+            try:
+                m = (await client.get_market(ms["ticker"])).get("market") or {}
+            except Exception:
+                still_ms.append(ms)
+                continue
+            res = m.get("result")
+            if res not in ("yes", "no"):
+                still_ms.append(ms)
+                continue
+            y = 1.0 if res == "yes" else 0.0
+            entry = ms["yes_price"] if ms["side"] == "yes" else 1.0 - ms["yes_price"]
+            gross = (y - ms["yes_price"]) if ms["side"] == "yes" else ((1.0 - y) - (1.0 - ms["yes_price"]))
+            emit({"type": "maker_settle", "ts": nowt.isoformat(), **{k: ms[k] for k in
+                  ("ticker", "side", "yes_price", "fair", "signal_ts", "filled_proxy")},
+                  "result": res, "gross_if_filled": round(gross, 4), "entry": round(entry, 4)})
+        maker_shadows[:] = still_ms
 
     last_reconcile = 0.0
     while True:
@@ -227,6 +250,12 @@ async def main() -> None:
                 h.append((now, mid_now, spot_now))
                 if len(h) > 40:
                     del h[: len(h) - 40]
+                for ms in maker_shadows:
+                    if ms["ticker"] == tk and not ms["filled_proxy"]:
+                        if (ms["side"] == "yes" and ya is not None and ya <= ms["yes_price"]) or \
+                           (ms["side"] == "no" and yb is not None and yb >= ms["yes_price"]):
+                            ms["filled_proxy"] = True
+                            ms["filled_ts"] = now.isoformat()
                 if tk in signaled or fair_now is None or spot_now is None or mny is None:
                     continue
                 ref = None
@@ -282,6 +311,19 @@ async def main() -> None:
                 rec["edge_live"] = round(edge_live, 4)
                 if edge_live < 0.03:
                     rec["guard"] = "live_edge_too_small"
+                    # Maker counterfactual (spec 2026-07-06): where would a resting
+                    # bid at fair-minus-3c sit? Tracked to settlement, fills judged
+                    # by a traded-through proxy — an UPPER BOUND on real maker fills
+                    # (queue position ignored).
+                    maker_yes_price = (round(float(fair_now) - 0.03, 2) if side == "yes"
+                                       else round(float(fair_now) + 0.03, 2))
+                    if 0.01 <= maker_yes_price <= 0.99:
+                        rec["maker_yes_price"] = maker_yes_price
+                        maker_shadows.append({
+                            "ticker": tk, "side": side, "yes_price": maker_yes_price,
+                            "fair": float(fair_now), "signal_ts": now.isoformat(),
+                            "filled_proxy": False, "settle_by": cl + timedelta(seconds=60),
+                        })
                     emit(rec)
                     continue
                 # Credible-edge ceiling (same principle as RISK_MAX_CREDIBLE_EDGE_BPS):
