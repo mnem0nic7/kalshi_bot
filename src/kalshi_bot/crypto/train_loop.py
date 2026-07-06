@@ -41,6 +41,32 @@ def materialize_window_bounds(
     return bounds
 
 
+def process_rss_bytes() -> int:
+    """Current process RSS in bytes from /proc/self/status (0 if unreadable).
+
+    Used by the stepped materialize to decide on a PLANNED clean restart
+    between chunks: memory accumulates across chunks within one process
+    (48h/24h/12h windows all eventually OOM'd the 32g cgroup), while a fresh
+    process passed every one of those same windows.
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def should_restart_for_rss(rss_bytes: int, threshold_gb: float | None) -> bool:
+    """True when a between-chunks clean restart is warranted. 0/None disables;
+    an unreadable RSS (0) never triggers."""
+    if not threshold_gb or threshold_gb <= 0 or rss_bytes <= 0:
+        return False
+    return rss_bytes > threshold_gb * 1024**3
+
+
 def build_train_work_order(
     assets: list[str], frequencies: list[str]
 ) -> list[tuple[str, str]]:

@@ -674,6 +674,16 @@ Crypto has its own history, spot, model, replay, gate, and autonomy loops.
 | `CRYPTO_EMPIRICAL_BUCKET_MIN_NET_PNL_DOLLARS` | `0.0` | Bucket net P/L floor. |
 | `CRYPTO_EMPIRICAL_BUCKET_MIN_WIN_RATE` | `0.55` | Bucket win-rate floor. |
 
+### `CRYPTO_TRAIN_MATERIALIZE_RESTART_RSS_GB`
+Default `18.0` (GB). During a CHUNKED materialize catch-up, memory accumulates
+across chunks within one process (48h/24h/12h steps all eventually hit the 32g
+cgroup on ladder-dense 1h windows) while a fresh process passes those same
+windows. When post-chunk RSS exceeds this threshold the trainer exits cleanly
+BETWEEN chunks (`crypto_materialize_planned_restart` warning, SIGTERM to self);
+docker `unless-stopped` restarts it and the committed chunk watermark resumes
+the catch-up. Never fires after the final chunk. `0` disables (revert to
+memcg-kill containment only).
+
 ### Nightly Model Regeneration Settings
 
 The daemon runs a nightly per-asset model+backtest+gate refresh at a configured local hour. See `docs/crypto-trading-dials-and-knobs.md` for the full reference including staleness logic, checkpoint schema, and rollback steps.

@@ -234,6 +234,10 @@ class Settings(BaseSettings):
     # whole (e.g. 11-day) window — the 2026-06-19 1h durability fix. 0 == disabled
     # (single unbounded pass, legacy behavior). Set on the trainer.
     crypto_train_materialize_max_step_hours: float = 0.0
+    # Planned clean restart between materialize chunks once process RSS exceeds
+    # this many GB (0 disables). Fresh-process resume via the committed chunk
+    # watermark replaces the memcg OOM kill (2026-07-06 catch-up incident).
+    crypto_train_materialize_restart_rss_gb: float = 18.0
     crypto_train_build_workers: int = 1  # 1 = serial (today); >1 = ProcessPool over assets (trainer only)
     # Populate orderbook microstructure features (spot_exchange_spread_bps,
     # recent_trade_count, exchange bid/ask) during the build. Loads the spot

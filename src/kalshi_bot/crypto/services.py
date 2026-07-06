@@ -10,6 +10,7 @@ import logging
 import math
 import multiprocessing
 import os
+import signal
 import time
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
@@ -3518,6 +3519,7 @@ class CryptoTrainingBackfillService:
                 materialize_microstructure=materialize_microstructure,
                 materialize_settlement_windows=materialize_settlement_windows,
             )
+        from kalshi_bot.crypto import train_loop
         from kalshi_bot.crypto.train_loop import materialize_window_bounds
 
         freq = normalize_frequency(frequency) or "15m"
@@ -3569,6 +3571,33 @@ class CryptoTrainingBackfillService:
                 edge.isoformat(),
                 last_result.get("status"),
             )
+            if i < total:
+                rss = train_loop.process_rss_bytes()
+                threshold_gb = float(
+                    getattr(self.settings, "crypto_train_materialize_restart_rss_gb", 0) or 0
+                )
+                if train_loop.should_restart_for_rss(rss, threshold_gb):
+                    # Memory accumulates across chunks within one process; a fresh
+                    # process passes windows this one would OOM on. Exit cleanly
+                    # between chunks (never mid-chunk) — unless-stopped restarts
+                    # us and the committed watermark resumes the catch-up.
+                    logger.warning(
+                        "crypto_materialize_planned_restart freq=%s after chunk=%d/%d "
+                        "rss_gb=%.1f threshold_gb=%.1f — clean exit, watermark resume",
+                        freq,
+                        i,
+                        total,
+                        rss / 1024**3,
+                        threshold_gb,
+                    )
+                    result = {
+                        **last_result,
+                        "status": "restart_pending",
+                        "chunks_completed": i,
+                        "chunks_total": total,
+                    }
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return result
         return last_result
 
     async def _materialize_once(
