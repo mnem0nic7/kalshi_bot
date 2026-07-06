@@ -10,6 +10,8 @@ operator to set, explicitly:
   STALE_PILOT_MAX_OPEN=1                    (correlated-exposure cap)
   STALE_PILOT_DAILY_LOSS_STOP=3.0           (dollars)
   STALE_PILOT_MAX_ENTRY=0.75                (dollars)
+  STALE_PILOT_CONTRACTS=2                   (contracts per ticket)
+  STALE_PILOT_MAX_TRADES_PER_WINDOW=5       (per 12h UTC window; belt is the daily cap)
 
 Detection is identical to scripts/stale_quote_shadow.py (imported); guards and
 ticket construction are the TDD'd kalshi_bot.crypto.stale_quote_pilot. Orders go
@@ -76,6 +78,8 @@ def _env_cfg() -> PilotConfig:
         max_open_positions=int(os.environ.get("STALE_PILOT_MAX_OPEN", "0")),
         daily_loss_stop_dollars=float(os.environ.get("STALE_PILOT_DAILY_LOSS_STOP", "0")),
         max_entry_dollars=float(os.environ.get("STALE_PILOT_MAX_ENTRY", "0")),
+        contracts=int(os.environ.get("STALE_PILOT_CONTRACTS", "1")),
+        max_trades_per_window=int(os.environ.get("STALE_PILOT_MAX_TRADES_PER_WINDOW", "0")),
     )
 
 
@@ -137,7 +141,8 @@ async def main() -> None:
     emit({"type": "start", "ts": datetime.now(UTC).isoformat(), "enabled": cfg.enabled,
           "assets": list(cfg.assets), "caps": {"trades_day": cfg.max_trades_per_day,
           "open": cfg.max_open_positions, "loss_stop": cfg.daily_loss_stop_dollars,
-          "max_entry": cfg.max_entry_dollars}})
+          "max_entry": cfg.max_entry_dollars, "contracts": cfg.contracts,
+          "trades_window": cfg.max_trades_per_window}})
 
     watch = [a for a in (cfg.assets or tuple(SERIES))]
 
@@ -160,7 +165,7 @@ async def main() -> None:
                 continue
             y = 1.0 if res == "yes" else 0.0
             gross = (y - tr["entry"]) if tr["side"] == "yes" else ((1.0 - y) - tr["entry"])
-            net = gross - 0.07 * tr["entry"] * (1 - tr["entry"])
+            net = (gross - 0.07 * tr["entry"] * (1 - tr["entry"])) * tr.get("count", 1.0)
             state.realized_pnl_today += net
             state.open_positions = max(0, state.open_positions - 1)
             emit({"type": "settle", "ts": nowt.isoformat(), "ticker": tr["ticker"],
@@ -297,7 +302,8 @@ async def main() -> None:
                 # to pay through. (The earlier "0/7 at touch" was a fill-check
                 # bug, not reality.)
                 ticket = build_pilot_ticket(market_ticker=tk, side=side,
-                                            yes_bid=_decimal(f"{live_bid:.4f}"), yes_ask=_decimal(f"{live_ask:.4f}"))
+                                            yes_bid=_decimal(f"{live_bid:.4f}"), yes_ask=_decimal(f"{live_ask:.4f}"),
+                                            count=cfg.contracts)
                 coid = make_client_order_id("stale-quote-pilot", tk, ticket.nonce)
                 receipt = await execution.execute(
                     room=_RoomShim(shadow_mode=not cfg.enabled),
@@ -311,6 +317,7 @@ async def main() -> None:
                                           "inactive_color_skipped", "write_credentials_missing") \
                         and not receipt.status.startswith("rejected"):
                     state.trades_today += 1  # every submitted order consumes the daily budget
+                    state.trades_this_window += 1
                     # IOC can cancel with 0 fills — only a real fill is an open
                     # position. Look the order up BY client_order_id via
                     # get_orders(ticker=...): receipt.external_order_id proved
@@ -335,7 +342,7 @@ async def main() -> None:
                             else (1.0 - fill_price if fill_price is not None else live_entry)
                         state.open_positions += 1
                         open_trades.append({"ticker": tk, "side": side, "entry": eff_entry,
-                                            "settle_by": cl + timedelta(seconds=60)})
+                                            "count": filled, "settle_by": cl + timedelta(seconds=60)})
                 emit(rec)
         elapsed = asyncio.get_event_loop().time() - cycle_t0
         await asyncio.sleep(max(0.5, POLL_S - elapsed))
