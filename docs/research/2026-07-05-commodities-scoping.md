@@ -165,3 +165,87 @@ shape against the Pyth feed (same settlement-source-is-the-feed structure that m
 tractable), with AAA-gas nowcasting evaluated opportunistically alongside the CPI nowcast track
 rather than as its own vertical. **No implementation is authorized by this document** — any of the
 above would be its own scoped design/build task with its own review.
+
+## Pyth Hermes auth resolution (2026-07-06)
+
+Follow-up to the Brent GO-candidate's one open caveat above (exact auth/pricing terms for Pyth's
+public Hermes API post-2026-07-31 were unconfirmed). Checked against official Pyth sources plus one
+live empirical call.
+
+**(a) Is the 2026-07-31 auth requirement real, and what changes?** Yes, confirmed on two official
+Pyth-owned domains:
+- [`docs.pyth.network/price-feeds/core/how-pyth-works/hermes`](https://docs.pyth.network/price-feeds/core/how-pyth-works/hermes) —
+  "Authentication becomes required on July 31, 2026." Today the API is reachable unauthenticated at
+  `https://hermes.pyth.network/...`; after the cutover, callers must migrate to
+  `https://pyth.dourolabs.app/hermes/...` and send `Authorization: Bearer $PYTH_API_KEY`.
+- [`pyth.network/blog/the-pyth-core-upgrade`](https://www.pyth.network/blog/the-pyth-core-upgrade) —
+  same mechanism, official announcement: "the existing Hermes endpoint will redirect to the new one"
+  and "every Core user will need an API Key" (per
+  [`docs.pyth.network/.../api-instances-and-providers/hermes`](https://docs.pyth.network/price-feeds/core/api-instances-and-providers/hermes)
+  as well). This is a hard cutover, not an opt-in — the DAO switches all existing Pyth Core
+  contracts/endpoints over on 2026-07-31 regardless of whether a given integrator has migrated.
+
+**(b) Is there a free tier, and does it cover our modest usage (~1 feed, single latest-price
+endpoint, polled every ~10s)?** Checked the actual signup/pricing page,
+[`app.pyth.com/plans`](https://app.pyth.com/plans) (Pyth Terminal), which lists three tiers:
+- **Free ($0/mo):** view-only in the Terminal UI, 10s update cadence — but explicitly **no API
+  access**. Not usable for a programmatic collector at any polling rate.
+- **Starter ($500/mo):** API key included, up to 1s updates, but scoped to **crypto symbols only**
+  ("access to all crypto symbols"). Brent is not a crypto symbol — this tier does not cover it.
+- **Pro (from $2,500/mo, up to $5,000–$10,000/mo depending on bundle):** the only tier whose asset
+  coverage includes "equities, futures, commodities, rates, crypto & more." The companion blog post
+  breaks Pro into per-asset-class bundles (e.g. Futures $5,000/mo, FX & Metals $6,500/mo, Crypto
+  $2,500/mo, all-asset $10,000/mo); Brent (a futures-settled commodity feed, not a crypto feed) falls
+  under a Pro bundle, **not** Starter.
+- Net: there is no free or low-cost path to authenticated Brent access. The floor for our single-feed
+  use case is a **Pro subscription, $2,500–$5,000/month**, not the $500 Starter tier and nowhere near
+  free. Nothing about our request pattern (1 feed, ~1 req/sec or a single latest-price call every
+  ~10s) changes which tier gates commodities — it's gated by asset class, not by call volume.
+
+**(c) Signup process (for the record, not pursued given (b)):** create an account at
+[Pyth Terminal](https://app.pyth.com/plans), subscribe to a paid plan, receive an API key, switch the
+Hermes base URL to `https://pyth.dourolabs.app/hermes/` and send the key as a Bearer token. Custom/
+enterprise arrangements route through `data@dourolabs.xyz`.
+
+**(d) Does unauthenticated access remain usable at a lower rate limit, or is there a public mirror?**
+Today (pre-cutover) yes: `docs.pyth.network`'s Hermes-instances page documents the public instance
+rate limit as **10 requests / 10 seconds per IP** (429 for 60s if exceeded) — comfortably above our
+~1 req/sec need. But this free ride is time-boxed to 25 days from today: the same page states every
+Core user needs an API key after 2026-07-31, and the doc gives no indication the public instance
+survives the cutover unauthenticated (it "redirects to the new one"). Four commercial Hermes node
+providers are listed (Triton, P2P, extrnode, Liquify) as alternative infra for production users, but
+no pricing was found for any of them and nothing suggests they're free — not pursued further given
+the Pro-tier finding already answers the question. No other public mirror of Hermes was found.
+
+**Live empirical check (2026-07-06, unauthenticated, from this host):**
+```
+curl -s "https://hermes.pyth.network/v2/price_feeds?query=brent" | head -c 500
+```
+Returned `HTTP 200` with a JSON array of 14 Brent futures-month feeds (front-month rolls monthly, one
+entry per contract-month code, e.g. `BRENTU6` = July 2026 contract). **Works unauthenticated today**,
+confirming (d). The current front-month feed — `BRENTU6`, "PYTH BRENT 31 JULY 2026 / US DOLLAR",
+matching the exact contract (`BRENTU6`) cited as Kalshi's `KXBRENTD` settlement example earlier in
+this doc — has:
+
+**Brent feed id (front-month, `BRENTU6`, as of 2026-07-06): `93fdb7c6f23c6ba97baf2f086891e6749461a5f6cd620338102845acf210e96b`**
+
+Also confirmed the actual price-pull endpoint works unauthenticated today:
+`https://hermes.pyth.network/v2/updates/price/latest?ids[]=93fdb7c6f23c6ba97baf2f086891e6749461a5f6cd620338102845acf210e96b`
+returned `HTTP 200` with a binary Wormhole-VAA-encoded price update (as expected per the API spec).
+Note the front-month feed id is not stable long-term — Brent contracts roll monthly (`BRENTU6` →
+`BRENTV6` → …), so a real collector would need to re-resolve the current front-month id periodically
+via `/v2/price_feeds?query=brent`, same as the rolling-contract mechanic already described in the
+settlement-source table above.
+
+**Verdict: STOP.** The auth requirement is real and imminent (25 days out), has no free tier with API
+access, and — critically — commodities/futures feeds are gated behind the **Pro** plan
+($2,500–$5,000/month), not the cheaper crypto-only Starter tier ($500/month). This is well above
+"small-scale appetite" for what is, per the Recommendation above, one GO-*candidate* among ~40
+commodity products scoped (not yet a scoped build). Paying $2,500+/month indefinitely to keep polling
+one Kalshi series' settlement-source feed does not clear the bar this spike was checking. The
+unauthenticated public instance still works today and until 2026-07-31, so nothing here blocks
+further *exploratory* polling in the next 25 days, but any Brent build that assumes ongoing free/cheap
+Pyth access should not proceed past this checkpoint without either (i) an explicit operator decision
+to pay for Pro, or (ii) a cheaper non-Pyth Brent source materializing. This does not change the
+verdicts for copper/nat-gas/WTI/AAA-gas above (copper and nat-gas were already NO on market-spread
+grounds independent of feed cost; WTI never had a Pyth dependency; AAA-gas's feed is free regardless).
