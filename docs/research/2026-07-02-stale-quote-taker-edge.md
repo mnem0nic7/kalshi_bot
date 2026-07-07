@@ -161,3 +161,36 @@ ticks) inside the active app container for each of `BNB HYPE DOGE ETH XRP`, appe
 deliberately after the Sunday 09:00 UTC VACUUM FULL window, not competing with it. This is a
 detection-only recheck (no automatic pilot asset removal); an operator reviews the log and drops any
 asset whose current-window avg/ct goes negative, same as the BTC kill-rule precedent above.
+
+## Recheck 2026-07-07 → DOGE + ETH DROPPED (operator "agreed")
+
+The recheck was run early (ahead of the Monday cron) because the scaled pilot's first ~24h ran
+5W/11L, net −$7.65, with every asset negative. Window 06-23→07-07 (14d), dedup one-trade-per-market
+at the pilot's dfair≥0.10 trigger:
+
+| asset | dedup avg/ct @0.10 | n   | win | no-staleness baseline | verdict |
+|-------|--------------------|-----|-----|-----------------------|---------|
+| BNB   | **+5.63¢**         | 563 | 63% | +3.62¢                | keep |
+| HYPE  | **+5.36¢**         | 574 | 60% | +1.35¢                | keep |
+| XRP   | **+2.74¢**         | 662 | 58% | −3.79¢                | keep |
+| DOGE  | **−0.28¢**         | 649 | 57% | +0.84¢ (beats stale!) | **dropped** |
+| ETH   | **−2.28¢**         | 619 | 53% | −1.12¢                | **dropped** (new decay) |
+
+ETH is the new decay: negative at the 0.10 trigger and worse than its baseline; it only turns
+positive at dfair≥0.15 (+3.34¢) — its book still goes stale on large moves but reprices fast enough
+to eat the 0.10–0.15 band. DOGE confirmed its prior-week flip a second time. Live scaled-era P&L
+agreed directionally (ETH −$1.99/5 settles, DOGE −$2.05/2 in the scaled era). Allowlist is now
+`BNB,HYPE,XRP`; re-adding DOGE/ETH requires fresh positive backtest evidence, same as BTC. A
+threshold raise to 0.15 (all five assets non-negative there) was considered and deferred — it
+changes the validated entry rule on smaller samples with unproven live capture at rarer signals.
+
+**Restart-safe daily counters (same deploy).** Pilot restarts previously zeroed
+`pnl_today`/`trades_today`/`trades_this_window`, silently re-arming the daily loss stop mid-day
+(07-06: two restarts left the counter at +$0.60 while the true day was −$2.34). The pilot now
+rebuilds today's counters from its own JSONL at startup (`rebuild_state_from_records` in
+`kalshi_bot/crypto/stale_quote_pilot.py`; the watchdog docker-cp's the host JSONL into the
+container since `STALE_PILOT_STDOUT=1` means no in-container copy exists). Verified live at the
+07-07 16:28Z restart: start record shows `rebuilt: pnl_today −5.18, trades_today 10, window 5` —
+the pilot correctly refused to re-arm and sat out the rest of the day. Open positions are
+deliberately not rebuilt (they settle within ~15 min; reconstruction risks double-counting a
+settlement that raced the restart).

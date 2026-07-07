@@ -43,10 +43,15 @@ docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" || { echo "$(date -u +%F
 
 docker cp "$SCRIPT" "$CONTAINER":/app/stale_quote_pilot.py >/dev/null 2>&1 || true
 docker cp "$SRC" "$CONTAINER":/app/src/kalshi_bot/crypto/stale_quote_pilot.py >/dev/null 2>&1 || true
+# Seed today's counters: the pilot rebuilds pnl_today/trade budgets from its
+# own JSONL at startup (STALE_PILOT_STDOUT=1 means no in-container copy exists,
+# so copy the host log in) — a restart must not re-arm the daily loss stop.
+docker exec "$CONTAINER" mkdir -p /app/data/stale_pilot 2>/dev/null || true
+docker cp "$OUT" "$CONTAINER":/app/data/stale_pilot/pilot.jsonl >/dev/null 2>&1 || true
 
 nohup docker exec "$CONTAINER" env STALE_PILOT_STDOUT=1 \
   STALE_PILOT_ENABLED=1 \
-  STALE_PILOT_ASSETS=BNB,HYPE,DOGE,ETH,XRP \
+  STALE_PILOT_ASSETS=BNB,HYPE,XRP \
   STALE_PILOT_CONTRACTS=2 \
   STALE_PILOT_MAX_TRADES_PER_DAY=10 \
   STALE_PILOT_MAX_TRADES_PER_WINDOW=5 \

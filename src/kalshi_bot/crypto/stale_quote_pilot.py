@@ -9,6 +9,7 @@ caps ON TOP of those rails; every default refuses to trade.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -42,6 +43,58 @@ class PilotState:
     open_positions: int = 0
     window_index: int | None = None
     trades_this_window: int = 0
+
+
+# Order receipt statuses that do NOT consume the daily/window trade budget
+# (mirrors the submission-count rule in scripts/stale_quote_pilot.py).
+NON_BUDGET_ORDER_STATUSES: tuple[str, ...] = (
+    "shadow_skipped",
+    "kill_switch_blocked",
+    "inactive_color_skipped",
+    "write_credentials_missing",
+)
+
+
+def order_consumed_budget(status: str | None) -> bool:
+    """True when an order receipt status counted against the trade budgets."""
+    return bool(status) and status not in NON_BUDGET_ORDER_STATUSES and not status.startswith("rejected")
+
+
+def rebuild_state_from_records(
+    records: Iterable[dict], config: PilotConfig, now: datetime
+) -> PilotState:
+    """Rebuild daily counters from the pilot's own JSONL after a restart.
+
+    Restarts previously zeroed trades_today / realized_pnl_today /
+    trades_this_window, silently re-arming the daily loss stop and trade
+    budgets mid-day. Open positions are deliberately NOT rebuilt: they settle
+    within ~15 minutes, so a restart orphans at most one settlement cycle,
+    and reconstructing entry/settle_by from records is not worth the risk of
+    double-counting a settlement that raced the restart.
+    """
+    state = PilotState(day=now.date())
+    window_hours = max(1, config.window_hours)
+    state.window_index = now.hour // window_hours
+    for rec in records:
+        ts = rec.get("ts")
+        if not isinstance(ts, str):
+            continue
+        try:
+            when = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if when.date() != state.day:
+            continue
+        if rec.get("type") == "settle":
+            try:
+                state.realized_pnl_today += float(rec.get("net", 0.0))
+            except (TypeError, ValueError):
+                continue
+        elif order_consumed_budget(rec.get("order_status")):
+            state.trades_today += 1
+            if when.hour // window_hours == state.window_index:
+                state.trades_this_window += 1
+    return state
 
 
 def evaluate_guards(

@@ -5,7 +5,7 @@ shadow_mode=True, so the FULL ExecutionService path runs (kill switch, color,
 creds) but returns shadow_skipped — a true dry-run. Enabling requires the
 operator to set, explicitly:
   STALE_PILOT_ENABLED=1
-  STALE_PILOT_ASSETS=BNB,HYPE,DOGE,ETH,XRP  (allowlist; XRP validated 2026-07-06; BTC dropped by kill rule)
+  STALE_PILOT_ASSETS=BNB,HYPE,XRP           (allowlist; BTC dropped 07-06 kill rule; DOGE+ETH dropped 07-07 edge-decay recheck)
   STALE_PILOT_MAX_TRADES_PER_DAY=10
   STALE_PILOT_MAX_OPEN=2                    (correlated-exposure cap)
   STALE_PILOT_DAILY_LOSS_STOP=6.0           (dollars)
@@ -36,7 +36,14 @@ from datetime import UTC, datetime, timedelta
 
 from kalshi_bot.config import get_settings
 from kalshi_bot.core.fixed_point import make_client_order_id
-from kalshi_bot.crypto.stale_quote_pilot import PilotConfig, PilotState, build_pilot_ticket, evaluate_guards
+from kalshi_bot.crypto.stale_quote_pilot import (
+    PilotConfig,
+    PilotState,
+    build_pilot_ticket,
+    evaluate_guards,
+    order_consumed_budget,
+    rebuild_state_from_records,
+)
 from kalshi_bot.db.repositories import PlatformRepository
 from kalshi_bot.db.session import create_engine, create_session_factory
 from kalshi_bot.integrations.kalshi import KalshiClient
@@ -136,6 +143,23 @@ async def main() -> None:
     client = KalshiClient(settings)
     execution = ExecutionService(settings, client)
     state = PilotState()
+    # Rebuild today's counters from prior records so a restart does not
+    # re-arm the daily loss stop / trade budgets mid-day. The watchdog
+    # docker-cp's the host JSONL to this path before starting us; absent
+    # file (fresh day / manual run) => fresh counters.
+    rebuild_path = os.environ.get("STALE_PILOT_REBUILD_PATH",
+                                  os.path.join(OUT_DIR, "pilot.jsonl"))
+    try:
+        with open(rebuild_path) as fh:
+            prior = []
+            for raw in fh:
+                try:
+                    prior.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+        state = rebuild_state_from_records(prior, cfg, datetime.now(UTC))
+    except OSError:
+        pass
     open_trades: list[dict] = []   # {ticker, side, entry, settle_by}
     maker_shadows: list[dict] = []  # {ticker, side, yes_price, fair, signal_ts, filled_proxy, settle_by}
     hist: dict[str, list] = {}
@@ -144,7 +168,10 @@ async def main() -> None:
           "assets": list(cfg.assets), "caps": {"trades_day": cfg.max_trades_per_day,
           "open": cfg.max_open_positions, "loss_stop": cfg.daily_loss_stop_dollars,
           "max_entry": cfg.max_entry_dollars, "contracts": cfg.contracts,
-          "trades_window": cfg.max_trades_per_window}})
+          "trades_window": cfg.max_trades_per_window},
+          "rebuilt": {"pnl_today": round(state.realized_pnl_today, 4),
+                      "trades_today": state.trades_today,
+                      "trades_this_window": state.trades_this_window}})
 
     watch = [a for a in (cfg.assets or tuple(SERIES))]
 
@@ -369,9 +396,7 @@ async def main() -> None:
                 )
                 rec["order_status"] = receipt.status
                 rec["client_order_id"] = coid
-                if receipt.status not in ("shadow_skipped", "kill_switch_blocked",
-                                          "inactive_color_skipped", "write_credentials_missing") \
-                        and not receipt.status.startswith("rejected"):
+                if order_consumed_budget(receipt.status):
                     state.trades_today += 1  # every submitted order consumes the daily budget
                     state.trades_this_window += 1
                     # IOC can cancel with 0 fills — only a real fill is an open
