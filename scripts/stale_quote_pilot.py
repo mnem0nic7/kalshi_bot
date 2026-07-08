@@ -6,12 +6,14 @@ creds) but returns shadow_skipped — a true dry-run. Enabling requires the
 operator to set, explicitly:
   STALE_PILOT_ENABLED=1
   STALE_PILOT_ASSETS=BNB,HYPE,XRP           (allowlist; BTC dropped 07-06 kill rule; DOGE+ETH dropped 07-07 edge-decay recheck)
-  STALE_PILOT_MAX_TRADES_PER_DAY=10
+  STALE_PILOT_MAX_TRADES_PER_DAY=1000000    (2026-07-08 operator: NO trade-count cap — loss stop is the brake)
   STALE_PILOT_MAX_OPEN=2                    (correlated-exposure cap)
-  STALE_PILOT_DAILY_LOSS_STOP=6.0           (dollars)
+  STALE_PILOT_DAILY_LOSS_STOP=3.0           (dollars; static FALLBACK when the pct fetch fails)
+  STALE_PILOT_DAILY_LOSS_STOP_PCT=0.10      (2026-07-08: stop = pct x account balance, fetched at startup;
+                                             overrides the dollar value when set and the balance fetch works)
   STALE_PILOT_MAX_ENTRY=0.75                (dollars)
   STALE_PILOT_CONTRACTS=2                   (contracts per ticket)
-  STALE_PILOT_MAX_TRADES_PER_WINDOW=5       (per 12h UTC window; belt is the daily cap)
+  STALE_PILOT_MAX_TRADES_PER_WINDOW=0       (0 disables the per-12h-window budget)
 
 Detection is identical to scripts/stale_quote_shadow.py (imported); guards and
 ticket construction are the TDD'd kalshi_bot.crypto.stale_quote_pilot. Orders go
@@ -31,7 +33,7 @@ import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from kalshi_bot.config import get_settings
@@ -142,6 +144,18 @@ async def main() -> None:
     factory = create_session_factory(engine)
     client = KalshiClient(settings)
     execution = ExecutionService(settings, client)
+    # Percent-of-capital loss stop (2026-07-08 operator: "no cap on # of trades
+    # just a 10% of capital stop"): stop = pct x live account balance, fetched
+    # once per start. Fetch failure -> keep the static dollar fallback env.
+    stop_pct = float(os.environ.get("STALE_PILOT_DAILY_LOSS_STOP_PCT", "0") or 0)
+    if stop_pct > 0:
+        try:
+            bal = float((await client.get_balance()).get("balance_dollars") or 0)
+            if bal > 0:
+                cfg = replace(cfg, daily_loss_stop_dollars=round(stop_pct * bal, 2))
+        except Exception as exc:  # noqa: BLE001 - fallback env value stays in force
+            emit({"type": "loss_stop_pct_fetch_failed", "ts": datetime.now(UTC).isoformat(),
+                  "error": str(exc)[:120], "fallback_stop": cfg.daily_loss_stop_dollars})
     state = PilotState()
     # Rebuild today's counters from prior records so a restart does not
     # re-arm the daily loss stop / trade budgets mid-day. The watchdog
