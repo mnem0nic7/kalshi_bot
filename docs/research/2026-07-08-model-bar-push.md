@@ -81,3 +81,38 @@ labels remove a measured 13–19% near-money label-noise handicap, the one
 structural disadvantage not yet fixed; if champions still lose to the mid on
 basis-aligned labels, the 15m level game is closed and the roadmap is speed
 edges + 1h/other-venue breadth.
+
+## Weather addendum (2026-07-08): first surviving conditional angle — longshot-NO
+
+Operator asked why weather isn't trading → quantified how close the best
+conditional angle gets to the fee line, using the accumulated shadow corpus
+(`historical_market_snapshots`, 806k KXHIGH intraday quote rows since 06-05;
+results parsed from post-settlement snapshot payloads; ~600 settled markets
+since 06-22).
+
+Method: per-market quote aggregates (avg mid/spread per hours-to-close
+bucket) joined to settlement results; calibration bias per price-band × ttc
+bucket vs a fee + half-spread hurdle; then two honesty gates — dedup to ONE
+strike per city-day (nearest 0.175 mid), and day-clustered standard errors
+(weather outcomes correlate across cities within a day).
+
+**Finding: 10–25¢ YES longshots quoted 12–48h before close are overpriced.**
+Mid says 16.5¢, realized P(yes) = 8.6% (n=58 city-days, 18 cities, 15 days).
+Bias −8¢ holds at ~2.2–2.3σ through city-day dedup AND day clustering on
+mids. At EXECUTABLE prices (sell YES at the bid = buy NO, taker fee):
+**+5.96¢/ct, 91% win** — but day-clustered t = **+1.7, below significance**.
+
+Why this is a LEAD and not a trade (the crypto favorite-longshot lesson,
+which was real in-sample and lost OOS): the payoff shape is many small wins
++ rare large losses on heat-spike days, and 15 midsummer days cannot contain
+the tail — the market's 16¢ may be correctly pricing spikes that simply
+didn't occur in the window. Capacity is also small (~4 qualifying city-days
+per day, thin books).
+
+**Pre-registered forward test:** re-run this exact analysis (executable
+prices, city-day dedup, day-clustered t) around **2026-08-15** (~45–60 days
+of corpus, tail-event coverage). Pass = day-clustered t ≥ 2.5 at executable
+prices with the effect stable across the added weeks; then design a capped
+pilot (operator go required). No collection change needed — the corpus
+accrues automatically. This supersedes waiting until 10-01 for this one
+angle; the blanket NO-GO on everything else stands.
