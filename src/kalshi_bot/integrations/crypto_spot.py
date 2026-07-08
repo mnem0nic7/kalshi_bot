@@ -24,8 +24,10 @@ COINBASE_PRODUCT_IDS = {
     "DOGE": "DOGE-USD",
     "ETH": "ETH-USD",
     "HYPE": "HYPE-USD",
+    "NEAR": "NEAR-USD",
     "SOL": "SOL-USD",
     "XRP": "XRP-USD",
+    "ZEC": "ZEC-USD",
 }
 
 COINGECKO_IDS = {
@@ -36,8 +38,10 @@ COINGECKO_IDS = {
     "DOGE": "dogecoin",
     "ETH": "ethereum",
     "HYPE": "hyperliquid",
+    "NEAR": "near",
     "SOL": "solana",
     "XRP": "ripple",
+    "ZEC": "zcash",
 }
 
 # Requested Kraken pair per asset. None means the asset is not listed on Kraken
@@ -52,13 +56,15 @@ KRAKEN_PAIRS: dict[str, str | None] = {
     "DOGE": "DOGEUSD",
     "ETH": "ETHUSD",
     "HYPE": None,
+    "NEAR": "NEARUSD",
     "SOL": "SOLUSD",
     "XRP": "XRPUSD",
+    "ZEC": "ZECUSD",
 }
 
 # Gemini spot symbol per asset (US-accessible CF-Benchmarks constituent venue).
 # None means the asset is not listed on Gemini and must be skipped (never
-# proxied) — Gemini does not list BNB or HYPE.
+# proxied) — Gemini does not list BNB, HYPE, or NEAR (probed 2026-07-08).
 GEMINI_PAIRS: dict[str, str | None] = {
     "ADA": "adausd",
     "BCH": "bchusd",
@@ -67,8 +73,10 @@ GEMINI_PAIRS: dict[str, str | None] = {
     "DOGE": "dogeusd",
     "ETH": "ethusd",
     "HYPE": None,
+    "NEAR": None,
     "SOL": "solusd",
     "XRP": "xrpusd",
+    "ZEC": "zecusd",
 }
 
 # Gemini v2 candles time-frame buckets: interval_seconds -> API token.

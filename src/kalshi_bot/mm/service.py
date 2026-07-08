@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Headroom over the configured σ̂ window so EWMA has enough returns to settle.
 _VOL_WINDOW_FLOOR = 33
-_DEFAULT_MM_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE")
+_DEFAULT_MM_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE", "NEAR", "ZEC")
 
 
 def resolve_mm_assets(raw: str | list[str] | None) -> list[str]:

@@ -642,7 +642,7 @@ class Settings(BaseSettings):
     crypto_model_nightly_hour_local: int = 3
     crypto_model_nightly_min_new_strict_rows: int = 60
     crypto_model_nightly_max_age_hours: int = 336
-    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE"
+    crypto_model_nightly_assets: str = "BTC,ETH,SOL,XRP,BNB,DOGE,HYPE,NEAR,ZEC"
     # Frequencies included in the nightly rotation. Both 15m and 1h produce the
     # full 14-slot rotation (7 assets × 2 frequencies = one model per night over
     # two weeks). Independent of CRYPTO_AUTO_FREQUENCIES (live trading).

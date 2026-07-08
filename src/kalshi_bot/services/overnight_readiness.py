@@ -42,6 +42,8 @@ CRYPTO_MARKET_PREFIXES = (
     "KXDOGE15M",
     "KXBNB15M",
     "KXHYPE15M",
+    "KXNEAR15M",
+    "KXZEC15M",
     "KXBTC",
     "KXBTCD",
     "KXETH",

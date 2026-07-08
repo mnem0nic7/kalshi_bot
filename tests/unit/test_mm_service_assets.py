@@ -22,5 +22,5 @@ def test_accepts_list_input():
 
 
 def test_falls_back_to_default_when_empty():
-    assert resolve_mm_assets("") == ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"]
-    assert resolve_mm_assets(None) == ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"]
+    assert resolve_mm_assets("") == ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE", "NEAR", "ZEC"]
+    assert resolve_mm_assets(None) == ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE", "NEAR", "ZEC"]
