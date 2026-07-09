@@ -826,7 +826,7 @@ services:
         while true; do
           cycle=$((cycle + 1))
           echo "starting crypto current collection" >&2
-          assets="$${CRYPTO_CURRENT_15M_ASSETS:-$${PRODUCTION_CRYPTO_CURRENT_15M_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP}}"
+          assets="$${CRYPTO_CURRENT_15M_ASSETS:-$${PRODUCTION_CRYPTO_CURRENT_15M_ASSETS:-BTC,HYPE,ETH,BNB,SOL,DOGE,XRP,NEAR,ZEC}}"
           assets="$${assets//,/ }"
           if ! kalshi-bot-cli crypto-history collect-open \
             --kalshi-env production \
